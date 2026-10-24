@@ -888,6 +888,150 @@ local function build_json_messages(messages)
     return "[" .. table.concat(json_msgs, ",") .. "]"
 end
 
+-- ==============================================================================
+-- LIGHTWEIGHT PURE-LUA JSON DECODER
+-- ==============================================================================
+
+local function parse_json(str)
+    local pos = 1
+    local len = #str
+
+    local function skip_whitespace()
+        while pos <= len and str:byte(pos) <= 32 do
+            pos = pos + 1
+        end
+    end
+
+    local parse_value
+
+    local function parse_string()
+        pos = pos + 1 -- Skip opening quote
+        local chars = {}
+        while pos <= len do
+            local c = str:sub(pos, pos)
+            if c == '"' then
+                pos = pos + 1
+                return table.concat(chars)
+            elseif c == '\\' then
+                pos = pos + 1
+                local esc = str:sub(pos, pos)
+                if esc == '"' or esc == '\\' or esc == '/' then
+                    table.insert(chars, esc)
+                elseif esc == 'b' then table.insert(chars, '\b')
+                elseif esc == 'f' then table.insert(chars, '\f')
+                elseif esc == 'n' then table.insert(chars, '\n')
+                elseif esc == 'r' then table.insert(chars, '\r')
+                elseif esc == 't' then table.insert(chars, '\t')
+                elseif esc == 'u' then
+                    local hex = str:sub(pos + 1, pos + 4)
+                    local cp = tonumber(hex, 16)
+                    if cp then
+                        pos = pos + 4
+                        -- Convert Unicode code point to UTF-8
+                        if cp < 0x80 then
+                            table.insert(chars, string.char(cp))
+                        elseif cp < 0x800 then
+                            table.insert(chars, string.char(0xC0 + math.floor(cp / 64), 0x80 + (cp % 64)))
+                        else
+                            table.insert(chars, string.char(0xE0 + math.floor(cp / 4096), 0x80 + (math.floor(cp / 64) % 64), 0x80 + (cp % 64)))
+                        end
+                    end
+                else
+                    table.insert(chars, esc)
+                end
+                pos = pos + 1
+            else
+                table.insert(chars, c)
+                pos = pos + 1
+            end
+        end
+        error("Unterminated string in JSON")
+    end
+
+    local function parse_number()
+        local start_pos = pos
+        while pos <= len and str:sub(pos, pos):match('[%d%.eE%+%-]') do
+            pos = pos + 1
+        end
+        return tonumber(str:sub(start_pos, pos - 1))
+    end
+
+    local function parse_array()
+        pos = pos + 1 -- Skip '['
+        local arr = {}
+        skip_whitespace()
+        if str:sub(pos, pos) == ']' then
+            pos = pos + 1
+            return arr
+        end
+        while pos <= len do
+            table.insert(arr, parse_value())
+            skip_whitespace()
+            local c = str:sub(pos, pos)
+            if c == ']' then
+                pos = pos + 1
+                return arr
+            elseif c == ',' then
+                pos = pos + 1
+            else
+                error("Expected ',' or ']' in array at pos " .. pos)
+            end
+        end
+    end
+
+    local function parse_object()
+        pos = pos + 1 -- Skip '{'
+        local obj = {}
+        skip_whitespace()
+        if str:sub(pos, pos) == '}' then
+            pos = pos + 1
+            return obj
+        end
+        while pos <= len do
+            skip_whitespace()
+            if str:sub(pos, pos) ~= '"' then error("Expected string key at pos " .. pos) end
+            local key = parse_string()
+            skip_whitespace()
+            if str:sub(pos, pos) ~= ':' then error("Expected ':' at pos " .. pos) end
+            pos = pos + 1
+            obj[key] = parse_value()
+            skip_whitespace()
+            local c = str:sub(pos, pos)
+            if c == '}' then
+                pos = pos + 1
+                return obj
+            elseif c == ',' then
+                pos = pos + 1
+            else
+                error("Expected ',' or '}' in object at pos " .. pos)
+            end
+        end
+    end
+
+    function parse_value()
+        skip_whitespace()
+        local c = str:sub(pos, pos)
+        if c == '"' then return parse_string()
+        elseif c == '{' then return parse_object()
+        elseif c == '[' then return parse_array()
+        elseif c:match('[%d%-]') then return parse_number()
+        elseif str:sub(pos, pos + 3) == 'true' then pos = pos + 4; return true
+        elseif str:sub(pos, pos + 4) == 'false' then pos = pos + 5; return false
+        elseif str:sub(pos, pos + 3) == 'null' then pos = pos + 4; return nil
+        else error("Unexpected character in JSON: " .. tostring(c)) end
+    end
+
+    local ok, res = pcall(function()
+        skip_whitespace()
+        return parse_value()
+    end)
+    return ok, res
+end
+
+-- ==============================================================================
+-- HARDENED API DISPATCHER
+-- ==============================================================================
+
 local function ask_deep_seek(chat_history, model_name)
     local temp_json_path = reaper.GetResourcePath() .. "/temp_ds_request.json"
     local temp_response_path = reaper.GetResourcePath() .. "/temp_ds_response.txt"
@@ -910,22 +1054,38 @@ local function ask_deep_seek(chat_history, model_name)
     os.execute(curl_command)
 
     local response_file = io.open(temp_response_path, "r")
-    if not response_file then return "Network Error: API request failed/timed out." end
+    if not response_file then return "Network Error: API request failed or timed out." end
     local raw_response = response_file:read("*a")
     response_file:close()
 
     os.remove(temp_json_path)
     os.remove(temp_response_path)
 
-    local content_match = raw_response:match('"content"%s*:%s*"(.-)"%s*},?%s*')
-    if not content_match then content_match = raw_response:match('"content" *: *"(.*)"') end
-
-    if content_match then
-        content_match = content_match:gsub('"%s*}%s*]%s*}%s*$', '')
-        return content_match:gsub('\\n', '\n'):gsub('\\"', '"'):gsub('\\\\', '\\')
+    -- Parse response using the full JSON decoder
+    local ok, data = parse_json(raw_response)
+    if not ok or type(data) ~= "table" then
+        return "JSON Parse Error: Invalid API response.\n\nRaw output:\n" .. tostring(raw_response)
     end
 
-    return "Failed to parse API response. Raw response:\n" .. raw_response
+    -- Explicitly handle API error structures
+    if data.error then
+        local err_msg = data.error.message or "Unknown API error"
+        local err_type = data.error.type or "API_Error"
+        return "DeepSeek API Error (" .. err_type .. "):\n" .. err_msg
+    end
+
+    -- Extract message content safely
+    if data.choices and data.choices[1] and data.choices[1].message then
+        local content = data.choices[1].message.content or "No content returned."
+
+        -- Warn if token budget truncated the answer
+        if data.choices[1].finish_reason == "length" then
+            content = content .. "\n\n⚠️ [WARNING: Response was truncated by DeepSeek token output limit.]"
+        end
+        return content
+    end
+
+    return "Unexpected API response structure:\n" .. raw_response
 end
 
 local user_balance_str = "N/A"
