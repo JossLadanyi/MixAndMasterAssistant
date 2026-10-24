@@ -857,13 +857,25 @@ local function EscapeJsonString(str)
     return (str:gsub('[\\"\n\r\t]', escape_map))
 end
 
-local function AskDeepSeek(full_prompt, model_name)
+-- Helper to convert Lua chat history table to a JSON array string
+local function BuildJsonMessages(messages)
+    local json_msgs = {}
+    for _, msg in ipairs(messages) do
+        local safe_content = EscapeJsonString(msg.content)
+        table.insert(json_msgs, '{"role":"'..msg.role..'","content":"'..safe_content..'"}')
+    end
+    return "[" .. table.concat(json_msgs, ",") .. "]"
+end
+
+local function AskDeepSeek(chat_history, model_name)
     local temp_json_path = reaper.GetResourcePath() .. "/temp_ds_request.json"
     local temp_response_path = reaper.GetResourcePath() .. "/temp_ds_response.txt"
 
-    local sanitized_prompt = EscapeJsonString(full_prompt)
     local selected_model = model_name or "deepseek-v4-pro"
-    local json_payload = '{"model":"' .. selected_model .. '","messages":[{"role":"system","content":"You are a surgical mix engineer."},{"role":"user","content":"' .. sanitized_prompt .. '"}],"thinking":{"type":"disabled"},"temperature":0.1}'
+    local msgs_json = BuildJsonMessages(chat_history)
+
+    -- NOTE: "thinking":{"type":"disabled"} is included to prevent expensive output token burning
+    local json_payload = '{"model":"' .. selected_model .. '","messages":' .. msgs_json .. ',"thinking":{"type":"disabled"},"temperature":0.1}'
 
     local json_file = io.open(temp_json_path, "w")
     if not json_file then return "I/O Error: Unable to write request file." end
@@ -877,7 +889,7 @@ local function AskDeepSeek(full_prompt, model_name)
     os.execute(curl_command)
 
     local response_file = io.open(temp_response_path, "r")
-    if not response_file then return "Network Error: DeepSeek API request failed/timed out." end
+    if not response_file then return "Network Error: API request failed/timed out." end
     local raw_response = response_file:read("*a")
     response_file:close()
 
@@ -885,9 +897,7 @@ local function AskDeepSeek(full_prompt, model_name)
     os.remove(temp_response_path)
 
     local content_match = raw_response:match('"content"%s*:%s*"(.-)"%s*},?%s*')
-    if not content_match then
-        content_match = raw_response:match('"content" *: *"(.*)"')
-    end
+    if not content_match then content_match = raw_response:match('"content" *: *"(.*)"') end
 
     if content_match then
         content_match = content_match:gsub('"%s*}%s*]%s*}%s*$', '')
@@ -897,12 +907,10 @@ local function AskDeepSeek(full_prompt, model_name)
     return "Failed to parse API response. Raw response:\n" .. raw_response
 end
 
-
 -- ==============================================================================
--- 10. REAIM-GUI RICH TEXT CONTROLLER & WORKFLOW RUNNER (COMPLETE)
+-- 10. UNIFIED CHATBOX & WORKFLOW CONTROLLER
 -- ==============================================================================
 
---- Renders markdown text into styled ReaImGui elements
 local function RenderMarkdownText(ctx, text)
     if not text or text == "" then return end
 
@@ -911,7 +919,7 @@ local function RenderMarkdownText(ctx, text)
             -- Headers (### Title) -> Gold text with separator
             if line:match("^#+%s*(.+)") then
                 local header_text = line:match("^#+%s*(.+)")
-                reaper.ImGui_Dummy(ctx, 0, 6)
+                reaper.ImGui_Dummy(ctx, 0, 4)
                 reaper.ImGui_TextColored(ctx, 0xFFD54FFF, "▶  " .. header_text)
                 reaper.ImGui_Separator(ctx)
                 reaper.ImGui_Dummy(ctx, 0, 2)
@@ -941,26 +949,21 @@ local function RenderMarkdownText(ctx, text)
     end
 end
 
--- UI State Variables
-local current_view = "SETTINGS" -- "SETTINGS" or "REPORT"
-local report_ai_text = ""
-local report_metrics_yaml = ""
+local chat_history = {}
+local chat_input_text = ""
 local report_saved_path = nil
 
-local function RunWorkflow(target_mode, model_choice, mute_parallels, bypass_master_fx, duration_pref, output_api, user_notes)
+local function RunFreshScan(target_mode, model_choice, mute_parallels, bypass_master_fx, duration_pref, output_api, custom_notes)
     local target_descriptions = { [1] = "Drums & Bass", [2] = "Instruments", [3] = "Vocals", [4] = "Full Mix" }
     local target_name = target_descriptions[target_mode] or "Full Mix"
-
     local model_ids = { [1] = "deepseek-v4-pro", [2] = "deepseek-flash" }
     local selected_model = model_ids[model_choice] or "deepseek-v4-pro"
 
-    -- 1. Scan full project hierarchy & routing
+    -- 1. Scan and isolate
+	SaveAndApplyMixState(target_mode, mute_parallels, bypass_master_fx)
     local project_yaml, song_regions = ExtractFullProjectYAML()
 
-    -- 2. Solo target and mute requested busses
-    SaveAndApplyMixState(target_mode, mute_parallels, bypass_master_fx)
-
-    -- 3. Run ghost render and 9-band DSP analysis
+    -- 2. Render and analyze
     local tracks_before = reaper.CountTracks(0)
     reaper.Main_OnCommand(42230, 0)
     local audio_metrics, rendered_tracks, dsp_error = AnalyzeGhostRender(song_regions, duration_pref, tracks_before)
@@ -975,121 +978,110 @@ local function RunWorkflow(target_mode, model_choice, mute_parallels, bypass_mas
         return false
     end
 
-    -- 4. Build prompt package (incorporating user notes at the top)
-    local full_prompt = BuildFullPrompt(project_yaml, audio_metrics, target_name, user_notes)
-    report_metrics_yaml = to_yaml(audio_metrics)
-
-    -- MANDATORY: Always save to text file
+    -- 3. Save raw file
+    local full_prompt = BuildFullPrompt(project_yaml, audio_metrics, target_name, custom_notes)
     report_saved_path = SavePromptToTxt(full_prompt, target_name)
 
-    -- Handle API Call depending on checkbox choice
-    report_ai_text = ""
+    -- 4. Initialize chat history for DeepSeek Prompt Caching
+    chat_history = {
+        { role = "system", content = full_prompt },
+        { role = "user", content = "Perform full mix analysis as instructed." }
+    }
+
     if output_api then
-        reaper.ShowConsoleMsg("Transmitting payload to DeepSeek API... (Wait 3-10 seconds)\n")
-        report_ai_text = AskDeepSeek(full_prompt, selected_model)
+        local reply = AskDeepSeek(chat_history, selected_model)
+        table.insert(chat_history, { role = "assistant", content = reply })
     else
-        report_ai_text = "Prompt exported to text file successfully.\n\nFile location:\n" .. (report_saved_path or "")
+        table.insert(chat_history, { role = "assistant", content = "Analysis saved to file:\n" .. (report_saved_path or "") })
     end
 
     return true
 end
 
+local function SendFollowupMessage(user_text, model_choice)
+    if TrimString(user_text) == "" then return end
+    local model_ids = { [1] = "deepseek-v4-pro", [2] = "deepseek-flash" }
+    local selected_model = model_ids[model_choice] or "deepseek-v4-pro"
+
+    table.insert(chat_history, { role = "user", content = user_text })
+    local reply = AskDeepSeek(chat_history, selected_model)
+    table.insert(chat_history, { role = "assistant", content = reply })
+end
+
 local function main()
     local ctx = reaper.ImGui_CreateContext("AI_Mix_Assistant")
-    local target_idx = 3           -- 0: Drums, 1: Inst, 2: Vox, 3: Full Mix
-    local model_idx = 0            -- 0: DeepSeek V4 Pro, 1: DeepSeek Flash
+    local target_idx = 3
+    local model_idx = 0
     local mute_parallels = true
     local bypass_master_fx = true
-    local duration_idx = 0         -- 0: 10s, 1: 20s, 2: Full
-    local output_api = true        -- Checkbox: Call API or just save file
-    local user_notes = ""          -- Text buffer for additional instructions
+    local duration_idx = 0
+    local output_api = true
+    local custom_notes = ""
 
-    local target_items = "Drums & Bass\0Instruments\0Vocals\0Full Mix\0\0"
-    local model_items  = "DeepSeek V4 Pro (Flagship Reasoning)\0DeepSeek Flash (Fast / Low-Cost)\0\0"
+    local target_items = "Drums & Bass\0Instruments (No Drums/Bass/Vox)\0Vocals\0Full Mix\0\0"
+    local model_items = "DeepSeek V4 Pro (Flagship Reasoning)\0DeepSeek Flash (Fast / Low-Cost)\0\0"
     local duration_items = "10 Seconds\0" .. "20 Seconds\0" .. "Full Region\0\0"
 
     local function loop()
-        local win_w = (current_view == "SETTINGS") and 420 or 700
-        local win_h = (current_view == "SETTINGS") and 370 or 580
-        reaper.ImGui_SetNextWindowSize(ctx, win_w, win_h, reaper.ImGui_Cond_FirstUseEver())
-
-        local title = (current_view == "SETTINGS") and "Mix and Master Assistant" or "Mix and Master Assistant - Report"
-        local visible, open = reaper.ImGui_Begin(ctx, title, true, reaper.ImGui_WindowFlags_NoCollapse())
+        reaper.ImGui_SetNextWindowSize(ctx, 720, 680, reaper.ImGui_Cond_FirstUseEver())
+        local visible, open = reaper.ImGui_Begin(ctx, "Mix and Master Assistant", true, reaper.ImGui_WindowFlags_NoCollapse())
 
         if visible then
-            if current_view == "SETTINGS" then
-                _, target_idx = reaper.ImGui_Combo(ctx, "Target Bus", target_idx, target_items)
+            -- SCAN SETTINGS PANEL
+            if reaper.ImGui_CollapsingHeader(ctx, "Scan Configuration & Controls") then
+                _, target_idx = reaper.ImGui_Combo(ctx, "Target", target_idx, target_items)
                 _, model_idx  = reaper.ImGui_Combo(ctx, "AI Model", model_idx, model_items)
-
-                reaper.ImGui_Separator(ctx)
-
-                _, mute_parallels = reaper.ImGui_Checkbox(ctx, "Mute Parallel Busses (NYC/Rear/etc)", mute_parallels)
-                _, bypass_master_fx = reaper.ImGui_Checkbox(ctx, "Bypass Master Bus FX Chain", bypass_master_fx)
+                _, mute_parallels = reaper.ImGui_Checkbox(ctx, "Mute Parallels", mute_parallels)
+                _, bypass_master_fx = reaper.ImGui_Checkbox(ctx, "Bypass Master FX", bypass_master_fx)
                 _, duration_idx = reaper.ImGui_Combo(ctx, "Duration", duration_idx, duration_items)
-                _, output_api = reaper.ImGui_Checkbox(ctx, "Also Call DeepSeek API (Uncheck for TXT Only)", output_api)
+                _, output_api = reaper.ImGui_Checkbox(ctx, "Query DeepSeek API (Uncheck for TXT only)", output_api)
 
-                reaper.ImGui_Dummy(ctx, 0, 4)
-                reaper.ImGui_Text(ctx, "Additional Instructions / Notes for AI:")
-                -- Multiline text input box for custom user notes
-                _, user_notes = reaper.ImGui_InputTextMultiline(ctx, "##user_notes", user_notes, -1, 50)
+                reaper.ImGui_Text(ctx, "Custom Instructions / Notes for Scan:")
+                _, custom_notes = reaper.ImGui_InputText(ctx, "##notes", custom_notes)
 
-                reaper.ImGui_Dummy(ctx, 0, 6)
+                if reaper.ImGui_Button(ctx, "Run Fresh Scan & Reset Chat", -1, 30) then
+                    local dur_map = { [0] = 10, [1] = 20, [2] = 0 }
+                    RunFreshScan(target_idx + 1, model_idx + 1, mute_parallels, bypass_master_fx, dur_map[duration_idx], output_api, custom_notes)
+                end
                 reaper.ImGui_Separator(ctx)
-                reaper.ImGui_Dummy(ctx, 0, 4)
+            end
 
-                if reaper.ImGui_Button(ctx, "Run Mix Analysis", -1, 32) then
-                    local dur_values = { [0] = 10, [1] = 20, [2] = 0 }
-                    local success = RunWorkflow(
-                        target_idx + 1,
-                        model_idx + 1,
-                        mute_parallels,
-                        bypass_master_fx,
-                        dur_values[duration_idx],
-                        output_api,
-                        user_notes
-                    )
-                    if success then
-                        current_view = "REPORT"
+            -- CHAT HISTORY LOG
+            reaper.ImGui_TextColored(ctx, 0xFFD54FFF, "Conversation Log:")
+            local _, avail_h = reaper.ImGui_GetContentRegionAvail(ctx)
+			local scroll_h = math.max(150, avail_h - 40)
+            if reaper.ImGui_BeginChild(ctx, "ChatScroll", 0, scroll_h) then
+                for _, msg in ipairs(chat_history) do
+                    if msg.role == "user" and msg.content ~= "Perform full mix analysis as instructed." then
+                        reaper.ImGui_TextColored(ctx, 0x4FC3F7FF, "YOU: ")
+                        reaper.ImGui_SameLine(ctx)
+                        reaper.ImGui_TextWrapped(ctx, msg.content)
+                        reaper.ImGui_Separator(ctx)
+                    elseif msg.role == "assistant" then
+                        reaper.ImGui_TextColored(ctx, 0x81C784FF, "DEEPSEEK: ")
+                        RenderMarkdownText(ctx, msg.content)
+                        reaper.ImGui_Separator(ctx)
                     end
                 end
+                reaper.ImGui_EndChild(ctx)
+            end
 
-            elseif current_view == "REPORT" then
-                if reaper.ImGui_Button(ctx, "◀ Back to Scan", 120, 26) then
-                    current_view = "SETTINGS"
-                end
-
-                reaper.ImGui_SameLine(ctx)
-                if reaper.ImGui_Button(ctx, "Copy Directives to Clipboard", 200, 26) then
-                    reaper.ImGui_SetClipboardText(ctx, report_ai_text)
-                end
-
-                if report_saved_path then
-                    reaper.ImGui_SameLine(ctx)
-                    reaper.ImGui_TextDisabled(ctx, "(Saved to .txt)")
-                end
-
-                reaper.ImGui_Dummy(ctx, 0, 4)
-
-                if reaper.ImGui_BeginTabBar(ctx, "ReportTabs") then
-                    if reaper.ImGui_BeginTabItem(ctx, "AI Mixing Directives") then
-                        if reaper.ImGui_BeginChild(ctx, "DirectivesScroll", 0, 0) then
-                            RenderMarkdownText(ctx, report_ai_text)
-                            reaper.ImGui_EndChild(ctx)
-                        end
-                        reaper.ImGui_EndTabItem(ctx)
-                    end
-
-                    if reaper.ImGui_BeginTabItem(ctx, "Detected Audio Metrics") then
-                        if reaper.ImGui_BeginChild(ctx, "MetricsScroll", 0, 0) then
-                            reaper.ImGui_TextColored(ctx, 0x81C784FF, "=== REGIONAL METRICS DETECTED ===")
-                            reaper.ImGui_Separator(ctx)
-                            reaper.ImGui_Text(ctx, report_metrics_yaml)
-                            reaper.ImGui_EndChild(ctx)
-                        end
-                        reaper.ImGui_EndTabItem(ctx)
-                    end
-
-                    reaper.ImGui_EndTabBar(ctx)
+            -- FOLLOW-UP INPUT AREA
+            reaper.ImGui_Separator(ctx)
+			local enter_pressed
+			enter_pressed, chat_input_text = reaper.ImGui_InputText(ctx, "##chat_in", chat_input_text, reaper.ImGui_InputTextFlags_EnterReturnsTrue())
+			reaper.ImGui_SameLine(ctx)
+			if reaper.ImGui_Button(ctx, "Send", 80, 24) or enter_pressed then
+				if TrimString(chat_input_text) ~= "" then
+					local user_msg = chat_input_text
+					chat_input_text = ""
+					SendFollowupMessage(user_msg, model_idx + 1)
+				end
+			end
+            reaper.ImGui_SameLine(ctx)
+            if reaper.ImGui_Button(ctx, "Copy Last", 80, 24) then
+                if #chat_history > 0 then
+                    reaper.ImGui_SetClipboardText(ctx, chat_history[#chat_history].content)
                 end
             end
         end
