@@ -1360,29 +1360,38 @@ local function fetch_deep_seek_balance()
         return
     end
 
-    local temp_resp = reaper.GetResourcePath() .. "/temp_ds_bal.txt"
-    local curl_cmd = curl_bin .. ' -s -X GET https://api.deepseek.com/user/balance ' ..
-                     '-H ' .. shell_quote_for_curl('Authorization: Bearer ' .. API_KEY) .. ' ' ..
-                     '-o ' .. shell_quote_for_curl(temp_resp)
-    os.execute(curl_cmd)
+    local curl_cmd = curl_bin .. ' -sS -H ' .. shell_quote_for_curl('Authorization: Bearer ' .. API_KEY) ..
+                     ' https://api.deepseek.com/user/balance'
 
-    local file = io.open(temp_resp, "r")
-    if file then
-        local raw = file:read("*a")
-        file:close()
-        os.remove(temp_resp)
+    local handle = io.popen(curl_cmd)
+    local raw = handle and handle:read("*a") or ""
+    if handle then handle:close() end
 
-        -- Extract total_balance and currency
-        local total = raw:match('"total_balance"%s*:%s*"(.-)"')
-        local curr  = raw:match('"currency"%s*:%s*"(.-)"') or "USD"
-
-        if total then
-            local symbol = (curr == "USD") and "$" or "¥"
-            user_balance_str = symbol .. total
-        else
-            user_balance_str = "Check Failed"
-        end
+    if raw == "" then
+        user_balance_str = "Check Failed"
+        return
     end
+
+    local ok_json, data = parse_json(raw)
+    if not ok_json or type(data) ~= "table" then
+        user_balance_str = "Check Failed"
+        return
+    end
+
+    if data.error then
+        user_balance_str = "API Error"
+        return
+    end
+
+    local total_balance = data.total_balance or data.total or data.balance
+    if total_balance == nil then
+        user_balance_str = "Check Failed"
+        return
+    end
+
+    local currency = data.currency or "USD"
+    local symbol = (currency == "USD") and "$" or "¥"
+    user_balance_str = symbol .. tostring(total_balance)
 end
 
 -- ==============================================================================
