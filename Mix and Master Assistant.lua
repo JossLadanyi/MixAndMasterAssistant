@@ -170,6 +170,16 @@ local function get_track_identity(track)
     return (not track_name or track_name == "") and ("Track " .. track_idx) or track_name
 end
 
+local function get_model_name(model_choice)
+    local model_ids = { [1] = "deepseek-v4-pro", [2] = "deepseek-flash" }
+    return model_ids[model_choice] or "deepseek-v4-pro"
+end
+
+local function get_duration_seconds(duration_idx)
+    local duration_map = { [0] = 10, [1] = 20, [2] = 0 }
+    return duration_map[duration_idx] or 0
+end
+
 -- ==============================================================================
 -- 3. ORIGINAL SERIALIZER ENGINE (COMPACT & RANKED YAML)
 -- ==============================================================================
@@ -300,6 +310,12 @@ end
 local function get_all_connections()
     local connections = {}
     local num_tracks = reaper.CountTracks(0)
+    local track_lookup = {}
+
+    for i = 0, num_tracks - 1 do
+        local track = reaper.GetTrack(0, i)
+        track_lookup[track] = get_track_identity(track)
+    end
 
     for i = 0, num_tracks - 1 do
         local src_track = reaper.GetTrack(0, i)
@@ -308,19 +324,10 @@ local function get_all_connections()
         for s = 0, num_sends - 1 do
             local dest_track = reaper.GetTrackSendInfo_Value(src_track, 0, s, "P_DESTTRACK")
             if dest_track and dest_track ~= 0 then
-                local src_name = get_track_identity(src_track)
-                local dest_name = "Unknown Track"
-
-                if type(dest_track) == "userdata" then
-                    dest_name = get_track_identity(dest_track)
-                else
-                    for t = 0, num_tracks - 1 do
-                        local tr = reaper.GetTrack(0, t)
-                        if tr == dest_track then dest_name = get_track_identity(tr); break end
-                    end
-                end
-
+                local src_name = track_lookup[src_track] or get_track_identity(src_track)
+                local dest_name = track_lookup[dest_track] or "Unknown Track"
                 local conn = { src = src_name, dst = dest_name }
+
                 local main_send = reaper.GetMediaTrackInfo_Value(src_track, "B_MAINSEND")
                 local dst_chan = math.floor(reaper.GetTrackSendInfo_Value(src_track, 0, s, "I_DSTCHAN"))
                 local base_chan = (dst_chan & 1023) + 1
@@ -419,11 +426,16 @@ local function process_track_data(track, is_master, current_depth)
     local parent = reaper.GetParentTrack(track)
     if parent then track_data.parent = get_track_identity(parent) end
 
+    local folder_depth = reaper.GetMediaTrackInfo_Value(track, "I_FOLDERDEPTH")
+    local mute_state = reaper.GetMediaTrackInfo_Value(track, "B_MUTE") == 1
+    local solo_state = reaper.GetMediaTrackInfo_Value(track, "I_SOLO") > 0
+    local phase_state = reaper.GetMediaTrackInfo_Value(track, "B_PHASE") == 1
+
     local flags = {}
-    if reaper.GetMediaTrackInfo_Value(track, "I_FOLDERDEPTH") == 1 then table.insert(flags, "folder") end
-    if reaper.GetMediaTrackInfo_Value(track, "B_MUTE") == 1 then table.insert(flags, "muted") end
-    if reaper.GetMediaTrackInfo_Value(track, "I_SOLO") > 0 then table.insert(flags, "soloed") end
-    if reaper.GetMediaTrackInfo_Value(track, "B_PHASE") == 1 then table.insert(flags, "phase_flipped") end
+    if folder_depth == 1 then table.insert(flags, "folder") end
+    if mute_state then table.insert(flags, "muted") end
+    if solo_state then table.insert(flags, "soloed") end
+    if phase_state then table.insert(flags, "phase_flipped") end
     if #flags > 0 then track_data.flags = flags end
 
     local volume = linear_to_db(reaper.GetMediaTrackInfo_Value(track, "D_VOL"))
@@ -461,8 +473,7 @@ local function process_track_data(track, is_master, current_depth)
         if #active_envelopes > 0 then track_data.auto = table.concat(active_envelopes, ", ") end
     end
 
-    local is_muted = reaper.GetMediaTrackInfo_Value(track, "B_MUTE") == 1
-    if not is_muted then track_data.fx = get_track_fx_chain(track) end
+    if not mute_state then track_data.fx = get_track_fx_chain(track) end
     return track_data
 end
 
@@ -990,11 +1001,10 @@ local scroll_to_bottom = false
 local function RunFreshScan(target_mode, model_choice, mute_parallels, bypass_master_fx, duration_pref, output_api, custom_notes)
     local target_descriptions = { [1] = "Drums & Bass", [2] = "Instruments", [3] = "Vocals", [4] = "Full Mix" }
     local target_name = target_descriptions[target_mode] or "Full Mix"
-    local model_ids = { [1] = "deepseek-v4-pro", [2] = "deepseek-flash" }
-    local selected_model = model_ids[model_choice] or "deepseek-v4-pro"
+    local selected_model = get_model_name(model_choice)
 
     -- 1. Scan and isolate
-	SaveAndApplyMixState(target_mode, mute_parallels, bypass_master_fx)
+    SaveAndApplyMixState(target_mode, mute_parallels, bypass_master_fx)
     local project_yaml, song_regions = ExtractFullProjectYAML()
 
     -- 2. Render and analyze
@@ -1025,11 +1035,11 @@ local function RunFreshScan(target_mode, model_choice, mute_parallels, bypass_ma
     if output_api then
         local reply = AskDeepSeek(chat_history, selected_model)
         table.insert(chat_history, { role = "assistant", content = reply })
-		scroll_to_bottom = true
-        FetchDeepSeekBalance() -- AUTO-UPDATE BALANCE AFTER INITIAL SCAN
+        scroll_to_bottom = true
+        FetchDeepSeekBalance()
     else
         table.insert(chat_history, { role = "assistant", content = "Analysis saved to file:\n" .. (report_saved_path or "") })
-		scroll_to_bottom = true
+        scroll_to_bottom = true
     end
 
     return true
@@ -1037,17 +1047,14 @@ end
 
 local function SendFollowupMessage(user_text, model_choice)
     if TrimString(user_text) == "" then return end
-    local model_ids = { [1] = "deepseek-v4-pro", [2] = "deepseek-flash" }
-    local selected_model = model_ids[model_choice] or "deepseek-v4-pro"
+    local selected_model = get_model_name(model_choice)
 
-    -- Add user message and immediately queue scroll down
     table.insert(chat_history, { role = "user", content = user_text })
     scroll_to_bottom = true
 
-    -- Get DeepSeek response and queue scroll down to the answer
     local reply = AskDeepSeek(chat_history, selected_model)
     table.insert(chat_history, { role = "assistant", content = reply })
-    FetchDeepSeekBalance() -- AUTO-UPDATE BALANCE AFTER FOLLOW-UP
+    FetchDeepSeekBalance()
     scroll_to_bottom = true
 end
 
@@ -1097,8 +1104,7 @@ local function main()
                 _, custom_notes = reaper.ImGui_InputText(ctx, "##notes", custom_notes)
 
                 if reaper.ImGui_Button(ctx, "Run Fresh Scan & Reset Chat", -1, 30) then
-                    local dur_map = { [0] = 10, [1] = 20, [2] = 0 }
-                    RunFreshScan(target_idx + 1, model_idx + 1, mute_parallels, bypass_master_fx, dur_map[duration_idx], output_api, custom_notes)
+                    RunFreshScan(target_idx + 1, model_idx + 1, mute_parallels, bypass_master_fx, get_duration_seconds(duration_idx), output_api, custom_notes)
                 end
                 reaper.ImGui_Separator(ctx)
             end
@@ -1106,7 +1112,7 @@ local function main()
             -- CHAT HISTORY LOG
             reaper.ImGui_TextColored(ctx, 0xFFD54FFF, "Conversation Log:")
             local _, avail_h = reaper.ImGui_GetContentRegionAvail(ctx)
-            local scroll_h = math.max(150, avail_h - 40)
+            local scroll_h = math.max(150, avail_h - 70)
 
             if reaper.ImGui_BeginChild(ctx, "ChatScroll", 0, scroll_h) then
                 for _, msg in ipairs(chat_history) do
@@ -1131,32 +1137,31 @@ local function main()
                 reaper.ImGui_EndChild(ctx)
             end
 
-            -- FOLLOW-UP INPUT AREA
+			-- FOLLOW-UP INPUT AREA (MULTILINE + BUTTON ONLY)
             reaper.ImGui_Separator(ctx)
 
-            -- Stretch input box across the window leaving room for buttons
-            reaper.ImGui_SetNextItemWidth(ctx, -170)
-            _, chat_input_text = reaper.ImGui_InputText(ctx, "##chat_in", chat_input_text)
-
-            -- Detect Enter key while focused on the input box
-            local enter_pressed = reaper.ImGui_IsItemFocused(ctx) and
-                                  (reaper.ImGui_IsKeyPressed(ctx, reaper.ImGui_Key_Enter()) or
-                                   reaper.ImGui_IsKeyPressed(ctx, reaper.ImGui_Key_KeypadEnter()))
+            -- Multiline text box: Enter inserts a new line, does not submit
+            -- Width: -95px leaves room for the stacked buttons on the right. Height: 52px (approx 2.5 lines)
+            _, chat_input_text = reaper.ImGui_InputTextMultiline(ctx, "##chat_in", chat_input_text, -95, 52)
 
             reaper.ImGui_SameLine(ctx)
-            if reaper.ImGui_Button(ctx, "Send", 80, 24) or enter_pressed then
-                if TrimString(chat_input_text) ~= "" then
-                    local user_msg = chat_input_text
-                    chat_input_text = ""
-                    SendFollowupMessage(user_msg, model_idx + 1)
-                end
-            end
 
-            reaper.ImGui_SameLine(ctx)
-            if reaper.ImGui_Button(ctx, "Copy Last", 80, 24) then
-                if #chat_history > 0 then
-                    reaper.ImGui_SetClipboardText(ctx, chat_history[#chat_history].content)
+            -- Stack the 'Send' and 'Copy Chat' buttons neatly beside the multiline box
+            if reaper.ImGui_BeginGroup(ctx) then
+                if reaper.ImGui_Button(ctx, "Send", 85, 24) then
+                    if TrimString(chat_input_text) ~= "" then
+                        local user_msg = chat_input_text
+                        chat_input_text = ""
+                        SendFollowupMessage(user_msg, model_idx + 1)
+                    end
                 end
+
+                if reaper.ImGui_Button(ctx, "Copy Chat", 85, 24) then
+                    if #chat_history > 0 then
+                        reaper.ImGui_SetClipboardText(ctx, chat_history[#chat_history].content)
+                    end
+                end
+                reaper.ImGui_EndGroup(ctx)
             end
         end
 
