@@ -64,7 +64,7 @@ local IGNORED_PARAMETER_KEYWORDS = {
 -- 2. STRING SANITIZATION & TOKEN OPTIMIZATION
 -- ==============================================================================
 
-local function TrimString(str)
+local function trim_string(str)
     if type(str) ~= "string" then return str end
     return str:match("^%s*(.-)%s*$")
 end
@@ -78,7 +78,7 @@ end
 -- but the Lua function name and variables remain human-readable.
 local function clean_param_key(param_name)
     if not param_name then return "param" end
-    param_name = TrimString(param_name):lower()
+    param_name = trim_string(param_name):lower()
 
     -- Audio Parameter Abbreviations for the YAML output
     local abbreviations = {
@@ -109,7 +109,7 @@ end
 
 local function escape_yaml_string(str)
     if type(str) ~= "string" then return tostring(str) end
-    str = TrimString(str)
+    str = trim_string(str)
     -- Don't quote booleans or numbers
     if tonumber(str) and not str:lower():find("inf") then return str end
     if str:lower() == "true" or str:lower() == "false" then return str:lower() end
@@ -122,7 +122,7 @@ end
 
 local function is_valid_parameter_name(name)
     if not name or name == "" then return false end
-    name = TrimString(name):lower()
+    name = trim_string(name):lower()
     if name:match("^control %d+$") then return false end
     for _, word in ipairs(IGNORED_PARAMETER_KEYWORDS) do
         if name:find(word) then return false end
@@ -133,8 +133,8 @@ end
 local function is_boilerplate(param_name, param_value)
     if not param_name or not param_value then return true end
 
-    local name_lower = TrimString(param_name):lower()
-    local val_clean = TrimString(param_value):lower():gsub("%s+", "")
+    local name_lower = trim_string(param_name):lower()
+    local val_clean = trim_string(param_value):lower():gsub("%s+", "")
 
     if val_clean == "" or name_lower:find("ui") or name_lower:find("graph") then return true end
 
@@ -166,7 +166,7 @@ local function get_track_identity(track)
     if track == reaper.GetMasterTrack(0) then return "MASTER BUS" end
     local track_idx = math.floor(reaper.GetMediaTrackInfo_Value(track, "IP_TRACKNUMBER"))
     local _, track_name = reaper.GetSetMediaTrackInfo_String(track, "P_NAME", "", false)
-    track_name = TrimString(track_name)
+    track_name = trim_string(track_name)
     return (not track_name or track_name == "") and ("Track " .. track_idx) or track_name
 end
 
@@ -292,7 +292,7 @@ local function get_arrangement_markers()
     for i = 0, (num_markers + num_regions) - 1 do
         local retval, is_region, pos, region_end, name, marker_idx = reaper.EnumProjectMarkers3(0, i)
         if retval > 0 then
-            name = TrimString(name) or ""
+            name = trim_string(name) or ""
             local element = {
                 type = is_region and "region" or "marker",
                 name = name ~= "" and name or ((is_region and "Region " or "Marker ") .. marker_idx),
@@ -361,9 +361,9 @@ local function get_track_fx_chain(track)
 
     for i = 0, num_fx - 1 do
         local _, fx_name = reaper.TrackFX_GetFXName(track, i)
-        fx_name = TrimString(fx_name) or "Unknown FX"
+        fx_name = trim_string(fx_name) or "Unknown FX"
         fx_name = fx_name:match(":%s*(.+)") or fx_name
-        fx_name = TrimString(fx_name)
+        fx_name = trim_string(fx_name)
 
         local plugin = { name = fx_name }
         if not reaper.TrackFX_GetEnabled(track, i) then plugin.bypassed = true end
@@ -377,7 +377,7 @@ local function get_track_fx_chain(track)
         if current_wet ~= DEFAULT_SETTINGS.plugin.wet then plugin.wet = current_wet end
 
         local _, raw_name = reaper.TrackFX_GetFXName(track, i)
-        raw_name = TrimString(raw_name) or ""
+        raw_name = trim_string(raw_name) or ""
         local inst_idx = reaper.TrackFX_GetInstrument(track)
         local plugin_type = ((inst_idx == i) or raw_name:match("^%w+i:")) and "instrument" or "effect"
         if plugin_type ~= DEFAULT_SETTINGS.plugin.type then plugin.type = plugin_type end
@@ -391,11 +391,11 @@ local function get_track_fx_chain(track)
             for k = 0, num_params - 1 do
                 if k >= max_inspect then break end
                 local _, param_name = reaper.TrackFX_GetParamName(track, i, k)
-                param_name = TrimString(param_name)
+                param_name = trim_string(param_name)
 
                 if is_valid_parameter_name(param_name) then
                     local _, param_value = reaper.TrackFX_GetFormattedParamValue(track, i, k)
-                    param_value = TrimString(param_value)
+                    param_value = trim_string(param_value)
 
                     if not is_boilerplate(param_name, param_value) then
                         if count < MAX_PLUGIN_PARAMS then
@@ -466,7 +466,7 @@ local function process_track_data(track, is_master, current_depth)
             local env = reaper.GetTrackEnvelope(track, env_idx)
             if env then
                 local _, env_name = reaper.GetEnvelopeName(env, "")
-                env_name = TrimString(env_name)
+                env_name = trim_string(env_name)
                 if env_name and env_name ~= "" then table.insert(active_envelopes, env_name) end
             end
         end
@@ -477,10 +477,10 @@ local function process_track_data(track, is_master, current_depth)
     return track_data
 end
 
-local function ExtractFullProjectYAML()
+local function extract_full_project_yaml()
     local num, den = reaper.TimeMap_GetTimeSigAtTime(0, 0)
     local sr = reaper.GetSetProjectInfo(0, "PROJECT_SRATE", 0, false)
-    local proj_notes = TrimString(reaper.GetSetProjectNotes(0, false, ""))
+    local proj_notes = trim_string(reaper.GetSetProjectNotes(0, false, ""))
 
     local project_data = {
         meta = {
@@ -521,7 +521,7 @@ end
 
 local saved_mix_state = { tracks = {}, master_fx = {} }
 
-local function GetTrackCategory(name)
+local function get_track_category(name)
     name = name:lower()
 
     -- 99 = Parallel / Crush / NYC Busses
@@ -545,7 +545,7 @@ local function GetTrackCategory(name)
     end
 end
 
-local function SaveAndApplyMixState(target_mode, mute_parallels, bypass_master_fx)
+local function save_and_apply_mix_state(target_mode, mute_parallels, bypass_master_fx)
     local master_track = reaper.GetMasterTrack(0)
     saved_mix_state.master_fx = {}
 
@@ -560,7 +560,7 @@ local function SaveAndApplyMixState(target_mode, mute_parallels, bypass_master_f
         local track = reaper.GetTrack(0, i)
         local track_guid = reaper.GetTrackGUID(track)
         local _, track_name = reaper.GetSetMediaTrackInfo_String(track, "P_NAME", "", false)
-        local category = GetTrackCategory(track_name)
+        local category = get_track_category(track_name)
 
         saved_mix_state.tracks[track_guid] = {
             solo = reaper.GetMediaTrackInfo_Value(track, "I_SOLO"),
@@ -576,7 +576,7 @@ local function SaveAndApplyMixState(target_mode, mute_parallels, bypass_master_f
     end
 end
 
-local function RestoreMixState()
+local function restore_mix_state()
     local master_track = reaper.GetMasterTrack(0)
     for fx_idx, state in pairs(saved_mix_state.master_fx) do
         reaper.TrackFX_SetEnabled(master_track, fx_idx, state)
@@ -596,7 +596,7 @@ end
 -- ==============================================================================
 
 --- Traverses up the folder hierarchy to verify if any parent track is muted.
-local function IsTrackAudible(track)
+local function is_track_audible(track)
     local current = track
     while current do
         if reaper.GetMediaTrackInfo_Value(current, "B_MUTE") == 1 then
@@ -607,7 +607,7 @@ local function IsTrackAudible(track)
     return true
 end
 
-local function GetActiveTracks(start_time, end_time, max_tracks)
+local function get_active_tracks(start_time, end_time, max_tracks)
     local active_tracks = {}
     -- Only loop through tracks that existed BEFORE the render occurred
     local limit = (max_tracks or reaper.CountTracks(0)) - 1
@@ -615,7 +615,7 @@ local function GetActiveTracks(start_time, end_time, max_tracks)
     for i = 0, limit do
         local track = reaper.GetTrack(0, i)
 
-        if IsTrackAudible(track) then
+        if is_track_audible(track) then
             local is_active = false
             local item_count = reaper.CountTrackMediaItems(track)
 
@@ -648,7 +648,7 @@ end
 -- 7. 9-BAND MASTERING DSP ENGINE
 -- ==============================================================================
 
-local function ProcessAudioChunk(take, item_pos, analyze_start, analyze_dur)
+local function process_audio_chunk(take, item_pos, analyze_start, analyze_dur)
     local num_samples = math.floor(analyze_dur * SAMPLE_RATE)
     if num_samples < 1 then return nil end
 
@@ -729,7 +729,7 @@ end
 -- 8. MULTI-REGION & MULTI-TRACK GHOST RENDER ANALYZER (FIXED)
 -- ==============================================================================
 
-local function AnalyzeGhostRender(regions, duration_pref, tracks_before)
+local function analyze_ghost_render(regions, duration_pref, tracks_before)
     local tracks_after = reaper.CountTracks(0)
     local num_new_tracks = tracks_after - tracks_before
 
@@ -774,9 +774,9 @@ local function AnalyzeGhostRender(regions, duration_pref, tracks_before)
                             local clean_name = region.name:gsub("[%s%p]+", "_")
                             local seq_key = string.format("%02d_%s", region_counter, clean_name)
 
-                            local metrics = ProcessAudioChunk(take, item_start, safe_start, analysis_duration)
+                            local metrics = process_audio_chunk(take, item_start, safe_start, analysis_duration)
                             if metrics then
-                                metrics.active_trks = GetActiveTracks(overlap_start, overlap_end, tracks_before)
+                                metrics.active_trks = get_active_tracks(overlap_start, overlap_end, tracks_before)
                                 regional_metrics[seq_key] = metrics
                                 analyzed = true
                                 region_counter = region_counter + 1
@@ -796,9 +796,9 @@ local function AnalyzeGhostRender(regions, duration_pref, tracks_before)
             local pos = reaper.GetMediaItemInfo_Value(first_item, "D_POSITION")
             local dur = reaper.GetMediaItemInfo_Value(first_item, "D_LENGTH")
             if duration_pref > 0 then dur = math.min(duration_pref, dur) end
-            local m = ProcessAudioChunk(take, pos, pos, dur)
+            local m = process_audio_chunk(take, pos, pos, dur)
             if m then
-                m.active_trks = GetActiveTracks(pos, pos + dur, tracks_before)
+                m.active_trks = get_active_tracks(pos, pos + dur, tracks_before)
                 regional_metrics["01_Entire_Song"] = m
             end
         end
@@ -812,7 +812,7 @@ end
 -- 9. UNIFIED PROMPT BUILDER & MANDATORY FILE EXPORTER
 -- ==============================================================================
 
-local function BuildFullPrompt(project_yaml, audio_metrics, target_str, user_notes)
+local function build_full_prompt(project_yaml, audio_metrics, target_str, user_notes)
     local prompt = "=== MIXING & MASTERING DIRECTIVES ===\nYou are an elite, multi-platinum audio mixing and mastering engineer.\n"
     prompt = prompt .. "Focus Target: " .. target_str .. "\n\n"
 
@@ -821,7 +821,7 @@ local function BuildFullPrompt(project_yaml, audio_metrics, target_str, user_not
 
     if user_notes and user_notes ~= "" then
         prompt = prompt .. "[USER CUSTOM INSTRUCTIONS FOR THIS PASS]:\n"
-        prompt = prompt .. TrimString(user_notes) .. "\n\n"
+        prompt = prompt .. trim_string(user_notes) .. "\n\n"
     end
 
     prompt = prompt .. "1. MACRO-DYNAMICS: Compare Crest Factor and RMS across regions. If dynamic contrast is lacking, pinpoint over-compression in the YAML and specify threshold/ratio adjustments.\n"
@@ -837,7 +837,7 @@ local function BuildFullPrompt(project_yaml, audio_metrics, target_str, user_not
     return prompt
 end
 
-local function SavePromptToTxt(full_prompt, target_str)
+local function save_prompt_to_txt(full_prompt, target_str)
     local _, project_filepath = reaper.EnumProjects(-1, "")
     local project_dir = reaper.GetProjectPath("")
 
@@ -861,7 +861,7 @@ local function SavePromptToTxt(full_prompt, target_str)
     return nil
 end
 
-local function EscapeJsonString(str)
+local function escape_json_string(str)
     local escape_map = {
         ["\\"] = "\\\\", ['"'] = '\\"', ["\n"] = "\\n", ["\r"] = "\\r", ["\t"] = "\\t"
     }
@@ -869,21 +869,21 @@ local function EscapeJsonString(str)
 end
 
 -- Helper to convert Lua chat history table to a JSON array string
-local function BuildJsonMessages(messages)
+local function build_json_messages(messages)
     local json_msgs = {}
     for _, msg in ipairs(messages) do
-        local safe_content = EscapeJsonString(msg.content)
+        local safe_content = escape_json_string(msg.content)
         table.insert(json_msgs, '{"role":"'..msg.role..'","content":"'..safe_content..'"}')
     end
     return "[" .. table.concat(json_msgs, ",") .. "]"
 end
 
-local function AskDeepSeek(chat_history, model_name)
+local function ask_deep_seek(chat_history, model_name)
     local temp_json_path = reaper.GetResourcePath() .. "/temp_ds_request.json"
     local temp_response_path = reaper.GetResourcePath() .. "/temp_ds_response.txt"
 
     local selected_model = model_name or "deepseek-v4-pro"
-    local msgs_json = BuildJsonMessages(chat_history)
+    local msgs_json = build_json_messages(chat_history)
 
     -- NOTE: "thinking":{"type":"disabled"} is included to prevent expensive output token burning
     local json_payload = '{"model":"' .. selected_model .. '","messages":' .. msgs_json .. ',"thinking":{"type":"disabled"},"temperature":0.1}'
@@ -920,7 +920,7 @@ end
 
 local user_balance_str = "N/A"
 
-local function FetchDeepSeekBalance()
+local function fetch_deep_seek_balance()
     if API_KEY == "YOUR_DEEPSEEK_API_KEY" or API_KEY == "" then
         user_balance_str = "No API Key"
         return
@@ -955,7 +955,7 @@ end
 -- 10. UNIFIED CHATBOX & WORKFLOW CONTROLLER
 -- ==============================================================================
 
-local function RenderMarkdownText(ctx, text)
+local function render_markdown_text(ctx, text)
     if not text or text == "" then return end
 
     for line in text:gmatch("([^\r\n]*)[\r\n]?") do
@@ -998,24 +998,24 @@ local chat_input_text = ""
 local report_saved_path = nil
 local scroll_to_bottom = false
 
-local function RunFreshScan(target_mode, model_choice, mute_parallels, bypass_master_fx, duration_pref, output_api, custom_notes)
+local function run_fresh_scan(target_mode, model_choice, mute_parallels, bypass_master_fx, duration_pref, output_api, custom_notes)
     local target_descriptions = { [1] = "Drums & Bass", [2] = "Instruments", [3] = "Vocals", [4] = "Full Mix" }
     local target_name = target_descriptions[target_mode] or "Full Mix"
     local selected_model = get_model_name(model_choice)
 
     -- 1. Scan and isolate
-    SaveAndApplyMixState(target_mode, mute_parallels, bypass_master_fx)
-    local project_yaml, song_regions = ExtractFullProjectYAML()
+    save_and_apply_mix_state(target_mode, mute_parallels, bypass_master_fx)
+    local project_yaml, song_regions = extract_full_project_yaml()
 
     -- 2. Render and analyze
     local tracks_before = reaper.CountTracks(0)
     reaper.Main_OnCommand(42230, 0)
-    local audio_metrics, rendered_tracks, dsp_error = AnalyzeGhostRender(song_regions, duration_pref, tracks_before)
+    local audio_metrics, rendered_tracks, dsp_error = analyze_ghost_render(song_regions, duration_pref, tracks_before)
 
     if rendered_tracks then
         for _, trk in ipairs(rendered_tracks) do reaper.DeleteTrack(trk) end
     end
-    RestoreMixState()
+    restore_mix_state()
 
     if not audio_metrics then
         reaper.ShowMessageBox(dsp_error or "DSP Processing failed.", "Analysis Error", 0)
@@ -1023,8 +1023,8 @@ local function RunFreshScan(target_mode, model_choice, mute_parallels, bypass_ma
     end
 
     -- 3. Save raw file
-    local full_prompt = BuildFullPrompt(project_yaml, audio_metrics, target_name, custom_notes)
-    report_saved_path = SavePromptToTxt(full_prompt, target_name)
+    local full_prompt = build_full_prompt(project_yaml, audio_metrics, target_name, custom_notes)
+    report_saved_path = save_prompt_to_txt(full_prompt, target_name)
 
     -- 4. Initialize chat history for DeepSeek Prompt Caching
     chat_history = {
@@ -1033,10 +1033,10 @@ local function RunFreshScan(target_mode, model_choice, mute_parallels, bypass_ma
     }
 
     if output_api then
-        local reply = AskDeepSeek(chat_history, selected_model)
+        local reply = ask_deep_seek(chat_history, selected_model)
         table.insert(chat_history, { role = "assistant", content = reply })
         scroll_to_bottom = true
-        FetchDeepSeekBalance()
+        fetch_deep_seek_balance()
     else
         table.insert(chat_history, { role = "assistant", content = "Analysis saved to file:\n" .. (report_saved_path or "") })
         scroll_to_bottom = true
@@ -1045,22 +1045,22 @@ local function RunFreshScan(target_mode, model_choice, mute_parallels, bypass_ma
     return true
 end
 
-local function SendFollowupMessage(user_text, model_choice)
-    if TrimString(user_text) == "" then return end
+local function send_followup_message(user_text, model_choice)
+    if trim_string(user_text) == "" then return end
     local selected_model = get_model_name(model_choice)
 
     table.insert(chat_history, { role = "user", content = user_text })
     scroll_to_bottom = true
 
-    local reply = AskDeepSeek(chat_history, selected_model)
+    local reply = ask_deep_seek(chat_history, selected_model)
     table.insert(chat_history, { role = "assistant", content = reply })
-    FetchDeepSeekBalance()
+    fetch_deep_seek_balance()
     scroll_to_bottom = true
 end
 
 local function main()
 	-- Query live balance immediately upon launching the script
-    FetchDeepSeekBalance()
+    fetch_deep_seek_balance()
 
 	local ctx = reaper.ImGui_CreateContext("AI_Mix_Assistant")
     local target_idx = 3
@@ -1086,7 +1086,7 @@ local function main()
             reaper.ImGui_TextColored(ctx, 0x81C784FF, user_balance_str)
             reaper.ImGui_SameLine(ctx)
             if reaper.ImGui_SmallButton(ctx, "↻ Refresh") then
-                FetchDeepSeekBalance()
+                fetch_deep_seek_balance()
             end
             reaper.ImGui_Separator(ctx)
             reaper.ImGui_Dummy(ctx, 0, 2)
@@ -1104,7 +1104,7 @@ local function main()
                 _, custom_notes = reaper.ImGui_InputText(ctx, "##notes", custom_notes)
 
                 if reaper.ImGui_Button(ctx, "Run Fresh Scan & Reset Chat", -1, 30) then
-                    RunFreshScan(target_idx + 1, model_idx + 1, mute_parallels, bypass_master_fx, get_duration_seconds(duration_idx), output_api, custom_notes)
+                    run_fresh_scan(target_idx + 1, model_idx + 1, mute_parallels, bypass_master_fx, get_duration_seconds(duration_idx), output_api, custom_notes)
                 end
                 reaper.ImGui_Separator(ctx)
             end
@@ -1123,7 +1123,7 @@ local function main()
                         reaper.ImGui_Separator(ctx)
                     elseif msg.role == "assistant" then
                         reaper.ImGui_TextColored(ctx, 0x81C784FF, "DEEPSEEK: ")
-                        RenderMarkdownText(ctx, msg.content)
+                        render_markdown_text(ctx, msg.content)
                         reaper.ImGui_Separator(ctx)
                     end
                 end
@@ -1149,10 +1149,10 @@ local function main()
             -- Stack the 'Send' and 'Copy Chat' buttons neatly beside the multiline box
             if reaper.ImGui_BeginGroup(ctx) then
                 if reaper.ImGui_Button(ctx, "Send", 85, 24) then
-                    if TrimString(chat_input_text) ~= "" then
+                    if trim_string(chat_input_text) ~= "" then
                         local user_msg = chat_input_text
                         chat_input_text = ""
-                        SendFollowupMessage(user_msg, model_idx + 1)
+                        send_followup_message(user_msg, model_idx + 1)
                     end
                 end
 
