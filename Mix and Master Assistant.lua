@@ -678,19 +678,10 @@ local function process_audio_chunk(take, item_pos, analyze_start, analyze_dur)
 
     if not ok then return nil end
 
-    -- Defensive conversion: some REAPER builds expose the data differently, so we avoid
-    -- assuming every array supports .table() without checking first.
+	-- Convert C++ buffer to a native 1-based Lua table
     local samples = buffer
-    if type(samples) == "userdata" then
-        local table_fn = samples.table
-        if type(table_fn) == "function" then
-            local ok_table, converted = pcall(function()
-                return table_fn(samples)
-            end)
-            if ok_table and type(converted) == "table" then
-                samples = converted
-            end
-        end
+    if type(buffer) == "userdata" and buffer.table then
+        samples = buffer.table()
     end
 
     if type(samples) ~= "table" then return nil end
@@ -786,11 +777,11 @@ local function analyze_ghost_render(regions, duration_pref, tracks_before, pre_r
 
     -- Build a real identity set of tracks created by the render by comparing GUIDs before
     -- and after. This is more reliable than assuming track count/index range alone.
-    local existing_guids = {}
-    for i = 0, tracks_before - 1 do
-        local trk = reaper.GetTrack(0, i)
-        if trk then
-            existing_guids[reaper.GetTrackGUID(trk)] = true
+    local existing_guids = pre_render_guids or {}
+    if not pre_render_guids then
+        for i = 0, tracks_before - 1 do
+            local trk = reaper.GetTrack(0, i)
+            if trk then existing_guids[reaper.GetTrackGUID(trk)] = true end
         end
     end
 
@@ -1274,9 +1265,10 @@ local function ask_deep_seek(chat_history, model_name)
     json_file:write(json_payload)
     json_file:close()
 
-    local curl_command = curl_bin .. ' -sS -D "' .. temp_response_path .. '.headers" -o "' .. temp_response_path .. '" -X POST https://api.deepseek.com/chat/completions ' ..
+	local curl_command = curl_bin .. ' -sS -D "' .. temp_response_path .. '.headers" -o "' .. temp_response_path .. '" -X POST https://api.deepseek.com/chat/completions ' ..
                          '-H ' .. shell_quote_for_curl('Authorization: Bearer ' .. API_KEY) .. ' ' ..
                          '-H ' .. shell_quote_for_curl('Content-Type: application/json') .. ' ' ..
+                         '-H ' .. shell_quote_for_curl('Expect:') .. ' ' ..
                          '-d ' .. shell_quote_for_curl('@' .. temp_json_path)
     os.execute(curl_command)
 
@@ -1301,10 +1293,9 @@ local function ask_deep_seek(chat_history, model_name)
     os.remove(temp_response_path)
     os.remove(temp_response_path .. ".headers")
 
-    local http_status = headers:match("HTTP/[%d%.]+%s+(%d%d%d)")
+	local http_status = headers:match(".*HTTP/[%d%.]+%s+(%d%d%d)")
     if http_status and http_status ~= "200" then
         local msg = "DeepSeek API HTTP Error (" .. http_status .. ")"
-        if headers ~= "" then msg = msg .. "\nHeaders:\n" .. headers end
         return msg .. "\n\nBody:\n" .. tostring(raw_response)
     end
 
@@ -1372,13 +1363,16 @@ local function fetch_deep_seek_balance()
         return
     end
 
-    local total_balance = data.total_balance or data.total or data.balance
+    -- DeepSeek balance is inside balance_infos[1]
+    local info = (data.balance_infos and data.balance_infos[1]) or data
+    local total_balance = info.total_balance or info.total or info.balance
+
     if total_balance == nil then
         user_balance_str = "Check Failed"
         return
     end
 
-    local currency = data.currency or "USD"
+    local currency = info.currency or "USD"
     local symbol = (currency == "USD") and "$" or "¥"
     user_balance_str = symbol .. tostring(total_balance)
 end
