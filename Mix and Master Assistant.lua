@@ -1228,11 +1228,10 @@ local function ask_deep_seek(chat_history, model_name)
     json_file:write(json_payload)
     json_file:close()
 
-    local curl_command = curl_bin .. ' -s -X POST https://api.deepseek.com/chat/completions ' ..
+    local curl_command = curl_bin .. ' -sS -D "' .. temp_response_path .. '.headers" -o "' .. temp_response_path .. '" -X POST https://api.deepseek.com/chat/completions ' ..
                          '-H ' .. shell_quote_for_curl('Authorization: Bearer ' .. API_KEY) .. ' ' ..
                          '-H ' .. shell_quote_for_curl('Content-Type: application/json') .. ' ' ..
-                         '-d ' .. shell_quote_for_curl('@' .. temp_json_path) .. ' ' ..
-                         '-o ' .. shell_quote_for_curl(temp_response_path)
+                         '-d ' .. shell_quote_for_curl('@' .. temp_json_path)
     os.execute(curl_command)
 
     local response_file = io.open(temp_response_path, "r")
@@ -1245,8 +1244,23 @@ local function ask_deep_seek(chat_history, model_name)
     local raw_response = response_file:read("*a")
     response_file:close()
 
+    local header_file = io.open(temp_response_path .. ".headers", "r")
+    local headers = ""
+    if header_file then
+        headers = header_file:read("*a")
+        header_file:close()
+    end
+
     os.remove(temp_json_path)
     os.remove(temp_response_path)
+    os.remove(temp_response_path .. ".headers")
+
+    local http_status = headers:match("HTTP/[%d%.]+%s+(%d%d%d)")
+    if http_status and http_status ~= "200" then
+        local msg = "DeepSeek API HTTP Error (" .. http_status .. ")"
+        if headers ~= "" then msg = msg .. "\nHeaders:\n" .. headers end
+        return msg .. "\n\nBody:\n" .. tostring(raw_response)
+    end
 
     -- Parse response using the full JSON decoder
     local ok, data = parse_json(raw_response)
