@@ -1,5 +1,5 @@
 -- ==============================================================================
--- REAPER AI MIX ASSISTANT & SCANNER (v4.5 - FULL READABILITY EDITION)
+-- REAPER AI MIX ASSISTANT & SCANNER (v5.0 - FULL READABILITY EDITION)
 -- ==============================================================================
 -- Features:
 -- 1. Token-Optimized YAML Architecture Scanner (Reduces LLM cost, retains data)
@@ -681,10 +681,16 @@ local function process_audio_chunk(take, item_pos, analyze_start, analyze_dur)
     -- Defensive conversion: some REAPER builds expose the data differently, so we avoid
     -- assuming every array supports .table() without checking first.
     local samples = buffer
-    if type(samples) == "table" and type(samples.table) == "function" then
-        samples = samples:table()
-    elseif type(samples) == "userdata" and type(samples.table) == "function" then
-        samples = samples:table()
+    if type(samples) == "userdata" then
+        local table_fn = samples.table
+        if type(table_fn) == "function" then
+            local ok_table, converted = pcall(function()
+                return table_fn(samples)
+            end)
+            if ok_table and type(converted) == "table" then
+                samples = converted
+            end
+        end
     end
 
     if type(samples) ~= "table" then return nil end
@@ -768,18 +774,53 @@ end
 -- 8. MULTI-REGION & MULTI-TRACK GHOST RENDER ANALYZER (FIXED)
 -- ==============================================================================
 
-local function analyze_ghost_render(regions, duration_pref, tracks_before)
+local function analyze_ghost_render(regions, duration_pref, tracks_before, pre_render_guids)
     local tracks_after = reaper.CountTracks(0)
     local num_new_tracks = tracks_after - tracks_before
 
-    if num_new_tracks <= 0 then
-        return nil, nil, "Render failed or 'Add rendered items to new tracks' was not checked."
+    -- Build a real identity set of tracks created by the render by comparing GUIDs before
+    -- and after. This is more reliable than assuming track count/index range alone.
+    local existing_guids = {}
+    for i = 0, tracks_before - 1 do
+        local trk = reaper.GetTrack(0, i)
+        if trk then
+            existing_guids[reaper.GetTrackGUID(trk)] = true
+        end
     end
 
-    -- Collect ALL newly created render tracks
-    local new_tracks = {}
-    for i = tracks_before, tracks_after - 1 do
-        table.insert(new_tracks, reaper.GetTrack(0, i))
+    local render_tracks = {}
+    local seen_render_guids = {}
+    for i = 0, tracks_after - 1 do
+        local trk = reaper.GetTrack(0, i)
+        if trk then
+            local guid = reaper.GetTrackGUID(trk)
+            if not existing_guids[guid] and not seen_render_guids[guid] then
+                seen_render_guids[guid] = true
+                local item_count = reaper.CountTrackMediaItems(trk)
+                local found_audio = false
+                for item_idx = 0, item_count - 1 do
+                    local media_item = reaper.GetTrackMediaItem(trk, item_idx)
+                    local take = media_item and reaper.GetActiveTake(media_item)
+                    if take and reaper.TakeNumChannels(take) > 0 then
+                        local item_len = reaper.GetMediaItemInfo_Value(media_item, "D_LENGTH")
+                        if item_len and item_len > 0 then
+                            found_audio = true
+                            break
+                        end
+                    end
+                end
+                if found_audio then
+                    table.insert(render_tracks, trk)
+                end
+            end
+        end
+    end
+
+    if #render_tracks == 0 then
+        if num_new_tracks <= 0 then
+            return nil, nil, "Render did not create any new tracks. In REAPER, enable 'Render > Add rendered items to new tracks' before running the analysis."
+        end
+        return nil, nil, "Render created temporary tracks, but no valid audio items were generated. Check your time selection, mix bounds, and whether 'Render > Add rendered items to new tracks' is enabled."
     end
 
     local regional_metrics = {}
@@ -789,8 +830,8 @@ local function analyze_ghost_render(regions, duration_pref, tracks_before)
         for _, region in ipairs(regions) do
             local analyzed = false
 
-            -- Search across all newly rendered tracks and items for this region
-            for _, trk in ipairs(new_tracks) do
+            -- Search across all newly rendered tracks and items for this region.
+            for _, trk in ipairs(render_tracks) do
                 for item_idx = 0, reaper.CountTrackMediaItems(trk) - 1 do
                     local media_item = reaper.GetTrackMediaItem(trk, item_idx)
                     local take = media_item and reaper.GetActiveTake(media_item)
@@ -827,35 +868,32 @@ local function analyze_ghost_render(regions, duration_pref, tracks_before)
         end
     end
 
--- Fallback if no regions exist: analyze first valid item across full timeline
+    -- Fallback if no regions exist: analyze the first valid audio item across the whole timeline.
     if not next(regional_metrics) then
-        for _, trk in ipairs(new_tracks) do
-            if trk then -- Safe dereference check
-                local first_item = reaper.GetTrackMediaItem(trk, 0)
-                local take = first_item and reaper.GetActiveTake(first_item)
+        for _, trk in ipairs(render_tracks) do
+            local first_item = reaper.GetTrackMediaItem(trk, 0)
+            local take = first_item and reaper.GetActiveTake(first_item)
 
-                if take then
-                    local pos = reaper.GetMediaItemInfo_Value(first_item, "D_POSITION")
-                    local dur = reaper.GetMediaItemInfo_Value(first_item, "D_LENGTH")
-                    if duration_pref > 0 then dur = math.min(duration_pref, dur) end
+            if take then
+                local pos = reaper.GetMediaItemInfo_Value(first_item, "D_POSITION")
+                local dur = reaper.GetMediaItemInfo_Value(first_item, "D_LENGTH")
+                if duration_pref > 0 then dur = math.min(duration_pref, dur) end
 
-                    local m = process_audio_chunk(take, pos, pos, dur)
-                    if m then
-                        m.active_trks = get_active_tracks(pos, pos + dur, tracks_before)
-                        regional_metrics["01_Entire_Song"] = m
-                    end
-                    break -- Stop searching once we successfully analyze the first valid take
+                local m = process_audio_chunk(take, pos, pos, dur)
+                if m then
+                    m.active_trks = get_active_tracks(pos, pos + dur, tracks_before)
+                    regional_metrics["01_Entire_Song"] = m
+                    break
                 end
             end
         end
     end
 
-    -- ULTIMATE SAFETY NET: If metrics are still empty, abort gracefully
     if not next(regional_metrics) then
-        return nil, new_tracks, "Analysis failed: No valid audio items were generated by the render. Check your time selection and mix bounds."
+        return nil, render_tracks, "Render created temporary tracks, but no valid audio items were generated. Check your time selection, mix bounds, and whether 'Render > Add rendered items to new tracks' is enabled."
     end
 
-    return regional_metrics, new_tracks, nil
+    return regional_metrics, render_tracks, nil
 end
 
 
@@ -1392,8 +1430,16 @@ local function run_fresh_scan(target_mode, model_choice, mute_parallels, bypass_
 
     -- 2. Render and analyze
     local tracks_before = reaper.CountTracks(0)
+    local pre_render_guids = {}
+    for i = 0, tracks_before - 1 do
+        local trk = reaper.GetTrack(0, i)
+        if trk then
+            pre_render_guids[reaper.GetTrackGUID(trk)] = true
+        end
+    end
+
     reaper.Main_OnCommand(42230, 0)
-    local audio_metrics, rendered_tracks, dsp_error = analyze_ghost_render(song_regions, duration_pref, tracks_before)
+    local audio_metrics, rendered_tracks, dsp_error = analyze_ghost_render(song_regions, duration_pref, tracks_before, pre_render_guids)
 
     if rendered_tracks then
         for _, trk in ipairs(rendered_tracks) do reaper.DeleteTrack(trk) end
