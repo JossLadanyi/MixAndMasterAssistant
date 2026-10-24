@@ -37,7 +37,7 @@ local reaper = reaper
 local API_KEY = "YOUR_DEEPSEEK_API_KEY"
 
 -- Maximum plugin parameters to capture per effect (Balances precision vs tokens)
-local MAX_PLUGIN_PARAMS = 64
+local MAX_PLUGIN_PARAMS = 128
 
 -- DSP Sample Rate & Filter Q Factor (Chamberlin State-Variable Filter)
 local SAMPLE_RATE = 44100
