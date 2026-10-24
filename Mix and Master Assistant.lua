@@ -1079,11 +1079,11 @@ local function main()
             -- SCAN SETTINGS PANEL
             if reaper.ImGui_CollapsingHeader(ctx, "Scan Configuration & Controls") then
                 _, target_idx = reaper.ImGui_Combo(ctx, "Target", target_idx, target_items)
-                _, model_idx  = reaper.ImGui_Combo(ctx, "AI Model", model_idx, model_items)
                 _, mute_parallels = reaper.ImGui_Checkbox(ctx, "Mute Parallels", mute_parallels)
                 _, bypass_master_fx = reaper.ImGui_Checkbox(ctx, "Bypass Master FX", bypass_master_fx)
                 _, duration_idx = reaper.ImGui_Combo(ctx, "Duration", duration_idx, duration_items)
                 _, output_api = reaper.ImGui_Checkbox(ctx, "Query DeepSeek API (Uncheck for TXT only)", output_api)
+                _, model_idx = reaper.ImGui_Combo(ctx, "AI Model", model_idx, model_items)
 
                 reaper.ImGui_Text(ctx, "Custom Instructions / Notes for Scan:")
                 _, custom_notes = reaper.ImGui_InputText(ctx, "##notes", custom_notes)
