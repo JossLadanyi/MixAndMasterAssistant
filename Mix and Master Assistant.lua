@@ -1328,6 +1328,8 @@ end
 
 local user_balance_str = "N/A"
 
+local user_balance_str = "N/A"
+
 local function fetch_deep_seek_balance()
     if API_KEY == "YOUR_DEEPSEEK_API_KEY" or API_KEY == "" then
         user_balance_str = "No API Key"
@@ -1340,10 +1342,14 @@ local function fetch_deep_seek_balance()
         return
     end
 
+    local os_name = reaper.GetOS()
     local curl_cmd = curl_bin .. ' -sS -H ' .. shell_quote_for_curl('Authorization: Bearer ' .. API_KEY) ..
                      ' https://api.deepseek.com/user/balance'
 
-    local handle = io.popen(curl_cmd)
+    -- On Windows, wrap the command in an extra pair of quotes so cmd.exe doesn't strip inner quotes.
+    -- Append 2>&1 so stderr errors (like network/certificate issues) are captured instead of lost.
+    local popen_cmd = os_name:match("Win") and ('"' .. curl_cmd .. ' 2>&1"') or (curl_cmd .. ' 2>&1')
+    local handle = io.popen(popen_cmd)
     local raw = handle and handle:read("*a") or ""
     if handle then handle:close() end
 
@@ -1352,29 +1358,36 @@ local function fetch_deep_seek_balance()
         return
     end
 
+    local total_balance = nil
+    local currency = "USD"
+
+    -- 1. Parse via JSON decoder
     local ok_json, data = parse_json(raw)
-    if not ok_json or type(data) ~= "table" then
+    if ok_json and type(data) == "table" then
+        if data.error then
+            user_balance_str = data.error.message or "API Error"
+            return
+        end
+        -- DeepSeek balance is nested inside balance_infos[1]
+        local info = (data.balance_infos and data.balance_infos[1]) or data
+        total_balance = info.total_balance or info.total or info.balance
+        currency = info.currency or currency
+    end
+
+    -- 2. Direct regex fallback (guarantees extraction even if JSON structure varies)
+    if not total_balance then
+        total_balance = raw:match('"total_balance"%s*:%s*"(.-)"')
+        currency = raw:match('"currency"%s*:%s*"(.-)"') or currency
+    end
+
+    if total_balance then
+        local symbol = (currency == "USD") and "$" or "¥"
+        user_balance_str = symbol .. tostring(total_balance)
+    else
         user_balance_str = "Check Failed"
-        return
+        -- Print exact server output to the console for instant diagnostics
+        reaper.ShowConsoleMsg("\n[DeepSeek Balance Error]\nRaw Server Output:\n" .. tostring(raw) .. "\n")
     end
-
-    if data.error then
-        user_balance_str = "API Error"
-        return
-    end
-
-    -- DeepSeek balance is inside balance_infos[1]
-    local info = (data.balance_infos and data.balance_infos[1]) or data
-    local total_balance = info.total_balance or info.total or info.balance
-
-    if total_balance == nil then
-        user_balance_str = "Check Failed"
-        return
-    end
-
-    local currency = info.currency or "USD"
-    local symbol = (currency == "USD") and "$" or "¥"
-    user_balance_str = symbol .. tostring(total_balance)
 end
 
 -- ==============================================================================
