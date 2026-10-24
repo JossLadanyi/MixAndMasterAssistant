@@ -1141,6 +1141,20 @@ local function command_succeeded(cmd)
     return status == 0 or status == true
 end
 
+local function shell_quote_for_curl(value)
+    local text = tostring(value or "")
+    local os_name = reaper.GetOS()
+
+    if os_name:match("Win") then
+        text = text:gsub('"', '""')
+        return '"' .. text .. '"'
+    end
+
+    text = text:gsub("\\", "\\\\")
+    text = text:gsub("'", "'\\''")
+    return "'" .. text .. "'"
+end
+
 local function resolve_curl_binary()
     if cached_curl_cmd then return cached_curl_cmd end
 
@@ -1215,9 +1229,10 @@ local function ask_deep_seek(chat_history, model_name)
     json_file:close()
 
     local curl_command = curl_bin .. ' -s -X POST https://api.deepseek.com/chat/completions ' ..
-                         '-H "Authorization: Bearer ' .. API_KEY .. '" ' ..
-                         '-H "Content-Type: application/json" ' ..
-                         '-d @"' .. temp_json_path .. '" -o "' .. temp_response_path .. '"'
+                         '-H ' .. shell_quote_for_curl('Authorization: Bearer ' .. API_KEY) .. ' ' ..
+                         '-H ' .. shell_quote_for_curl('Content-Type: application/json') .. ' ' ..
+                         '-d ' .. shell_quote_for_curl('@' .. temp_json_path) .. ' ' ..
+                         '-o ' .. shell_quote_for_curl(temp_response_path)
     os.execute(curl_command)
 
     local response_file = io.open(temp_response_path, "r")
@@ -1276,8 +1291,8 @@ local function fetch_deep_seek_balance()
 
     local temp_resp = reaper.GetResourcePath() .. "/temp_ds_bal.txt"
     local curl_cmd = curl_bin .. ' -s -X GET https://api.deepseek.com/user/balance ' ..
-                     '-H "Authorization: Bearer ' .. API_KEY .. '" ' ..
-                     '-o "' .. temp_resp .. '"'
+                     '-H ' .. shell_quote_for_curl('Authorization: Bearer ' .. API_KEY) .. ' ' ..
+                     '-o ' .. shell_quote_for_curl(temp_resp)
     os.execute(curl_cmd)
 
     local file = io.open(temp_resp, "r")
