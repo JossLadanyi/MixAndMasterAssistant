@@ -656,15 +656,23 @@ local function process_audio_chunk(take, item_pos, analyze_start, analyze_dur)
     local num_samples = math.floor(analyze_dur * SAMPLE_RATE)
     if num_samples < 1 then return nil end
 
-    -- Allocate buffer for 2 channels (Left + Right interleaved)
     local buffer = reaper.new_array(num_samples * 2)
     local accessor = reaper.CreateTakeAudioAccessor(take)
-    reaper.GetAudioAccessorSamples(accessor, SAMPLE_RATE, 2, analyze_start - item_pos, num_samples, buffer)
+    local ok = reaper.GetAudioAccessorSamples(accessor, SAMPLE_RATE, 2, analyze_start - item_pos, num_samples, buffer)
     reaper.DestroyAudioAccessor(accessor)
 
-    -- Convert C++ buffer to a native 1-based Lua table (faster & avoids metamethod calls)
-    local samples = buffer.table()
-    local total_sample_count = #samples
+    if not ok then return nil end
+
+    -- Defensive conversion: some REAPER builds expose the data differently, so we avoid
+    -- assuming every array supports .table() without checking first.
+    local samples = buffer
+    if type(samples) == "table" and samples.table then
+        samples = samples:table()
+    elseif type(samples) == "userdata" and type(samples.table) == "function" then
+        samples = samples:table()
+    end
+
+    local total_sample_count = type(samples) == "table" and #samples or 0
     if total_sample_count < 2 then return nil end
 
     local peak_left, peak_right = 0, 0
