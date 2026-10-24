@@ -774,6 +774,19 @@ end
 -- 8. MULTI-REGION & MULTI-TRACK GHOST RENDER ANALYZER (FIXED)
 -- ==============================================================================
 
+local function get_take_channel_count(take, media_item)
+    if not take then return 0 end
+
+    if media_item and reaper.GetMediaItemInfo_Value then
+        local channels = reaper.GetMediaItemInfo_Value(media_item, "I_NCHAN")
+        if channels and channels > 0 then
+            return math.floor(channels)
+        end
+    end
+
+    return 0
+end
+
 local function analyze_ghost_render(regions, duration_pref, tracks_before, pre_render_guids)
     local tracks_after = reaper.CountTracks(0)
     local num_new_tracks = tracks_after - tracks_before
@@ -801,7 +814,7 @@ local function analyze_ghost_render(regions, duration_pref, tracks_before, pre_r
                 for item_idx = 0, item_count - 1 do
                     local media_item = reaper.GetTrackMediaItem(trk, item_idx)
                     local take = media_item and reaper.GetActiveTake(media_item)
-                    if take and reaper.TakeNumChannels(take) > 0 then
+                    if get_take_channel_count(take, media_item) > 0 then
                         local item_len = reaper.GetMediaItemInfo_Value(media_item, "D_LENGTH")
                         if item_len and item_len > 0 then
                             found_audio = true
