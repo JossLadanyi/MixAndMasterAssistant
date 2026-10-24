@@ -996,9 +996,40 @@ local function parse_json(str)
 
     local function parse_number()
         local start_pos = pos
-        while pos <= len and str:sub(pos, pos):match('[%d%.eE%+%-]') do
+
+        -- Optional leading sign
+        if str:sub(pos, pos) == '-' or str:sub(pos, pos) == '+' then
             pos = pos + 1
         end
+
+        -- Integer part
+        while pos <= len and str:sub(pos, pos):match('%d') do
+            pos = pos + 1
+        end
+
+        -- Fractional part
+        if str:sub(pos, pos) == '.' then
+            pos = pos + 1
+            while pos <= len and str:sub(pos, pos):match('%d') do
+                pos = pos + 1
+            end
+        end
+
+        -- Exponent part
+        if str:sub(pos, pos) == 'e' or str:sub(pos, pos) == 'E' then
+            local exp_pos = pos
+            pos = pos + 1
+            if str:sub(pos, pos) == '-' or str:sub(pos, pos) == '+' then
+                pos = pos + 1
+            end
+            while pos <= len and str:sub(pos, pos):match('%d') do
+                pos = pos + 1
+            end
+            if pos == exp_pos + 1 then
+                error("Invalid exponent in JSON number at pos " .. exp_pos)
+            end
+        end
+
         return tonumber(str:sub(start_pos, pos - 1))
     end
 
