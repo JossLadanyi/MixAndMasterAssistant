@@ -550,8 +550,8 @@ local function get_track_category(name)
 end
 
 local function save_and_apply_mix_state(target_mode, mute_parallels, bypass_master_fx)
+    saved_mix_state = { tracks = {}, master_fx = {} }
     local master_track = reaper.GetMasterTrack(0)
-    saved_mix_state.master_fx = {}
 
     -- Backup and bypass master FX
     for fx_idx = 0, reaper.TrackFX_GetCount(master_track) - 1 do
@@ -562,35 +562,46 @@ local function save_and_apply_mix_state(target_mode, mute_parallels, bypass_mast
     -- Backup and set track solos/mutes
     for i = 0, reaper.CountTracks(0) - 1 do
         local track = reaper.GetTrack(0, i)
-        local track_guid = reaper.GetTrackGUID(track)
-        local _, track_name = reaper.GetSetMediaTrackInfo_String(track, "P_NAME", "", false)
-        local category = get_track_category(track_name)
+        if track then
+            local track_guid = reaper.GetTrackGUID(track)
+            local _, track_name = reaper.GetSetMediaTrackInfo_String(track, "P_NAME", "", false)
+            local category = get_track_category(track_name)
 
-        saved_mix_state.tracks[track_guid] = {
-            solo = reaper.GetMediaTrackInfo_Value(track, "I_SOLO"),
-            mute = reaper.GetMediaTrackInfo_Value(track, "B_MUTE")
-        }
+            saved_mix_state.tracks[track_guid] = {
+                solo = reaper.GetMediaTrackInfo_Value(track, "I_SOLO"),
+                mute = reaper.GetMediaTrackInfo_Value(track, "B_MUTE")
+            }
 
-        if target_mode ~= 4 then
-            reaper.SetMediaTrackInfo_Value(track, "I_SOLO", (category == target_mode) and 2 or 0)
-        end
-        if mute_parallels and category == 99 then
-            reaper.SetMediaTrackInfo_Value(track, "B_MUTE", 1)
+            if target_mode ~= 4 then
+                reaper.SetMediaTrackInfo_Value(track, "I_SOLO", (category == target_mode) and 2 or 0)
+            end
+            if mute_parallels and category == 99 then
+                reaper.SetMediaTrackInfo_Value(track, "B_MUTE", 1)
+            end
         end
     end
 end
 
 local function restore_mix_state()
     local master_track = reaper.GetMasterTrack(0)
-    for fx_idx, state in pairs(saved_mix_state.master_fx) do
-        reaper.TrackFX_SetEnabled(master_track, fx_idx, state)
-    end
-    for i = 0, reaper.CountTracks(0) - 1 do
-        local track = reaper.GetTrack(0, i)
-        local state = saved_mix_state.tracks[reaper.GetTrackGUID(track)]
-        if state then
-            reaper.SetMediaTrackInfo_Value(track, "I_SOLO", state.solo)
-            reaper.SetMediaTrackInfo_Value(track, "B_MUTE", state.mute)
+
+    if saved_mix_state then
+        for fx_idx, state in pairs(saved_mix_state.master_fx or {}) do
+            if master_track and reaper.TrackFX_GetCount(master_track) > fx_idx then
+                reaper.TrackFX_SetEnabled(master_track, fx_idx, state)
+            end
+        end
+
+        for i = 0, reaper.CountTracks(0) - 1 do
+            local track = reaper.GetTrack(0, i)
+            if track then
+                local track_guid = reaper.GetTrackGUID(track)
+                local state = saved_mix_state.tracks and saved_mix_state.tracks[track_guid]
+                if state then
+                    reaper.SetMediaTrackInfo_Value(track, "I_SOLO", state.solo)
+                    reaper.SetMediaTrackInfo_Value(track, "B_MUTE", state.mute)
+                end
+            end
         end
     end
 end
