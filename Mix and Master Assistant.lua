@@ -1460,7 +1460,8 @@ local function main()
 
     local function loop()
         reaper.ImGui_SetNextWindowSize(ctx, 720, 680, reaper.ImGui_Cond_FirstUseEver())
-        local visible, open = reaper.ImGui_Begin(ctx, "Mix and Master Assistant", true, reaper.ImGui_WindowFlags_NoCollapse())
+        local window_flags = reaper.ImGui_WindowFlags_NoCollapse() | reaper.ImGui_WindowFlags_TopMost()
+		local visible, open = reaper.ImGui_Begin(ctx, "Mix and Master Assistant", true, window_flags)
 
 		if visible then
             -- Live Account Balance Bar
