@@ -1529,23 +1529,23 @@ local function main()
 
             reaper.ImGui_SameLine(ctx)
 
-            -- Stack the 'Send' and 'Copy Chat' buttons neatly beside the multiline box
-            if reaper.ImGui_BeginGroup(ctx) then
-                if reaper.ImGui_Button(ctx, "Send", 85, 24) then
-                    if trim_string(chat_input_text) ~= "" then
-                        local user_msg = chat_input_text
-                        chat_input_text = ""
-                        send_followup_message(user_msg, model_idx + 1)
-                    end
+            -- Stack the 'Send' and 'Copy Chat' buttons neatly beside the multiline box.
+            -- We keep the group strictly balanced so ReaImGui does not report a missing EndGroup().
+            reaper.ImGui_BeginGroup(ctx)
+            if reaper.ImGui_Button(ctx, "Send", 85, 24) then
+                if trim_string(chat_input_text) ~= "" then
+                    local user_msg = chat_input_text
+                    chat_input_text = ""
+                    send_followup_message(user_msg, model_idx + 1)
                 end
-
-                if reaper.ImGui_Button(ctx, "Copy Chat", 85, 24) then
-                    if #chat_history > 0 then
-                        reaper.ImGui_SetClipboardText(ctx, chat_history[#chat_history].content)
-                    end
-                end
-                reaper.ImGui_EndGroup(ctx)
             end
+
+            if reaper.ImGui_Button(ctx, "Copy Chat", 85, 24) then
+                if #chat_history > 0 then
+                    reaper.ImGui_SetClipboardText(ctx, chat_history[#chat_history].content)
+                end
+            end
+            reaper.ImGui_EndGroup(ctx)
         end
 
         reaper.ImGui_End(ctx)
