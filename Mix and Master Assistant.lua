@@ -810,7 +810,7 @@ local function BuildFullPrompt(project_yaml, audio_metrics, target_str, user_not
 
     if user_notes and user_notes ~= "" then
         prompt = prompt .. "[USER CUSTOM INSTRUCTIONS FOR THIS PASS]:\n"
-        prompt = prompt .. trim(user_notes) .. "\n\n"
+        prompt = prompt .. TrimString(user_notes) .. "\n\n"
     end
 
     prompt = prompt .. "1. MACRO-DYNAMICS: Compare Crest Factor and RMS across regions. If dynamic contrast is lacking, pinpoint over-compression in the YAML and specify threshold/ratio adjustments.\n"
