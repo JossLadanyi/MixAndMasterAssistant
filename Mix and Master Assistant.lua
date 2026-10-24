@@ -1041,6 +1041,58 @@ local function parse_json(str)
 end
 
 -- ==============================================================================
+-- ROBUST CURL RESOLVER & PRE-FLIGHT CHECK
+-- ==============================================================================
+
+local cached_curl_cmd = nil
+
+local function resolve_curl_binary()
+    if cached_curl_cmd then return cached_curl_cmd end
+
+    local os_name = reaper.GetOS()
+
+    -- 1. Windows Path Resolution
+    if os_name:match("Win") then
+        local windir = os.getenv("WINDIR") or "C:\\Windows"
+        local candidates = {
+            -- Direct System32 path (avoids broken PATH variable)
+            windir .. "\\System32\\curl.exe",
+            -- Sysnative virtual folder (bypasses 32-bit to 64-bit redirection in WoW64)
+            windir .. "\\Sysnative\\curl.exe",
+            -- Common Git for Windows bundled curl
+            "C:\\Program Files\\Git\\mingw64\\bin\\curl.exe",
+            "C:\\Program Files\\Git\\usr\\bin\\curl.exe",
+        }
+
+        for _, filepath in ipairs(candidates) do
+            if reaper.file_exists(filepath) then
+                cached_curl_cmd = '"' .. filepath .. '"'
+                return cached_curl_cmd
+            end
+        end
+
+    -- 2. macOS / Linux Path Resolution
+    else
+        local unix_candidates = {
+            "/usr/bin/curl",
+            "/usr/local/bin/curl",
+            "/opt/homebrew/bin/curl", -- Apple Silicon Homebrew
+        }
+
+        for _, filepath in ipairs(unix_candidates) do
+            if reaper.file_exists(filepath) then
+                cached_curl_cmd = filepath
+                return cached_curl_cmd
+            end
+        end
+    end
+
+    -- Fallback to system PATH
+    cached_curl_cmd = "curl"
+    return cached_curl_cmd
+end
+
+-- ==============================================================================
 -- HARDENED API DISPATCHER
 -- ==============================================================================
 
@@ -1059,14 +1111,20 @@ local function ask_deep_seek(chat_history, model_name)
     json_file:write(json_payload)
     json_file:close()
 
-    local curl_command = 'curl -s -X POST https://api.deepseek.com/chat/completions ' ..
+	local curl_bin = resolve_curl_binary()
+    local curl_command = curl_bin .. ' -s -X POST https://api.deepseek.com/chat/completions ' ..
                          '-H "Authorization: Bearer ' .. API_KEY .. '" ' ..
                          '-H "Content-Type: application/json" ' ..
                          '-d @"' .. temp_json_path .. '" -o "' .. temp_response_path .. '"'
     os.execute(curl_command)
 
     local response_file = io.open(temp_response_path, "r")
-    if not response_file then return "Network Error: API request failed or timed out." end
+    if not response_file then
+        return "Network Error: API request failed or timed out.\n\n" ..
+               "Troubleshooting:\n" ..
+               "1. Verify internet connection.\n" ..
+               "2. Ensure cURL is installed. If on an older Windows version, install cURL or place curl.exe in C:\\Windows\\System32."
+    end
     local raw_response = response_file:read("*a")
     response_file:close()
 
@@ -1109,7 +1167,8 @@ local function fetch_deep_seek_balance()
     end
 
     local temp_resp = reaper.GetResourcePath() .. "/temp_ds_bal.txt"
-    local curl_cmd = 'curl -s -X GET https://api.deepseek.com/user/balance ' ..
+    local curl_bin = resolve_curl_binary()
+    local curl_cmd = curl_bin .. ' -s -X GET https://api.deepseek.com/user/balance ' ..
                      '-H "Authorization: Bearer ' .. API_KEY .. '" ' ..
                      '-o "' .. temp_resp .. '"'
     os.execute(curl_cmd)
