@@ -37,7 +37,7 @@ local reaper = reaper
 local API_KEY = "YOUR_DEEPSEEK_API_KEY"
 
 -- Maximum plugin parameters to capture per effect (Balances precision vs tokens)
-local MAX_PLUGIN_PARAMS = 64  
+local MAX_PLUGIN_PARAMS = 64
 
 -- DSP Sample Rate & Filter Q Factor (Chamberlin State-Variable Filter)
 local SAMPLE_RATE = 44100
@@ -55,7 +55,7 @@ local DEFAULT_SETTINGS = {
 
 -- Parameters that carry zero mix relevance (GUI controls, meters, themes)
 local IGNORED_PARAMETER_KEYWORDS = {
-    "unused", "reserved", "midi", "ui ", "gui", "program", 
+    "unused", "reserved", "midi", "ui ", "gui", "program",
     "preset", "monitoring", "meter", "theme", "tooltip",
     "display", "analyzer"
 }
@@ -79,31 +79,31 @@ end
 local function clean_param_key(param_name)
     if not param_name then return "param" end
     param_name = TrimString(param_name):lower()
-    
+
     -- Audio Parameter Abbreviations for the YAML output
     local abbreviations = {
         frequency = "freq", threshold = "thr", release = "rel", attack = "att", ratio = "rat",
         volume = "vol", gain = "gn", level = "lvl", output = "out", input = "inp", feedback = "fb",
         time = "tm", mix = "mx", width = "wdth", drive = "drv", resonance = "res", bandwidth = "bw",
-        cutoff = "cut", highpass = "hp", lowpass = "lp", slope = "slp", sidechain = "sc", 
+        cutoff = "cut", highpass = "hp", lowpass = "lp", slope = "slp", sidechain = "sc",
         lookahead = "la", saturation = "sat"
     }
-    
+
     for full_word, abbreviation in pairs(abbreviations) do
         param_name = param_name:gsub(full_word, abbreviation)
     end
-    
+
     -- Preserve unit context cleanly
     param_name = param_name:gsub("%%", "_pct")
     param_name = param_name:gsub("%s*%(%s*hz%s*%)", "_hz"):gsub("%s*%[%s*hz%s*%]", "_hz")
     param_name = param_name:gsub("%s*%(%s*db%s*%)", "_db"):gsub("%s*%[%s*db%s*%]", "_db")
     param_name = param_name:gsub("%s*%(%s*ms%s*%)", "_ms"):gsub("%s*%[%s*ms%s*%]", "_ms")
-    
+
     -- Strip special characters
     param_name = param_name:gsub("[%[%]%(%)]", "")
     param_name = param_name:gsub("[%s%-%/]+", "_")
     param_name = param_name:gsub("^_+", ""):gsub("_+$", "")
-    
+
     return param_name ~= "" and param_name or "param"
 end
 
@@ -124,24 +124,24 @@ local function is_valid_parameter_name(name)
     if not name or name == "" then return false end
     name = TrimString(name):lower()
     if name:match("^control %d+$") then return false end
-    for _, word in ipairs(IGNORED_PARAMETER_KEYWORDS) do 
-        if name:find(word) then return false end 
+    for _, word in ipairs(IGNORED_PARAMETER_KEYWORDS) do
+        if name:find(word) then return false end
     end
     return true
 end
 
 local function is_boilerplate(param_name, param_value)
     if not param_name or not param_value then return true end
-    
+
     local name_lower = TrimString(param_name):lower()
     local val_clean = TrimString(param_value):lower():gsub("%s+", "")
-    
+
     if val_clean == "" or name_lower:find("ui") or name_lower:find("graph") then return true end
 
     -- Filter out default bypass/power states
     if name_lower == "bypass" and (val_clean == "normal" or val_clean == "off" or val_clean == "0") then return true end
     if name_lower == "power" and (val_clean == "on" or val_clean == "1") then return true end
-    
+
     -- Filter out default 100% wet / 0% dry states
     local num_val = val_clean:gsub("db$", ""):gsub("%%$", "")
     if name_lower:find("wet") and (num_val == "100" or num_val == "100.0" or num_val == "1.0") then return true end
@@ -150,9 +150,9 @@ local function is_boilerplate(param_name, param_value)
     return false
 end
 
-local function linear_to_db(vol) 
+local function linear_to_db(vol)
     if vol <= 1e-7 then return -144.0 end
-    return math.floor((20 * math.log(vol, 10)) * 10 + 0.5) / 10 
+    return math.floor((20 * math.log(vol, 10)) * 10 + 0.5) / 10
 end
 
 local function format_pan_value(pan_val)
@@ -206,7 +206,7 @@ local INLINE_KEYS = { meta = true, params = true, media = true, flags = true, ac
 local INLINE_ARRAY_PARENTS = { arr = true, connections = true }
 local KEY_ORDER = {
     "notes", "meta", "arr", "connections", "tracks",
-    "track", "flags", "vol_db", "pan", "depth", "parent", 
+    "track", "flags", "vol_db", "pan", "depth", "parent",
     "auto", "media", "fx",
     "name", "type", "bypassed", "wet", "params",
     "src", "dst", "purpose", "dst_ch"
@@ -521,7 +521,7 @@ end
 local function SaveAndApplyMixState(target_mode, mute_parallels, bypass_master_fx)
     local master_track = reaper.GetMasterTrack(0)
     saved_mix_state.master_fx = {}
-    
+
     -- Backup and bypass master FX
     for fx_idx = 0, reaper.TrackFX_GetCount(master_track) - 1 do
         saved_mix_state.master_fx[fx_idx] = reaper.TrackFX_GetEnabled(master_track, fx_idx)
@@ -584,36 +584,36 @@ local function GetActiveTracks(start_time, end_time, max_tracks)
     local active_tracks = {}
     -- Only loop through tracks that existed BEFORE the render occurred
     local limit = (max_tracks or reaper.CountTracks(0)) - 1
-    
+
     for i = 0, limit do
         local track = reaper.GetTrack(0, i)
-        
+
         if IsTrackAudible(track) then
             local is_active = false
             local item_count = reaper.CountTrackMediaItems(track)
-            
+
             for j = 0, item_count - 1 do
                 local item = reaper.GetTrackMediaItem(track, j)
                 local item_muted = (reaper.GetMediaItemInfo_Value(item, "B_MUTE") == 1)
-                
+
                 if not item_muted then
                     local pos = reaper.GetMediaItemInfo_Value(item, "D_POSITION")
                     local len = reaper.GetMediaItemInfo_Value(item, "D_LENGTH")
-                    
+
                     if (pos < end_time) and (pos + len > start_time) then
                         is_active = true
                         break
                     end
                 end
             end
-            
+
             if is_active then
                 local _, name = reaper.GetSetMediaTrackInfo_String(track, "P_NAME", "", false)
                 table.insert(active_tracks, name ~= "" and name or ("Track_" .. (i + 1)))
             end
         end
     end
-    
+
     return active_tracks
 end
 
@@ -676,7 +676,7 @@ local function ProcessAudioChunk(take, item_pos, analyze_start, analyze_dur)
     local peak_db = (true_peak > 0) and (20 * math.log(true_peak, 10)) or -144
     local rms_db = (sum_sq_mid+sum_sq_side) > 0 and (20 * math.log(math.sqrt((sum_sq_mid+sum_sq_side)/num_samples), 10)) or -144
     local width_pct = (sum_sq_mid+sum_sq_side) > 0 and (math.sqrt(sum_sq_side)/(math.sqrt(sum_sq_mid)+math.sqrt(sum_sq_side)))*100 or 0
-    
+
     local sub_mono_status = ((eng_sub_side / (eng_sub + eng_sub_side + 0.0001)) * 100 > 12) and "Phase_Risk" or "Safe"
     local total_eng = eng_sub + eng_punch + eng_mud + eng_boxy + eng_core + eng_pres + eng_harsh + eng_sib + eng_air + 0.0001
 
@@ -705,7 +705,7 @@ end
 local function AnalyzeGhostRender(regions, duration_pref, tracks_before)
     local tracks_after = reaper.CountTracks(0)
     local num_new_tracks = tracks_after - tracks_before
-    
+
     if num_new_tracks <= 0 then
         return nil, nil, "Render failed or 'Add rendered items to new tracks' was not checked."
     end
@@ -782,21 +782,31 @@ end
 
 
 -- ==============================================================================
--- 9. PROMPT BUILDER & API DISPATCHER
+-- 9. UNIFIED PROMPT BUILDER & MANDATORY FILE EXPORTER
 -- ==============================================================================
 
-local function BuildFullPrompt(project_yaml, audio_metrics, target_str)
-    local prompt = "You are an elite, multi-platinum audio mixing and mastering engineer.\n"
+local function BuildFullPrompt(project_yaml, audio_metrics, target_str, user_notes)
+    local prompt = "=== MIXING & MASTERING DIRECTIVES ===\nYou are an elite, multi-platinum audio mixing and mastering engineer.\n"
     prompt = prompt .. "Focus Target: " .. target_str .. "\n\n"
-    prompt = prompt .. "=== REGIONAL AUDIO ANALYSIS METRICS ===\n" .. to_yaml(audio_metrics) .. "\n\n"
-    prompt = prompt .. "=== REAPER PROJECT CONFIGURATION & FX CHAINS ===\n" .. project_yaml .. "\n\n"
+
+    -- UNIFIED INSTRUCTIONS BLOCK (Combined Core Directives + User Notes)
     prompt = prompt .. "=== INSTRUCTIONS FOR ANALYSIS ===\n"
+
+    if user_notes and user_notes ~= "" then
+        prompt = prompt .. "[USER CUSTOM INSTRUCTIONS FOR THIS PASS]:\n"
+        prompt = prompt .. trim(user_notes) .. "\n\n"
+    end
+
     prompt = prompt .. "1. MACRO-DYNAMICS: Compare Crest Factor and RMS across regions. If dynamic contrast is lacking, pinpoint over-compression in the YAML and specify threshold/ratio adjustments.\n"
     prompt = prompt .. "2. LOW/MID FREQUENCY BALANCE: Scrutinize Sub (60Hz), Punch (120Hz), Mud (250Hz), and Boxy (500Hz). Locate masking in the project tracks and suggest surgical EQ cuts.\n"
     prompt = prompt .. "3. HIGH FREQUENCY INTEGRITY: Differentiate Harshness (6kHz) from Sibilance (8kHz). Look for abrasive saturation or identify tracks requiring a De-Esser.\n"
     prompt = prompt .. "4. STEREO & SUB-MONO INTEGRITY: Check 'width_pct' and 'sub_mono'. If 'Phase_Risk' is flagged on sub-bass, immediately identify which low-end tracks have wide side-channel information and advise how to high-pass or mono their sides.\n"
     prompt = prompt .. "5. CONTEXT AWARENESS: Look closely at 'active_trks' for each region. ONLY critique or suggest changes to tracks that are actively playing in that specific region.\n"
-    prompt = prompt .. "6. PRECISION: Quote exact track names, plugin names, and parameter settings as formatted in the project YAML."
+    prompt = prompt .. "6. PRECISION: Quote exact track names, plugin names, and parameter settings as formatted in the project YAML.\n\n"
+
+    prompt = prompt .. "=== REGIONAL AUDIO ANALYSIS METRICS ===\n" .. to_yaml(audio_metrics) .. "\n\n"
+    prompt = prompt .. "=== REAPER PROJECT CONFIGURATION & FX CHAINS ===\n" .. project_yaml .. "\n"
+
     return prompt
 end
 
@@ -867,7 +877,7 @@ local function AskDeepSeek(full_prompt, model_name)
         content_match = content_match:gsub('"%s*}%s*]%s*}%s*$', '')
         return content_match:gsub('\\n', '\n'):gsub('\\"', '"'):gsub('\\\\', '\\')
     end
-    
+
     return "Failed to parse API response. Raw response:\n" .. raw_response
 end
 
@@ -921,25 +931,24 @@ local report_ai_text = ""
 local report_metrics_yaml = ""
 local report_saved_path = nil
 
-local function RunWorkflow(target_mode, model_choice, mute_parallels, bypass_master_fx, duration_pref, output_mode)
+local function RunWorkflow(target_mode, model_choice, mute_parallels, bypass_master_fx, duration_pref, output_api, user_notes)
     local target_descriptions = { [1] = "Drums & Bass", [2] = "Instruments", [3] = "Vocals", [4] = "Full Mix" }
     local target_name = target_descriptions[target_mode] or "Full Mix"
 
     local model_ids = { [1] = "deepseek-v4-pro", [2] = "deepseek-flash" }
     local selected_model = model_ids[model_choice] or "deepseek-v4-pro"
 
-    -- 1. apply the mutes/solos/bypasses to the REAPER mixer state
-    SaveAndApplyMixState(target_mode, mute_parallels, bypass_master_fx)
-
-    -- 2. extract the project YAML (it will skip muted/disabled parallel tracks or master FX)
+    -- 1. Scan full project hierarchy & routing
     local project_yaml, song_regions = ExtractFullProjectYAML()
+
+    -- 2. Solo target and mute requested busses
+    SaveAndApplyMixState(target_mode, mute_parallels, bypass_master_fx)
 
     -- 3. Run ghost render and 9-band DSP analysis
     local tracks_before = reaper.CountTracks(0)
-    reaper.Main_OnCommand(42230, 0) -- Render using current settings with auto-add
+    reaper.Main_OnCommand(42230, 0)
     local audio_metrics, rendered_tracks, dsp_error = AnalyzeGhostRender(song_regions, duration_pref, tracks_before)
 
-    -- Cleanup scratch tracks & restore original mixer state
     if rendered_tracks then
         for _, trk in ipairs(rendered_tracks) do reaper.DeleteTrack(trk) end
     end
@@ -950,19 +959,17 @@ local function RunWorkflow(target_mode, model_choice, mute_parallels, bypass_mas
         return false
     end
 
-    -- 4. Build prompt package
-    local full_prompt = BuildFullPrompt(project_yaml, audio_metrics, target_name)
+    -- 4. Build prompt package (incorporating user notes at the top)
+    local full_prompt = BuildFullPrompt(project_yaml, audio_metrics, target_name, user_notes)
     report_metrics_yaml = to_yaml(audio_metrics)
 
-    -- Handle File Export (Modes 2 & 3)
-    report_saved_path = nil
-    if output_mode == 2 or output_mode == 3 then
-        report_saved_path = SavePromptToTxt(full_prompt, target_name)
-    end
+    -- MANDATORY: Always save to text file
+    report_saved_path = SavePromptToTxt(full_prompt, target_name)
 
-    -- Handle API Call (Modes 1 & 3)
+    -- Handle API Call depending on checkbox choice
     report_ai_text = ""
-    if output_mode == 1 or output_mode == 3 then
+    if output_api then
+        reaper.ShowConsoleMsg("Transmitting payload to DeepSeek API... (Wait 3-10 seconds)\n")
         report_ai_text = AskDeepSeek(full_prompt, selected_model)
     else
         report_ai_text = "Prompt exported to text file successfully.\n\nFile location:\n" .. (report_saved_path or "")
@@ -975,36 +982,40 @@ local function main()
     local ctx = reaper.ImGui_CreateContext("AI_Mix_Assistant")
     local target_idx = 3           -- 0: Drums, 1: Inst, 2: Vox, 3: Full Mix
     local model_idx = 0            -- 0: DeepSeek V4 Pro, 1: DeepSeek Flash
-    local mute_parallels = true    
-    local bypass_master_fx = true  
+    local mute_parallels = true
+    local bypass_master_fx = true
     local duration_idx = 0         -- 0: 10s, 1: 20s, 2: Full
-    local output_idx = 0           -- 0: API, 1: TXT, 2: Both
+    local output_api = true        -- Checkbox: Call API or just save file
+    local user_notes = ""          -- Text buffer for additional instructions
 
     local target_items = "Drums & Bass\0Instruments\0Vocals\0Full Mix\0\0"
     local model_items  = "DeepSeek V4 Pro (Flagship Reasoning)\0DeepSeek Flash (Fast / Low-Cost)\0\0"
     local duration_items = "10 Seconds\0" .. "20 Seconds\0" .. "Full Region\0\0"
-    local output_items = "Call DeepSeek API\0Save TXT Only (Web LLMs)\0Both (API + TXT)\0\0"
 
     local function loop()
-        -- Make window slightly taller to accommodate the extra combo box
-        local win_w = (current_view == "SETTINGS") and 390 or 700
-        local win_h = (current_view == "SETTINGS") and 290 or 580
+        local win_w = (current_view == "SETTINGS") and 420 or 700
+        local win_h = (current_view == "SETTINGS") and 370 or 580
         reaper.ImGui_SetNextWindowSize(ctx, win_w, win_h, reaper.ImGui_Cond_FirstUseEver())
 
-        local title = (current_view == "SETTINGS") and "AI Mix Assistant v4.5" or "AI Mix Directive Report"
+        local title = (current_view == "SETTINGS") and "AI Mix Assistant v4.6" or "AI Mix Directive Report"
         local visible, open = reaper.ImGui_Begin(ctx, title, true, reaper.ImGui_WindowFlags_NoCollapse())
-        
+
         if visible then
             if current_view == "SETTINGS" then
                 _, target_idx = reaper.ImGui_Combo(ctx, "Target Bus", target_idx, target_items)
                 _, model_idx  = reaper.ImGui_Combo(ctx, "AI Model", model_idx, model_items)
-                
+
                 reaper.ImGui_Separator(ctx)
 
                 _, mute_parallels = reaper.ImGui_Checkbox(ctx, "Mute Parallel Busses (NYC/Rear/etc)", mute_parallels)
                 _, bypass_master_fx = reaper.ImGui_Checkbox(ctx, "Bypass Master Bus FX Chain", bypass_master_fx)
                 _, duration_idx = reaper.ImGui_Combo(ctx, "Duration", duration_idx, duration_items)
-                _, output_idx = reaper.ImGui_Combo(ctx, "Output Mode", output_idx, output_items)
+                _, output_api = reaper.ImGui_Checkbox(ctx, "Also Call DeepSeek API (Uncheck for TXT Only)", output_api)
+
+                reaper.ImGui_Dummy(ctx, 0, 4)
+                reaper.ImGui_Text(ctx, "Additional Instructions / Notes for AI:")
+                -- Multiline text input box for custom user notes
+                _, user_notes = reaper.ImGui_InputTextMultiline(ctx, "##user_notes", user_notes, -1, 50)
 
                 reaper.ImGui_Dummy(ctx, 0, 6)
                 reaper.ImGui_Separator(ctx)
@@ -1012,8 +1023,15 @@ local function main()
 
                 if reaper.ImGui_Button(ctx, "Run Mix Analysis", -1, 32) then
                     local dur_values = { [0] = 10, [1] = 20, [2] = 0 }
-                    -- Pass model_idx + 1 (1 = deepseek-v4-pro, 2 = deepseek-flash)
-                    local success = RunWorkflow(target_idx + 1, model_idx + 1, mute_parallels, bypass_master_fx, dur_values[duration_idx], output_idx + 1)
+                    local success = RunWorkflow(
+                        target_idx + 1,
+                        model_idx + 1,
+                        mute_parallels,
+                        bypass_master_fx,
+                        dur_values[duration_idx],
+                        output_api,
+                        user_notes
+                    )
                     if success then
                         current_view = "REPORT"
                     end
@@ -1023,7 +1041,7 @@ local function main()
                 if reaper.ImGui_Button(ctx, "◀ Back to Scan", 120, 26) then
                     current_view = "SETTINGS"
                 end
-                
+
                 reaper.ImGui_SameLine(ctx)
                 if reaper.ImGui_Button(ctx, "Copy Directives to Clipboard", 200, 26) then
                     reaper.ImGui_SetClipboardText(ctx, report_ai_text)
