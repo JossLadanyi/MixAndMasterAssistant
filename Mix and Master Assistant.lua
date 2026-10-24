@@ -1134,6 +1134,13 @@ end
 
 local cached_curl_cmd = nil
 
+local function command_succeeded(cmd)
+    local status = os.execute(cmd)
+    if status == true then return true end
+    if type(status) == "number" then return status == 0 end
+    return status == 0 or status == true
+end
+
 local function resolve_curl_binary()
     if cached_curl_cmd then return cached_curl_cmd end
 
@@ -1174,7 +1181,7 @@ local function resolve_curl_binary()
 
     -- 3. Final safe probe: if curl is not in the known locations, check PATH.
     local probe_cmd = os_name:match("Win") and 'curl.exe --version >nul 2>&1' or 'curl --version >/dev/null 2>&1'
-    if os.execute(probe_cmd) == 0 then
+    if command_succeeded(probe_cmd) then
         cached_curl_cmd = "curl"
         return cached_curl_cmd
     end
