@@ -668,7 +668,11 @@ local function process_audio_chunk(take, item_pos, analyze_start, analyze_dur)
     if num_samples < 1 then return nil end
 
     local buffer = reaper.new_array(num_samples * 2)
+    if not buffer then return nil end
+
     local accessor = reaper.CreateTakeAudioAccessor(take)
+    if not accessor then return nil end
+
     local ok = reaper.GetAudioAccessorSamples(accessor, SAMPLE_RATE, 2, analyze_start - item_pos, num_samples, buffer)
     reaper.DestroyAudioAccessor(accessor)
 
@@ -677,13 +681,15 @@ local function process_audio_chunk(take, item_pos, analyze_start, analyze_dur)
     -- Defensive conversion: some REAPER builds expose the data differently, so we avoid
     -- assuming every array supports .table() without checking first.
     local samples = buffer
-    if type(samples) == "table" and samples.table then
+    if type(samples) == "table" and type(samples.table) == "function" then
         samples = samples:table()
     elseif type(samples) == "userdata" and type(samples.table) == "function" then
         samples = samples:table()
     end
 
-    local total_sample_count = type(samples) == "table" and #samples or 0
+    if type(samples) ~= "table" then return nil end
+
+    local total_sample_count = #samples
     if total_sample_count < 2 then return nil end
 
     local peak_left, peak_right = 0, 0
