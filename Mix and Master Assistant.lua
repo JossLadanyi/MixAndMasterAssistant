@@ -997,7 +997,7 @@ local function main()
         local win_h = (current_view == "SETTINGS") and 370 or 580
         reaper.ImGui_SetNextWindowSize(ctx, win_w, win_h, reaper.ImGui_Cond_FirstUseEver())
 
-        local title = (current_view == "SETTINGS") and "AI Mix Assistant v4.6" or "AI Mix Directive Report"
+        local title = (current_view == "SETTINGS") and "Mix and Master Assistant" or "Mix and Master Assistant - Report"
         local visible, open = reaper.ImGui_Begin(ctx, title, true, reaper.ImGui_WindowFlags_NoCollapse())
 
         if visible then
