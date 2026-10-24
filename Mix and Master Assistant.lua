@@ -985,6 +985,7 @@ end
 local chat_history = {}
 local chat_input_text = ""
 local report_saved_path = nil
+local scroll_to_bottom = false
 
 local function RunFreshScan(target_mode, model_choice, mute_parallels, bypass_master_fx, duration_pref, output_api, custom_notes)
     local target_descriptions = { [1] = "Drums & Bass", [2] = "Instruments", [3] = "Vocals", [4] = "Full Mix" }
@@ -1024,9 +1025,11 @@ local function RunFreshScan(target_mode, model_choice, mute_parallels, bypass_ma
     if output_api then
         local reply = AskDeepSeek(chat_history, selected_model)
         table.insert(chat_history, { role = "assistant", content = reply })
+		scroll_to_bottom = true
         FetchDeepSeekBalance() -- AUTO-UPDATE BALANCE AFTER INITIAL SCAN
     else
         table.insert(chat_history, { role = "assistant", content = "Analysis saved to file:\n" .. (report_saved_path or "") })
+		scroll_to_bottom = true
     end
 
     return true
@@ -1037,10 +1040,15 @@ local function SendFollowupMessage(user_text, model_choice)
     local model_ids = { [1] = "deepseek-v4-pro", [2] = "deepseek-flash" }
     local selected_model = model_ids[model_choice] or "deepseek-v4-pro"
 
+    -- Add user message and immediately queue scroll down
     table.insert(chat_history, { role = "user", content = user_text })
+    scroll_to_bottom = true
+
+    -- Get DeepSeek response and queue scroll down to the answer
     local reply = AskDeepSeek(chat_history, selected_model)
     table.insert(chat_history, { role = "assistant", content = reply })
     FetchDeepSeekBalance() -- AUTO-UPDATE BALANCE AFTER FOLLOW-UP
+    scroll_to_bottom = true
 end
 
 local function main()
@@ -1098,7 +1106,8 @@ local function main()
             -- CHAT HISTORY LOG
             reaper.ImGui_TextColored(ctx, 0xFFD54FFF, "Conversation Log:")
             local _, avail_h = reaper.ImGui_GetContentRegionAvail(ctx)
-			local scroll_h = math.max(150, avail_h - 40)
+            local scroll_h = math.max(150, avail_h - 40)
+
             if reaper.ImGui_BeginChild(ctx, "ChatScroll", 0, scroll_h) then
                 for _, msg in ipairs(chat_history) do
                     if msg.role == "user" and msg.content ~= "Perform full mix analysis as instructed." then
@@ -1112,21 +1121,37 @@ local function main()
                         reaper.ImGui_Separator(ctx)
                     end
                 end
+
+                -- Auto-scroll down to the latest message
+                if scroll_to_bottom then
+                    reaper.ImGui_SetScrollHereY(ctx, 1.0)
+                    scroll_to_bottom = false
+                end
+
                 reaper.ImGui_EndChild(ctx)
             end
 
             -- FOLLOW-UP INPUT AREA
             reaper.ImGui_Separator(ctx)
-			local enter_pressed
-			enter_pressed, chat_input_text = reaper.ImGui_InputText(ctx, "##chat_in", chat_input_text, reaper.ImGui_InputTextFlags_EnterReturnsTrue())
-			reaper.ImGui_SameLine(ctx)
-			if reaper.ImGui_Button(ctx, "Send", 80, 24) or enter_pressed then
-				if TrimString(chat_input_text) ~= "" then
-					local user_msg = chat_input_text
-					chat_input_text = ""
-					SendFollowupMessage(user_msg, model_idx + 1)
-				end
-			end
+
+            -- Stretch input box across the window leaving room for buttons
+            reaper.ImGui_SetNextItemWidth(ctx, -170)
+            _, chat_input_text = reaper.ImGui_InputText(ctx, "##chat_in", chat_input_text)
+
+            -- Detect Enter key while focused on the input box
+            local enter_pressed = reaper.ImGui_IsItemFocused(ctx) and
+                                  (reaper.ImGui_IsKeyPressed(ctx, reaper.ImGui_Key_Enter()) or
+                                   reaper.ImGui_IsKeyPressed(ctx, reaper.ImGui_Key_KeypadEnter()))
+
+            reaper.ImGui_SameLine(ctx)
+            if reaper.ImGui_Button(ctx, "Send", 80, 24) or enter_pressed then
+                if TrimString(chat_input_text) ~= "" then
+                    local user_msg = chat_input_text
+                    chat_input_text = ""
+                    SendFollowupMessage(user_msg, model_idx + 1)
+                end
+            end
+
             reaper.ImGui_SameLine(ctx)
             if reaper.ImGui_Button(ctx, "Copy Last", 80, 24) then
                 if #chat_history > 0 then
