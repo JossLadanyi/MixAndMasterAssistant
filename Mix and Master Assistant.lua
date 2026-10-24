@@ -860,27 +860,61 @@ local function build_full_prompt(project_yaml, audio_metrics, target_str, user_n
 end
 
 local function save_prompt_to_txt(full_prompt, target_str)
-    local _, project_filepath = reaper.EnumProjects(-1, "")
-    local project_dir = reaper.GetProjectPath("")
+    local path_separator = package.config:sub(1,1) or "/"
+    local sanitized_target = target_str:gsub("[%s%p]+", "_")
+    local filename_only = "AI_Mix_Prompt_" .. sanitized_target .. ".txt"
 
+    local target_dir = nil
+    local _, project_filepath = reaper.EnumProjects(-1, "")
+
+    -- 1. Check if project is saved to disk (.rpp)
     if project_filepath and project_filepath ~= "" then
-        local matched_dir = project_filepath:match("^(.*)[\\/]")
-        if matched_dir then project_dir = matched_dir end
+        target_dir = project_filepath:match("^(.*)[\\/]")
     end
 
-    local path_separator = package.config:sub(1,1) or "/"
-    if not project_dir:match("[\\/]$") then project_dir = project_dir .. path_separator end
+    -- 2. Fallback to default project recording path if valid
+    if not target_dir or target_dir == "" then
+        local project_path = reaper.GetProjectPath("")
+        if project_path and project_path ~= "" then
+            target_dir = project_path
+        end
+    end
 
-    local sanitized_target = target_str:gsub("[%s%p]+", "_")
-    local output_filename = project_dir .. "AI_Mix_Prompt_" .. sanitized_target .. ".txt"
+    -- 3. Fail-safe for unsaved projects: REAPER Resource Directory
+    -- (Always exists and is guaranteed to have user-write permissions)
+    if not target_dir or target_dir == "" then
+        target_dir = reaper.GetResourcePath()
+    end
 
-    local file = io.open(output_filename, "w")
+    -- Ensure proper trailing slash
+    if not target_dir:match("[\\/]$") then
+        target_dir = target_dir .. path_separator
+    end
+
+    local output_filename = target_dir .. filename_only
+    local file, err = io.open(output_filename, "w")
+
+    -- Emergency Fallback: If project folder is write-protected (e.g. read-only drive),
+    -- redirect file creation to REAPER's user directory
+    if not file then
+        local fallback_dir = reaper.GetResourcePath() .. path_separator
+        output_filename = fallback_dir .. filename_only
+        file, err = io.open(output_filename, "w")
+    end
+
     if file then
         file:write(full_prompt)
         file:close()
         return output_filename
+    else
+        -- Never fail silently: explicitly inform the user of the OS error
+        reaper.ShowMessageBox(
+            "Failed to save AI prompt text file.\n\nTried path:\n" .. output_filename ..
+            "\n\nSystem Error: " .. tostring(err),
+            "File Write Error", 0
+        )
+        return nil
     end
-    return nil
 end
 
 local function escape_json_string(str)
