@@ -652,10 +652,16 @@ local function process_audio_chunk(take, item_pos, analyze_start, analyze_dur)
     local num_samples = math.floor(analyze_dur * SAMPLE_RATE)
     if num_samples < 1 then return nil end
 
+    -- Allocate buffer for 2 channels (Left + Right interleaved)
     local buffer = reaper.new_array(num_samples * 2)
     local accessor = reaper.CreateTakeAudioAccessor(take)
     reaper.GetAudioAccessorSamples(accessor, SAMPLE_RATE, 2, analyze_start - item_pos, num_samples, buffer)
     reaper.DestroyAudioAccessor(accessor)
+
+    -- Convert C++ buffer to a native 1-based Lua table (faster & avoids metamethod calls)
+    local samples = buffer.table()
+    local total_sample_count = #samples
+    if total_sample_count < 2 then return nil end
 
     local peak_left, peak_right = 0, 0
     local sum_sq_mid, sum_sq_side = 0, 0
@@ -678,12 +684,17 @@ local function process_audio_chunk(take, item_pos, analyze_start, analyze_dur)
 
     local l1,b1, l2,b2, l3,b3, l4,b4, l5,b5, l6,b6, l7,b7, l8,b8, l9,b9, ls,bs = 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
 
-    for i = 1, num_samples * 2, 2 do
-        local samp_L, samp_R = buffer[i], buffer[i+1]
+    -- Fast native table loop (samples[1] = L0, samples[2] = R0, ...)
+    for i = 1, total_sample_count, 2 do
+        local samp_L = samples[i]
+        local samp_R = samples[i+1]
+
         if math.abs(samp_L) > peak_left then peak_left = math.abs(samp_L) end
         if math.abs(samp_R) > peak_right then peak_right = math.abs(samp_R) end
 
-        local mid, side = (samp_L + samp_R) * 0.5, (samp_L - samp_R) * 0.5
+        local mid = (samp_L + samp_R) * 0.5
+        local side = (samp_L - samp_R) * 0.5
+
         sum_sq_mid = sum_sq_mid + (mid * mid)
         sum_sq_side = sum_sq_side + (side * side)
 
@@ -707,7 +718,6 @@ local function process_audio_chunk(take, item_pos, analyze_start, analyze_dur)
     local sub_mono_status = ((eng_sub_side / (eng_sub + eng_sub_side + 0.0001)) * 100 > 12) and "Phase_Risk" or "Safe"
     local total_eng = eng_sub + eng_punch + eng_mud + eng_boxy + eng_core + eng_pres + eng_harsh + eng_sib + eng_air + 0.0001
 
-    -- Token optimized output keys for the AI
     return {
         dyn = { peak_db = round(peak_db, 1), rms_db = round(rms_db, 1), crest_db = round(peak_db - rms_db, 1) },
         stereo = { width_pct = round(width_pct, 1), sub_mono = sub_mono_status },
