@@ -1132,11 +1132,8 @@ local function resolve_curl_binary()
     if os_name:match("Win") then
         local windir = os.getenv("WINDIR") or "C:\\Windows"
         local candidates = {
-            -- Direct System32 path (avoids broken PATH variable)
             windir .. "\\System32\\curl.exe",
-            -- Sysnative virtual folder (bypasses 32-bit to 64-bit redirection in WoW64)
             windir .. "\\Sysnative\\curl.exe",
-            -- Common Git for Windows bundled curl
             "C:\\Program Files\\Git\\mingw64\\bin\\curl.exe",
             "C:\\Program Files\\Git\\usr\\bin\\curl.exe",
         }
@@ -1153,7 +1150,7 @@ local function resolve_curl_binary()
         local unix_candidates = {
             "/usr/bin/curl",
             "/usr/local/bin/curl",
-            "/opt/homebrew/bin/curl", -- Apple Silicon Homebrew
+            "/opt/homebrew/bin/curl",
         }
 
         for _, filepath in ipairs(unix_candidates) do
@@ -1164,9 +1161,15 @@ local function resolve_curl_binary()
         end
     end
 
-    -- Fallback to system PATH
-    cached_curl_cmd = "curl"
-    return cached_curl_cmd
+    -- 3. Final safe probe: if curl is not in the known locations, check PATH.
+    local probe_cmd = os_name:match("Win") and 'curl.exe --version >nul 2>&1' or 'curl --version >/dev/null 2>&1'
+    if os.execute(probe_cmd) == 0 then
+        cached_curl_cmd = "curl"
+        return cached_curl_cmd
+    end
+
+    cached_curl_cmd = nil
+    return nil
 end
 
 -- ==============================================================================
@@ -1176,6 +1179,11 @@ end
 local function ask_deep_seek(chat_history, model_name)
     local temp_json_path = reaper.GetResourcePath() .. "/temp_ds_request.json"
     local temp_response_path = reaper.GetResourcePath() .. "/temp_ds_response.txt"
+
+    local curl_bin = resolve_curl_binary()
+    if not curl_bin then
+        return "Network Error: cURL is not installed or not available on this system.\n\nInstall curl.exe or add it to PATH before using the DeepSeek API."
+    end
 
     local selected_model = model_name or "deepseek-v4-pro"
     local msgs_json = build_json_messages(chat_history)
@@ -1188,7 +1196,6 @@ local function ask_deep_seek(chat_history, model_name)
     json_file:write(json_payload)
     json_file:close()
 
-	local curl_bin = resolve_curl_binary()
     local curl_command = curl_bin .. ' -s -X POST https://api.deepseek.com/chat/completions ' ..
                          '-H "Authorization: Bearer ' .. API_KEY .. '" ' ..
                          '-H "Content-Type: application/json" ' ..
@@ -1243,8 +1250,13 @@ local function fetch_deep_seek_balance()
         return
     end
 
-    local temp_resp = reaper.GetResourcePath() .. "/temp_ds_bal.txt"
     local curl_bin = resolve_curl_binary()
+    if not curl_bin then
+        user_balance_str = "cURL Missing"
+        return
+    end
+
+    local temp_resp = reaper.GetResourcePath() .. "/temp_ds_bal.txt"
     local curl_cmd = curl_bin .. ' -s -X GET https://api.deepseek.com/user/balance ' ..
                      '-H "Authorization: Bearer ' .. API_KEY .. '" ' ..
                      '-o "' .. temp_resp .. '"'
