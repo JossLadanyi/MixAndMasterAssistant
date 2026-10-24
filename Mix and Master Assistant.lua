@@ -907,6 +907,39 @@ local function AskDeepSeek(chat_history, model_name)
     return "Failed to parse API response. Raw response:\n" .. raw_response
 end
 
+local user_balance_str = "N/A"
+
+local function FetchDeepSeekBalance()
+    if API_KEY == "YOUR_DEEPSEEK_API_KEY" or API_KEY == "" then
+        user_balance_str = "No API Key"
+        return
+    end
+
+    local temp_resp = reaper.GetResourcePath() .. "/temp_ds_bal.txt"
+    local curl_cmd = 'curl -s -X GET https://api.deepseek.com/user/balance ' ..
+                     '-H "Authorization: Bearer ' .. API_KEY .. '" ' ..
+                     '-o "' .. temp_resp .. '"'
+    os.execute(curl_cmd)
+
+    local file = io.open(temp_resp, "r")
+    if file then
+        local raw = file:read("*a")
+        file:close()
+        os.remove(temp_resp)
+
+        -- Extract total_balance and currency
+        local total = raw:match('"total_balance"%s*:%s*"(.-)"')
+        local curr  = raw:match('"currency"%s*:%s*"(.-)"') or "USD"
+
+        if total then
+            local symbol = (curr == "USD") and "$" or "¥"
+            user_balance_str = symbol .. total
+        else
+            user_balance_str = "Check Failed"
+        end
+    end
+end
+
 -- ==============================================================================
 -- 10. UNIFIED CHATBOX & WORKFLOW CONTROLLER
 -- ==============================================================================
@@ -991,6 +1024,7 @@ local function RunFreshScan(target_mode, model_choice, mute_parallels, bypass_ma
     if output_api then
         local reply = AskDeepSeek(chat_history, selected_model)
         table.insert(chat_history, { role = "assistant", content = reply })
+        FetchDeepSeekBalance() -- AUTO-UPDATE BALANCE AFTER INITIAL SCAN
     else
         table.insert(chat_history, { role = "assistant", content = "Analysis saved to file:\n" .. (report_saved_path or "") })
     end
@@ -1006,10 +1040,14 @@ local function SendFollowupMessage(user_text, model_choice)
     table.insert(chat_history, { role = "user", content = user_text })
     local reply = AskDeepSeek(chat_history, selected_model)
     table.insert(chat_history, { role = "assistant", content = reply })
+    FetchDeepSeekBalance() -- AUTO-UPDATE BALANCE AFTER FOLLOW-UP
 end
 
 local function main()
-    local ctx = reaper.ImGui_CreateContext("AI_Mix_Assistant")
+	-- Query live balance immediately upon launching the script
+    FetchDeepSeekBalance()
+
+	local ctx = reaper.ImGui_CreateContext("AI_Mix_Assistant")
     local target_idx = 3
     local model_idx = 0
     local mute_parallels = true
@@ -1026,7 +1064,18 @@ local function main()
         reaper.ImGui_SetNextWindowSize(ctx, 720, 680, reaper.ImGui_Cond_FirstUseEver())
         local visible, open = reaper.ImGui_Begin(ctx, "Mix and Master Assistant", true, reaper.ImGui_WindowFlags_NoCollapse())
 
-        if visible then
+		if visible then
+            -- Live Account Balance Bar
+            reaper.ImGui_Text(ctx, "Account Balance: ")
+            reaper.ImGui_SameLine(ctx)
+            reaper.ImGui_TextColored(ctx, 0x81C784FF, user_balance_str)
+            reaper.ImGui_SameLine(ctx)
+            if reaper.ImGui_SmallButton(ctx, "↻ Refresh") then
+                FetchDeepSeekBalance()
+            end
+            reaper.ImGui_Separator(ctx)
+            reaper.ImGui_Dummy(ctx, 0, 2)
+
             -- SCAN SETTINGS PANEL
             if reaper.ImGui_CollapsingHeader(ctx, "Scan Configuration & Controls") then
                 _, target_idx = reaper.ImGui_Combo(ctx, "Target", target_idx, target_items)
