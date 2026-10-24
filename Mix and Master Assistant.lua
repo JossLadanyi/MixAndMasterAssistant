@@ -512,10 +512,26 @@ local saved_mix_state = { tracks = {}, master_fx = {} }
 
 local function GetTrackCategory(name)
     name = name:lower()
-    if name:match("nyc") or name:match("rear") or name:match("parallel") or name:match("crush") then return 99 end
-    if name:match("drum") or name:match("kick") or name:match("snare") or name:match("bass") or name:match("808") then return 1 end
-    if name:match("vox") or name:match("vocal") or name:match("choir") or name:match("lead") then return 3 end
-    return 2 -- Instruments default
+
+    -- 99 = Parallel / Crush / NYC Busses
+    if name:match("nyc") or name:match("rear") or name:match("parallel") then
+        return 99
+
+    -- 1 = Drums & Bass (Drums, Percussion, Kicks, Snares, 808s, Basses)
+    elseif name:match("drum") or name:match("kick") or name:match("snare") or
+           name:match("hat") or name:match("perc") or name:match("cymbal") or
+           name:match("bass") or name:match("808") or name:match("sub") then
+        return 1
+
+    -- 3 = Vocals (Lead Vox, Harmonies, BGV, Choirs, Acapellas)
+    elseif name:match("vox") or name:match("vocal") or name:match("choir") or
+           name:match("lead") or name:match("bgv") or name:match("acap") or name:match("harmony") then
+        return 3
+
+    -- 2 = Instruments (Everything else: Guitars, Keys, Synths, Strings, Horns, FX, Pads)
+    else
+        return 2
+    end
 end
 
 local function SaveAndApplyMixState(target_mode, mute_parallels, bypass_master_fx)
