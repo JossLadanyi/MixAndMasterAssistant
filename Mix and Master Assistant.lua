@@ -522,7 +522,11 @@ end
 local saved_mix_state = { tracks = {}, master_fx = {} }
 
 local function get_track_category(name)
-    name = name:lower()
+    if type(name) ~= "string" then
+        name = ""
+    else
+        name = trim_string(name):lower()
+    end
 
     -- 99 = Parallel / Crush / NYC Busses
     if name:match("nyc") or name:match("rear") or name:match("parallel") then
