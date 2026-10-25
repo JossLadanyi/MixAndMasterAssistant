@@ -33,8 +33,8 @@ local reaper = reaper
 -- 1. GLOBAL CONFIGURATION & TUNING
 -- ==============================================================================
 
--- DeepSeek API Key (Only needed if using Output Mode: API or Both)
 local API_KEY = "YOUR_DEEPSEEK_API_KEY"
+-- DeepSeek API Key (Only needed if sending analysis to DeepSeek)
 
 -- Maximum plugin parameters to capture per effect (Balances precision vs tokens)
 local MAX_PLUGIN_PARAMS = 128
@@ -553,6 +553,7 @@ end
 local function save_and_apply_mix_state(target_mode, mute_parallels, bypass_master_fx)
     saved_mix_state = { tracks = {}, master_fx = {} }
     local master_track = reaper.GetMasterTrack(0)
+    local target_track_names = {} -- RESTORED: Collect the soloed tracks
 
     -- Backup and bypass master FX
     for fx_idx = 0, reaper.TrackFX_GetCount(master_track) - 1 do
@@ -567,6 +568,7 @@ local function save_and_apply_mix_state(target_mode, mute_parallels, bypass_mast
             local track_guid = reaper.GetTrackGUID(track)
             local _, track_name = reaper.GetSetMediaTrackInfo_String(track, "P_NAME", "", false)
             local category = get_track_category(track_name)
+            local display_name = (trim_string(track_name) ~= "") and trim_string(track_name) or ("Track " .. (i + 1))
 
             saved_mix_state.tracks[track_guid] = {
                 solo = reaper.GetMediaTrackInfo_Value(track, "I_SOLO"),
@@ -574,13 +576,20 @@ local function save_and_apply_mix_state(target_mode, mute_parallels, bypass_mast
             }
 
             if target_mode ~= 4 then
-                reaper.SetMediaTrackInfo_Value(track, "I_SOLO", (category == target_mode) and 2 or 0)
+                if category == target_mode then
+                    reaper.SetMediaTrackInfo_Value(track, "I_SOLO", 2)
+                    table.insert(target_track_names, display_name) -- RESTORED: Add to list
+                else
+                    reaper.SetMediaTrackInfo_Value(track, "I_SOLO", 0)
+                end
             end
             if mute_parallels and category == 99 then
                 reaper.SetMediaTrackInfo_Value(track, "B_MUTE", 1)
             end
         end
     end
+
+    return target_track_names
 end
 
 local function restore_mix_state()
@@ -895,11 +904,21 @@ end
 -- 9. UNIFIED PROMPT BUILDER & MANDATORY FILE EXPORTER
 -- ==============================================================================
 
-local function build_full_prompt(project_yaml, audio_metrics, target_str, user_notes)
+local function build_full_prompt(project_yaml, audio_metrics, target_str, user_notes, target_tracks)
     local prompt = "=== MIXING & MASTERING DIRECTIVES ===\nYou are an elite, multi-platinum audio mixing and mastering engineer.\n"
     prompt = prompt .. "Focus Target: " .. target_str .. "\n\n"
 
-    -- UNIFIED INSTRUCTIONS BLOCK (Combined Core Directives + User Notes)
+    -- NEW: Explicitly list soloed tracks and restrict AI focus
+    prompt = prompt .. "=== TARGET TRACKS ===\n"
+    if target_tracks and #target_tracks > 0 then
+        prompt = prompt .. "The following tracks are currently isolated (soloed) for this specific analysis:\n"
+        prompt = prompt .. "- " .. table.concat(target_tracks, "\n- ") .. "\n\n"
+        prompt = prompt .. "CRITICAL RESTRICTION: Focus YOUR ENTIRE ANALYSIS and plugin recommendations SOLELY on these specific tracks, plus the Master Bus if relevant. Do not critique or suggest parameter changes for any tracks outside this list.\n\n"
+    else
+        prompt = prompt .. "All active tracks are included in this full mix analysis.\n\n"
+    end
+
+    -- UNIFIED INSTRUCTIONS BLOCK
     prompt = prompt .. "=== INSTRUCTIONS FOR ANALYSIS ===\n"
 
     if user_notes and user_notes ~= "" then
@@ -1449,8 +1468,8 @@ local function run_fresh_scan(target_mode, model_choice, mute_parallels, bypass_
     local target_name = target_descriptions[target_mode] or "Full Mix"
     local selected_model = get_model_name(model_choice)
 
-    -- 1. Scan and isolate
-    save_and_apply_mix_state(target_mode, mute_parallels, bypass_master_fx)
+    -- 1. Scan and isolate (Now captures the list of soloed tracks)
+    local target_tracks = save_and_apply_mix_state(target_mode, mute_parallels, bypass_master_fx)
     local project_yaml, song_regions = extract_full_project_yaml()
 
     -- 2. Render and analyze
@@ -1476,14 +1495,23 @@ local function run_fresh_scan(target_mode, model_choice, mute_parallels, bypass_
         return false
     end
 
-    -- 3. Save raw file
-    local full_prompt = build_full_prompt(project_yaml, audio_metrics, target_name, custom_notes)
+	-- 3. Save raw file
+    local full_prompt = build_full_prompt(project_yaml, audio_metrics, target_name, custom_notes, target_tracks)
     report_saved_path = save_prompt_to_txt(full_prompt, target_name)
 
     -- 4. Initialize chat history for DeepSeek Prompt Caching
+    -- Create a UI-only message to show the tracks in the chatbox without sending them to the API
+    local initial_ui_msg = "Please analyze the mix for: **" .. target_name .. "**."
+    if target_mode ~= 4 and target_tracks and #target_tracks > 0 then
+        initial_ui_msg = initial_ui_msg .. "\n\n**Isolated Tracks:**\n- " .. table.concat(target_tracks, "\n- ")
+    elseif target_mode == 4 then
+        initial_ui_msg = initial_ui_msg .. " (All tracks included)."
+    end
+
     chat_history = {
         { role = "system", content = full_prompt },
-        { role = "user", content = "Perform full mix analysis as instructed." }
+        -- 'content' goes to DeepSeek, 'display_content' goes to your ReaImGui screen
+        { role = "user", content = "Perform full mix analysis as instructed.", display_content = initial_ui_msg }
     }
 
     if output_api then
@@ -1522,14 +1550,30 @@ local function main()
     -- LOAD FIXED-WIDTH FONT FOR CHAT (Slightly larger: size 15)
     -- =========================================================
     local os_name = reaper.GetOS()
-    local font_name = "Courier New" -- Safe fallback
-    if os_name:match("Win") then
-        font_name = "Consolas"
-    elseif os_name:match("OSX") or os_name:match("macOS") then
-        font_name = "Menlo"
+    local font_name = os_name:match("Win") and "Consolas" or "Menlo"
+    local chat_font = nil
+
+    if reaper.ImGui_CreateFont then
+        chat_font = reaper.ImGui_CreateFont(font_name)
+        reaper.ImGui_Attach(ctx, chat_font)
     end
-    local chat_font = reaper.ImGui_CreateFont(font_name, 15)
-    reaper.ImGui_Attach(ctx, chat_font)
+
+    -- Universal helper: handles ReaImGui 0.10+ (3 args) and older versions (2 args)
+    local function push_chat_font(size)
+        if chat_font then
+            local s = size or 15
+            local ok = pcall(reaper.ImGui_PushFont, ctx, chat_font, s)
+            if not ok then
+                pcall(reaper.ImGui_PushFont, ctx, chat_font)
+            end
+        end
+    end
+
+    local function pop_chat_font()
+        if chat_font then
+            pcall(reaper.ImGui_PopFont, ctx)
+        end
+    end
     -- =========================================================
 
     local target_idx = 3
@@ -1585,15 +1629,13 @@ local function main()
             local scroll_h = math.max(150, avail_h - 70)
 
             if reaper.ImGui_BeginChild(ctx, "ChatScroll", 0, scroll_h) then
-
-                -- >> PUSH CUSTOM FONT FOR CHAT LOG <<
-                reaper.ImGui_PushFont(ctx, chat_font)
+                push_chat_font(15)
 
                 for _, msg in ipairs(chat_history) do
-                    if msg.role == "user" and msg.content ~= "Perform full mix analysis as instructed." then
+                    if msg.role == "user" then
                         reaper.ImGui_TextColored(ctx, 0x4FC3F7FF, "YOU: ")
-                        reaper.ImGui_SameLine(ctx)
-                        reaper.ImGui_TextWrapped(ctx, msg.content)
+                        local text_to_show = msg.display_content or msg.content
+                        render_markdown_text(ctx, text_to_show)
                         reaper.ImGui_Separator(ctx)
                     elseif msg.role == "assistant" then
                         reaper.ImGui_TextColored(ctx, 0x81C784FF, "DEEPSEEK: ")
@@ -1608,25 +1650,21 @@ local function main()
                     scroll_to_bottom = false
                 end
 
-                -- >> POP CUSTOM FONT <<
-                reaper.ImGui_PopFont(ctx)
-
+                pop_chat_font()
                 reaper.ImGui_EndChild(ctx)
             end
 
             -- FOLLOW-UP INPUT AREA (MULTILINE + BUTTON ONLY)
             reaper.ImGui_Separator(ctx)
 
-            -- Multiline text box: Enter inserts a new line, does not submit
-            -- Width: -95px leaves room for the stacked buttons on the right. Height: 52px (approx 2.5 lines)
-            reaper.ImGui_PushFont(ctx, chat_font)
+            -- Multiline text box with fixed-width font
+            push_chat_font(15)
             _, chat_input_text = reaper.ImGui_InputTextMultiline(ctx, "##chat_in", chat_input_text, -95, 52)
-            reaper.ImGui_PopFont(ctx)
+            pop_chat_font()
 
             reaper.ImGui_SameLine(ctx)
 
-            -- Stack the 'Send' and 'Copy Chat' buttons neatly beside the multiline box.
-            -- We keep the group strictly balanced so ReaImGui does not report a missing EndGroup().
+            -- Stacked action buttons
             reaper.ImGui_BeginGroup(ctx)
             if reaper.ImGui_Button(ctx, "Send", 85, 24) then
                 if trim_string(chat_input_text) ~= "" then
