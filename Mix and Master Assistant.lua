@@ -528,7 +528,7 @@ local function get_track_category(name)
         name = trim_string(name):lower()
     end
 
-    -- 99 = Parallel / Crush / NYC Busses
+    -- 99 = Parallel / Rear / NYC Busses
     if name:match("nyc") or name:match("rear") or name:match("parallel") then
         return 99
 
@@ -540,7 +540,8 @@ local function get_track_category(name)
 
     -- 3 = Vocals (Lead Vox, Harmonies, BGV, Choirs, Acapellas)
     elseif name:match("vox") or name:match("vocal") or name:match("choir") or
-           name:match("lead") or name:match("bgv") or name:match("acap") or name:match("harmony") then
+           name:match("lead") or name:match("bgv") or name:match("acap") or
+           name:match("harmony") or name:match("chorus") or name:match("backing") then
         return 3
 
     -- 2 = Instruments (Everything else: Guitars, Keys, Synths, Strings, Horns, FX, Pads)
