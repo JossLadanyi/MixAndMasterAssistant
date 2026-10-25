@@ -1708,22 +1708,36 @@ local function main()
 
             reaper.ImGui_SameLine(ctx)
 
-            -- Stacked action buttons
-            reaper.ImGui_BeginGroup(ctx)
-            if reaper.ImGui_Button(ctx, "Send", 85, 24) then
-                if trim_string(chat_input_text) ~= "" then
-                    local user_msg = chat_input_text
-                    chat_input_text = ""
-                    send_followup_message(user_msg, model_idx + 1)
-                end
-            end
+			-- Stacked action buttons
+			reaper.ImGui_BeginGroup(ctx)
+			if reaper.ImGui_Button(ctx, "Send", 85, 24) then
+				if trim_string(chat_input_text) ~= "" then
+					local user_msg = chat_input_text
+					chat_input_text = ""
+					send_followup_message(user_msg, model_idx + 1)
+				end
+			end
 
-            if reaper.ImGui_Button(ctx, "Copy Chat", 85, 24) then
-                if #chat_history > 0 then
-                    reaper.ImGui_SetClipboardText(ctx, chat_history[#chat_history].content)
-                end
-            end
-            reaper.ImGui_EndGroup(ctx)
+			if reaper.ImGui_Button(ctx, "Copy Chat", 85, 24) then
+				if #chat_history > 0 then
+					local conversation_lines = {}
+
+					for _, msg in ipairs(chat_history) do
+						if msg.role == "user" then
+							-- Uses display_content if available (so the track list summary is included)
+							local user_text = msg.display_content or msg.content
+							table.insert(conversation_lines, "### YOU:\n" .. user_text)
+						elseif msg.role == "assistant" then
+							table.insert(conversation_lines, "### DEEPSEEK:\n" .. msg.content)
+						end
+					end
+
+					-- Join the entire conversation separated by clean dividers
+					local full_chat_export = table.concat(conversation_lines, "\n\n" .. string.rep("-", 40) .. "\n\n")
+					reaper.ImGui_SetClipboardText(ctx, full_chat_export)
+				end
+			end
+			reaper.ImGui_EndGroup(ctx)
         end
 
         reaper.ImGui_End(ctx)
