@@ -550,10 +550,34 @@ local function get_track_category(name)
     end
 end
 
+--- Determines track category by inspecting parent folder hierarchy first.
+-- Children inside Drums, Vocals, or Parallel folders inherit their parent's category.
+local function get_effective_track_category(track)
+    if not track then return 2 end
+
+    -- 1. Check parent folder hierarchy (Parents strictly override children)
+    local current_parent = reaper.GetParentTrack(track)
+    while current_parent do
+        local _, parent_name = reaper.GetSetMediaTrackInfo_String(current_parent, "P_NAME", "", false)
+        local parent_cat = get_track_category(parent_name)
+
+        -- If parent folder is explicitly Drums, Vocals, or Parallel, children inherit it
+        if parent_cat == 1 or parent_cat == 3 or parent_cat == 99 then
+            return parent_cat
+        end
+
+        current_parent = reaper.GetParentTrack(current_parent)
+    end
+
+    -- 2. Fall back to track's own name if not inside an explicit category folder
+    local _, track_name = reaper.GetSetMediaTrackInfo_String(track, "P_NAME", "", false)
+    return get_track_category(track_name)
+end
+
 local function save_and_apply_mix_state(target_mode, mute_parallels, bypass_master_fx)
     saved_mix_state = { tracks = {}, master_fx = {} }
     local master_track = reaper.GetMasterTrack(0)
-    local target_track_names = {} -- RESTORED: Collect the soloed tracks
+    local target_track_names = {}
 
     -- Backup and bypass master FX
     for fx_idx = 0, reaper.TrackFX_GetCount(master_track) - 1 do
@@ -567,7 +591,9 @@ local function save_and_apply_mix_state(target_mode, mute_parallels, bypass_mast
         if track then
             local track_guid = reaper.GetTrackGUID(track)
             local _, track_name = reaper.GetSetMediaTrackInfo_String(track, "P_NAME", "", false)
-            local category = get_track_category(track_name)
+
+            -- Use the hierarchy-aware category detector!
+            local category = get_effective_track_category(track)
             local display_name = (trim_string(track_name) ~= "") and trim_string(track_name) or ("Track " .. (i + 1))
 
             saved_mix_state.tracks[track_guid] = {
@@ -578,11 +604,12 @@ local function save_and_apply_mix_state(target_mode, mute_parallels, bypass_mast
             if target_mode ~= 4 then
                 if category == target_mode then
                     reaper.SetMediaTrackInfo_Value(track, "I_SOLO", 2)
-                    table.insert(target_track_names, display_name) -- RESTORED: Add to list
+                    table.insert(target_track_names, display_name)
                 else
                     reaper.SetMediaTrackInfo_Value(track, "I_SOLO", 0)
                 end
             end
+
             if mute_parallels and category == 99 then
                 reaper.SetMediaTrackInfo_Value(track, "B_MUTE", 1)
             end
@@ -620,7 +647,7 @@ end
 -- 6. ACTIVE TRACK DETECTION (WITH PARENT HIERARCHY MUTE CHECK)
 -- ==============================================================================
 
---- Traverses up the folder hierarchy to verify if any parent track is muted.
+--- Traverses up folder hierarchy to verify track is audible (checks both Mutes and Solos).
 local function is_track_audible(track)
     local current = track
     while current do
@@ -629,6 +656,23 @@ local function is_track_audible(track)
         end
         current = reaper.GetParentTrack(current)
     end
+
+    -- If any track is soloed in REAPER, this track must be soloed (or under a soloed folder) to be audible
+    if reaper.AnyTrackSolo(0) then
+        local is_soloed = false
+        current = track
+        while current do
+            if reaper.GetMediaTrackInfo_Value(current, "I_SOLO") > 0 then
+                is_soloed = true
+                break
+            end
+            current = reaper.GetParentTrack(current)
+        end
+        if not is_soloed then
+            return false
+        end
+    end
+
     return true
 end
 
