@@ -681,6 +681,9 @@ local function get_active_tracks(start_time, end_time, max_tracks)
     -- Only loop through tracks that existed BEFORE the render occurred
     local limit = (max_tracks or reaper.CountTracks(0)) - 1
 
+    -- Threshold: Must overlap by at least 100 ms to be considered active
+    local MIN_OVERLAP_SECONDS = 0.1
+
     for i = 0, limit do
         local track = reaper.GetTrack(0, i)
 
@@ -695,8 +698,12 @@ local function get_active_tracks(start_time, end_time, max_tracks)
                 if not item_muted then
                     local pos = reaper.GetMediaItemInfo_Value(item, "D_POSITION")
                     local len = reaper.GetMediaItemInfo_Value(item, "D_LENGTH")
+                    local item_end = pos + len
 
-                    if (pos < end_time) and (pos + len > start_time) then
+                    -- Calculate actual overlap duration between item and section
+                    local overlap = math.min(item_end, end_time) - math.max(pos, start_time)
+
+                    if overlap > MIN_OVERLAP_SECONDS then
                         is_active = true
                         break
                     end
