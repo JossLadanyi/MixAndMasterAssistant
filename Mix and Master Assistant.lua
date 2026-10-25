@@ -385,25 +385,74 @@ local function get_track_fx_chain(track)
         if plugin_type == "effect" and not plugin.bypassed then
             local num_params = reaper.TrackFX_GetNumParams(track, i)
             local params_table = {}
+            local disabled_prefixes = {}
             local count = 0
             local max_inspect = 1000
 
+            -- -------------------------------------------------------------
+            -- PASS 1: Detect disabled modules using standardized keys
+            -- -------------------------------------------------------------
+            for k = 0, math.min(num_params - 1, max_inspect) do
+                local _, param_name = reaper.TrackFX_GetParamName(track, i, k)
+                if param_name and param_name ~= "" then
+                    -- Sanitize first so spaces/colons become underscores (e.g. "band_3_active")
+                    local clean_k = clean_param_key(param_name)
+
+                    if clean_k:find("active") or clean_k:find("enable") or clean_k:find("bypass") then
+                        local _, param_val = reaper.TrackFX_GetFormattedParamValue(track, i, k)
+                        local v_clean = trim_string(param_val):lower():gsub("%s+", "")
+
+                        local is_off = (v_clean == "off" or v_clean == "0" or v_clean == "false" or v_clean == "disabled")
+                        local is_bypassed = (clean_k:find("bypass") and (v_clean == "on" or v_clean == "1" or v_clean == "true"))
+
+                        if is_off or is_bypassed then
+                            -- Extract hierarchical prefixes reliably:
+                            local prefix = clean_k:match("^(band_%d+_)")
+                                        or clean_k:match("^(eq_b%d+_)")
+                                        or clean_k:match("^(c%d+_b%d+_)")
+                                        or clean_k:match("^(h%d+_)")
+                                        or clean_k:match("^(b%d+_)")
+
+                            if prefix then
+                                disabled_prefixes[prefix] = true
+                            end
+                        end
+                    end
+                end
+            end
+
+            -- -------------------------------------------------------------
+            -- PASS 2: Extract active parameters, dropping disabled prefixes
+            -- -------------------------------------------------------------
             for k = 0, num_params - 1 do
                 if k >= max_inspect then break end
                 local _, param_name = reaper.TrackFX_GetParamName(track, i, k)
                 param_name = trim_string(param_name)
 
                 if is_valid_parameter_name(param_name) then
-                    local _, param_value = reaper.TrackFX_GetFormattedParamValue(track, i, k)
-                    param_value = trim_string(param_value)
+                    local clean_key = clean_param_key(param_name)
+                    local is_in_disabled_band = false
 
-                    if not is_boilerplate(param_name, param_value) then
-                        if count < MAX_PLUGIN_PARAMS then
-                            local clean_key = clean_param_key(param_name)
-                            params_table[clean_key] = tonumber(param_value) or param_value
-                            count = count + 1
-                        else
+                    -- Check if clean parameter key starts with any disabled prefix
+                    for prefix, _ in pairs(disabled_prefixes) do
+                        if clean_key:sub(1, #prefix) == prefix then
+                            is_in_disabled_band = true
                             break
+                        end
+                    end
+
+                    -- Only keep parameters from active bands/modules
+                    if not is_in_disabled_band then
+                        local _, param_value = reaper.TrackFX_GetFormattedParamValue(track, i, k)
+                        param_value = trim_string(param_value)
+
+                        if not is_boilerplate(param_name, param_value) then
+                            if count < MAX_PLUGIN_PARAMS then
+                                params_table[clean_key] = tonumber(param_value) or param_value
+                                count = count + 1
+                            else
+                                break
+                            end
                         end
                     end
                 end
