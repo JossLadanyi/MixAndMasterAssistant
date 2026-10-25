@@ -1265,11 +1265,18 @@ local function ask_deep_seek(chat_history, model_name)
     json_file:write(json_payload)
     json_file:close()
 
-	local curl_command = curl_bin .. ' -sS -D "' .. temp_response_path .. '.headers" -o "' .. temp_response_path .. '" -X POST https://api.deepseek.com/chat/completions ' ..
+    local curl_command = curl_bin .. ' -sS -D "' .. temp_response_path .. '.headers" -o "' .. temp_response_path .. '" -X POST https://api.deepseek.com/chat/completions ' ..
                          '-H ' .. shell_quote_for_curl('Authorization: Bearer ' .. API_KEY) .. ' ' ..
                          '-H ' .. shell_quote_for_curl('Content-Type: application/json') .. ' ' ..
                          '-H ' .. shell_quote_for_curl('Expect:') .. ' ' ..
                          '-d ' .. shell_quote_for_curl('@' .. temp_json_path)
+
+    -- Windows cmd.exe quote-stripping protection
+    local os_name = reaper.GetOS()
+    if os_name:match("Win") then
+        curl_command = '"' .. curl_command .. '"'
+    end
+
     os.execute(curl_command)
 
     local response_file = io.open(temp_response_path, "r")
@@ -1293,9 +1300,10 @@ local function ask_deep_seek(chat_history, model_name)
     os.remove(temp_response_path)
     os.remove(temp_response_path .. ".headers")
 
-	local http_status = headers:match(".*HTTP/[%d%.]+%s+(%d%d%d)")
+    local http_status = headers:match("HTTP/[%d%.]+%s+(%d%d%d)")
     if http_status and http_status ~= "200" then
         local msg = "DeepSeek API HTTP Error (" .. http_status .. ")"
+        if headers ~= "" then msg = msg .. "\nHeaders:\n" .. headers end
         return msg .. "\n\nBody:\n" .. tostring(raw_response)
     end
 
@@ -1325,8 +1333,6 @@ local function ask_deep_seek(chat_history, model_name)
 
     return "Unexpected API response structure:\n" .. raw_response
 end
-
-local user_balance_str = "N/A"
 
 local user_balance_str = "N/A"
 
