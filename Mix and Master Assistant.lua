@@ -1512,10 +1512,25 @@ local function send_followup_message(user_text, model_choice)
 end
 
 local function main()
-	-- Query live balance immediately upon launching the script
+    -- Query live balance immediately upon launching the script
     fetch_deep_seek_balance()
 
-	local ctx = reaper.ImGui_CreateContext("AI_Mix_Assistant")
+    local ctx = reaper.ImGui_CreateContext("AI_Mix_Assistant")
+
+    -- =========================================================
+    -- LOAD FIXED-WIDTH FONT FOR CHAT (Slightly larger: size 15)
+    -- =========================================================
+    local os_name = reaper.GetOS()
+    local font_name = "Courier New" -- Safe fallback
+    if os_name:match("Win") then
+        font_name = "Consolas"
+    elseif os_name:match("OSX") or os_name:match("macOS") then
+        font_name = "Menlo"
+    end
+    local chat_font = reaper.ImGui_CreateFont(font_name, 15)
+    reaper.ImGui_Attach(ctx, chat_font)
+    -- =========================================================
+
     local target_idx = 3
     local model_idx = 0
     local mute_parallels = true
@@ -1531,9 +1546,9 @@ local function main()
     local function loop()
         reaper.ImGui_SetNextWindowSize(ctx, 720, 680, reaper.ImGui_Cond_FirstUseEver())
         local window_flags = reaper.ImGui_WindowFlags_NoCollapse() | reaper.ImGui_WindowFlags_TopMost()
-		local visible, open = reaper.ImGui_Begin(ctx, "Mix and Master Assistant", true, window_flags)
+        local visible, open = reaper.ImGui_Begin(ctx, "Mix and Master Assistant", true, window_flags)
 
-		if visible then
+        if visible then
             -- Live Account Balance Bar
             reaper.ImGui_Text(ctx, "Account Balance: ")
             reaper.ImGui_SameLine(ctx)
@@ -1569,6 +1584,10 @@ local function main()
             local scroll_h = math.max(150, avail_h - 70)
 
             if reaper.ImGui_BeginChild(ctx, "ChatScroll", 0, scroll_h) then
+
+                -- >> PUSH CUSTOM FONT FOR CHAT LOG <<
+                reaper.ImGui_PushFont(ctx, chat_font)
+
                 for _, msg in ipairs(chat_history) do
                     if msg.role == "user" and msg.content ~= "Perform full mix analysis as instructed." then
                         reaper.ImGui_TextColored(ctx, 0x4FC3F7FF, "YOU: ")
@@ -1588,15 +1607,20 @@ local function main()
                     scroll_to_bottom = false
                 end
 
+                -- >> POP CUSTOM FONT <<
+                reaper.ImGui_PopFont(ctx)
+
                 reaper.ImGui_EndChild(ctx)
             end
 
-			-- FOLLOW-UP INPUT AREA (MULTILINE + BUTTON ONLY)
+            -- FOLLOW-UP INPUT AREA (MULTILINE + BUTTON ONLY)
             reaper.ImGui_Separator(ctx)
 
             -- Multiline text box: Enter inserts a new line, does not submit
             -- Width: -95px leaves room for the stacked buttons on the right. Height: 52px (approx 2.5 lines)
+            reaper.ImGui_PushFont(ctx, chat_font)
             _, chat_input_text = reaper.ImGui_InputTextMultiline(ctx, "##chat_in", chat_input_text, -95, 52)
+            reaper.ImGui_PopFont(ctx)
 
             reaper.ImGui_SameLine(ctx)
 
