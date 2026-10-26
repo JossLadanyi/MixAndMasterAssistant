@@ -33,8 +33,8 @@ local reaper = reaper
 -- 1. GLOBAL CONFIGURATION & TUNING
 -- ==============================================================================
 
-local API_KEY = "YOUR_DEEPSEEK_API_KEY"
 -- DeepSeek API Key (Only needed if sending analysis to DeepSeek)
+local API_KEY = "YOUR_DEEPSEEK_API_KEY"
 
 -- Maximum plugin parameters to capture per effect (Balances precision vs tokens)
 local MAX_PLUGIN_PARAMS = 128
@@ -173,11 +173,6 @@ end
 local function get_model_name(model_choice)
     local model_ids = { [1] = "deepseek-v4-pro", [2] = "deepseek-flash" }
     return model_ids[model_choice] or "deepseek-v4-pro"
-end
-
-local function get_duration_seconds(duration_idx)
-    local duration_map = { [0] = 10, [1] = 20, [2] = 0 }
-    return duration_map[duration_idx] or 0
 end
 
 -- ==============================================================================
@@ -997,7 +992,7 @@ end
 -- 9. UNIFIED PROMPT BUILDER & MANDATORY FILE EXPORTER
 -- ==============================================================================
 
-local function build_full_prompt(project_yaml, audio_metrics, target_str, user_notes, target_tracks)
+local function build_full_prompt(project_yaml, audio_metrics, target_str, target_tracks)
     local prompt = "=== MIXING & MASTERING DIRECTIVES ===\nYou are an elite, multi-platinum audio mixing and mastering engineer.\n"
     prompt = prompt .. "Focus Target: " .. target_str .. "\n\n"
 
@@ -1013,11 +1008,6 @@ local function build_full_prompt(project_yaml, audio_metrics, target_str, user_n
 
     -- UNIFIED INSTRUCTIONS BLOCK
     prompt = prompt .. "=== INSTRUCTIONS FOR ANALYSIS ===\n"
-
-    if user_notes and user_notes ~= "" then
-        prompt = prompt .. "[USER INSTRUCTIONS FOR]:\n"
-        prompt = prompt .. trim_string(user_notes) .. "\n\n"
-    end
 
     prompt = prompt .. "1. MACRO-DYNAMICS: Compare Crest Factor and RMS across regions. If dynamic contrast is lacking, pinpoint over-compression in the YAML and specify threshold/ratio adjustments.\n"
     prompt = prompt .. "2. LOW/MID FREQUENCY BALANCE: Scrutinize Sub (60Hz), Punch (120Hz), Mud (250Hz), and Boxy (500Hz). Locate masking in the project tracks and suggest surgical EQ cuts.\n"
@@ -1589,7 +1579,7 @@ local function run_fresh_scan(target_mode, model_choice, mute_parallels, bypass_
     end
 
 	-- 3. Save raw file
-    local full_prompt = build_full_prompt(project_yaml, audio_metrics, target_name, custom_notes, target_tracks)
+    local full_prompt = build_full_prompt(project_yaml, audio_metrics, target_name, target_tracks)
     report_saved_path = save_prompt_to_txt(full_prompt, target_name)
 
     -- 4. Initialize chat history for DeepSeek Prompt Caching
@@ -1675,7 +1665,6 @@ local function main()
     local bypass_master_fx = true
     local duration_idx = 0
     local output_api = true
-    local custom_notes = ""
 
     local target_items = "Drums & Bass\0Instruments (No Drums/Bass/Vox)\0Vocals\0Full Mix\0\0"
     local model_items = "DeepSeek V4 Pro (Flagship Reasoning)\0DeepSeek Flash (Fast / Low-Cost)\0\0"
@@ -1707,11 +1696,11 @@ local function main()
                 _, output_api = reaper.ImGui_Checkbox(ctx, "Query DeepSeek API (Uncheck for TXT only)", output_api)
                 _, model_idx = reaper.ImGui_Combo(ctx, "AI Model", model_idx, model_items)
 
-                reaper.ImGui_Text(ctx, "Custom Instructions / Notes for Scan:")
-                _, custom_notes = reaper.ImGui_InputText(ctx, "##notes", custom_notes)
+                reaper.ImGui_Dummy(ctx, 0, 4)
 
                 if reaper.ImGui_Button(ctx, "Run Fresh Scan & Reset Chat", -1, 30) then
-                    run_fresh_scan(target_idx + 1, model_idx + 1, mute_parallels, bypass_master_fx, get_duration_seconds(duration_idx), output_api, custom_notes)
+                    local dur_map = { [0] = 10, [1] = 20, [2] = 0 }
+                    run_fresh_scan(target_idx + 1, model_idx + 1, mute_parallels, bypass_master_fx, dur_map[duration_idx], output_api)
                 end
                 reaper.ImGui_Separator(ctx)
             end
