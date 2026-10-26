@@ -360,9 +360,10 @@ local function get_track_fx_chain(track)
     local fx_chain = {}
 
     for i = 0, num_fx - 1 do
-        local _, fx_name = reaper.TrackFX_GetFXName(track, i)
+		local _, fx_name = reaper.TrackFX_GetFXName(track, i)
         fx_name = trim_string(fx_name) or "Unknown FX"
         fx_name = fx_name:match(":%s*(.+)") or fx_name
+        fx_name = fx_name:gsub("%s*%(.*%)$", "")	-- Uses a greedy match %s*%(.*%)$ to safely catch nested parens like "(Universal Audio (UADx))"
         fx_name = trim_string(fx_name)
 
         local plugin = { name = fx_name }
