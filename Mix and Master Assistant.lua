@@ -346,7 +346,12 @@ local function get_all_connections()
                 if mode_val == 1 then conn.type = "prefx" elseif mode_val == 3 or mode_val == 2 then conn.type = "pre" end
                 if dst_ch_str ~= "1/2" then conn.dst_ch = dst_ch_str end
 
-                conn.vol_db = linear_to_db(reaper.GetTrackSendInfo_Value(src_track, 0, s, "D_VOL"))
+                -- Only record send volume if it is NOT exactly 0.0 dB
+                local send_vol = linear_to_db(reaper.GetTrackSendInfo_Value(src_track, 0, s, "D_VOL"))
+                if send_vol ~= 0.0 then
+                    conn.vol_db = send_vol
+                end
+
                 table.insert(connections, conn)
             end
         end
@@ -493,20 +498,7 @@ local function process_track_data(track, is_master, current_depth)
     local pan = format_pan_value(reaper.GetMediaTrackInfo_Value(track, "D_PAN"))
     if pan ~= "Center" then track_data.pan = pan end
 
-    local item_count = reaper.CountTrackMediaItems(track)
-    if item_count > 0 then
-        local total_duration = 0
-        for idx = 0, item_count - 1 do
-            local item = reaper.GetTrackMediaItem(track, idx)
-            if item then
-                total_duration = total_duration + reaper.GetMediaItemInfo_Value(item, "D_LENGTH")
-            end
-        end
-        track_data.media = {
-            items = item_count,
-            dur_s = math.floor(total_duration * 10 + 0.5) / 10
-        }
-    end
+    -- (Media item duration and count loops were removed from here)
 
     local num_envelopes = reaper.CountTrackEnvelopes(track)
     if num_envelopes > 0 then
@@ -542,7 +534,8 @@ local function extract_full_project_yaml()
         tracks = {}
     }
 
-    if proj_notes and proj_notes ~= "" then project_data.notes = proj_notes end
+	project_data.notes = "Any routing send volume omitted is at 0.0 dB unity gain."
+    if proj_notes and proj_notes ~= "" then project_data.notes = project_data.notes .. '\n' .. proj_notes end
 
     -- 1. Master Track
     table.insert(project_data.tracks, process_track_data(reaper.GetMasterTrack(0), true, 0))
@@ -1012,7 +1005,7 @@ local function build_full_prompt(project_yaml, audio_metrics, target_str, user_n
     prompt = prompt .. "=== TARGET TRACKS ===\n"
     if target_tracks and #target_tracks > 0 then
         prompt = prompt .. "The following tracks are currently isolated (soloed) for this specific analysis:\n"
-        prompt = prompt .. "- " .. table.concat(target_tracks, "\n- ") .. "\n\n"
+        prompt = prompt .. table.concat(target_tracks, ", ") .. "\n\n"
         prompt = prompt .. "CRITICAL RESTRICTION: Focus YOUR ENTIRE ANALYSIS and plugin recommendations SOLELY on these specific tracks, plus the Master Bus if relevant. Do not critique or suggest parameter changes for any tracks outside this list.\n\n"
     else
         prompt = prompt .. "All active tracks are included in this full mix analysis.\n\n"
@@ -1022,7 +1015,7 @@ local function build_full_prompt(project_yaml, audio_metrics, target_str, user_n
     prompt = prompt .. "=== INSTRUCTIONS FOR ANALYSIS ===\n"
 
     if user_notes and user_notes ~= "" then
-        prompt = prompt .. "[USER CUSTOM INSTRUCTIONS FOR THIS PASS]:\n"
+        prompt = prompt .. "[USER INSTRUCTIONS FOR]:\n"
         prompt = prompt .. trim_string(user_notes) .. "\n\n"
     end
 
