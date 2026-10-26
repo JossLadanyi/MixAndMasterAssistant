@@ -1507,38 +1507,83 @@ end
 local function render_markdown_text(ctx, text)
     if not text or text == "" then return end
 
+    local in_table = false
+
     for line in text:gmatch("([^\r\n]*)[\r\n]?") do
-        if line ~= "" then
-            -- Headers (### Title) -> Gold text with separator
-            if line:match("^#+%s*(.+)") then
-                local header_text = line:match("^#+%s*(.+)")
-                reaper.ImGui_Dummy(ctx, 0, 4)
-                reaper.ImGui_TextColored(ctx, 0xFFD54FFF, "▶  " .. header_text)
-                reaper.ImGui_Separator(ctx)
-                reaper.ImGui_Dummy(ctx, 0, 2)
-
-            -- Bullet points (- item or * item)
-            elseif line:match("^[%*%-]%s+(.+)") then
-                local bullet_text = line:match("^[%*%-]%s+(.+)")
-                bullet_text = bullet_text:gsub("%*%*(.-)%*%*", "%1")
-                reaper.ImGui_Bullet(ctx)
-                reaper.ImGui_SameLine(ctx)
-                reaper.ImGui_TextWrapped(ctx, bullet_text)
-
-            -- Numbered lists (1. Directive) -> Cyan number
-            elseif line:match("^%d+%.%s+(.+)") then
-                local num, item_text = line:match("^(%d+%.)%s+(.+)")
-                item_text = item_text:gsub("%*%*(.-)%*%*", "%1")
-                reaper.ImGui_TextColored(ctx, 0x4FC3F7FF, num)
-                reaper.ImGui_SameLine(ctx)
-                reaper.ImGui_TextWrapped(ctx, item_text)
-
-            -- Regular paragraph text
+        -- Detect Markdown Table Rows (lines starting and ending with |)
+        if line:match("^%s*|.*|%s*$") then
+            if line:match("|%s*%-+.*|") then
+                -- Skip the markdown table separator row (e.g., |---|---|)
             else
-                local clean_line = line:gsub("%*%*(.-)%*%*", "%1")
-                reaper.ImGui_TextWrapped(ctx, clean_line)
+                if not in_table then
+                    -- Count columns based on pipe characters
+                    local cols = 0
+                    for _ in line:gmatch("|") do cols = cols + 1 end
+                    cols = cols - 1
+
+                    -- Start Native ReaImGui Table
+                    local flags = reaper.ImGui_TableFlags_Borders() | reaper.ImGui_TableFlags_RowBg() | reaper.ImGui_TableFlags_SizingStretchProp()
+                    if reaper.ImGui_BeginTable(ctx, "MarkdownTable", cols, flags) then
+                        in_table = true
+                    end
+                end
+
+                if in_table then
+                    reaper.ImGui_TableNextRow(ctx)
+                    local col_idx = 0
+                    for cell_text in line:gmatch("|([^|]+)") do
+                        reaper.ImGui_TableSetColumnIndex(ctx, col_idx)
+                        local clean_cell = trim_string(cell_text:gsub("%*%*(.-)%*%*", "%1"))
+                        reaper.ImGui_Text(ctx, clean_cell)
+                        col_idx = col_idx + 1
+                    end
+                end
+            end
+        else
+            -- If we were drawing a table and hit a normal line, close the table
+            if in_table then
+                reaper.ImGui_EndTable(ctx)
+                in_table = false
+                reaper.ImGui_Dummy(ctx, 0, 8)
+            end
+
+            if line ~= "" then
+                -- Headers (### Title) -> Gold text with separator
+                if line:match("^#+%s*(.+)") then
+                    local header_text = line:match("^#+%s*(.+)")
+                    reaper.ImGui_Dummy(ctx, 0, 4)
+                    reaper.ImGui_TextColored(ctx, 0xFFD54FFF, "▶  " .. header_text)
+                    reaper.ImGui_Separator(ctx)
+                    reaper.ImGui_Dummy(ctx, 0, 2)
+
+                -- Bullet points (- item or * item)
+                elseif line:match("^[%*%-]%s+(.+)") then
+                    local bullet_text = line:match("^[%*%-]%s+(.+)")
+                    bullet_text = bullet_text:gsub("%*%*(.-)%*%*", "%1")
+                    reaper.ImGui_Bullet(ctx)
+                    reaper.ImGui_SameLine(ctx)
+                    reaper.ImGui_TextWrapped(ctx, bullet_text)
+
+                -- Numbered lists (1. Directive) -> Cyan number
+                elseif line:match("^%d+%.%s+(.+)") then
+                    local num, item_text = line:match("^(%d+%.)%s+(.+)")
+                    item_text = item_text:gsub("%*%*(.-)%*%*", "%1")
+                    reaper.ImGui_TextColored(ctx, 0x4FC3F7FF, num)
+                    reaper.ImGui_SameLine(ctx)
+                    reaper.ImGui_TextWrapped(ctx, item_text)
+
+                -- Regular paragraph text
+                else
+                    local clean_line = line:gsub("%*%*(.-)%*%*", "%1")
+                    reaper.ImGui_TextWrapped(ctx, clean_line)
+                end
             end
         end
+    end
+
+    -- Ensure table is closed if it was the very last thing in the text
+    if in_table then
+        reaper.ImGui_EndTable(ctx)
     end
 end
 
@@ -1580,16 +1625,39 @@ local function run_fresh_scan(target_mode, model_choice, mute_parallels, bypass_
     end
 
 	-- 3. Save raw file
-    local full_prompt = build_full_prompt(project_yaml, audio_metrics, target_name, target_tracks)
+    local full_prompt = build_full_prompt(project_yaml, audio_metrics, target_name, custom_notes, target_tracks)
     report_saved_path = save_prompt_to_txt(full_prompt, target_name)
 
     -- 4. Initialize chat history for DeepSeek Prompt Caching
     -- Create a UI-only message to show the tracks in the chatbox without sending them to the API
-    local initial_ui_msg = "Please analyze the mix for: **" .. target_name .. "**."
+    local initial_ui_msg = "Please analyze the mix for: **" .. target_name .. "**.\n"
     if target_mode ~= 4 and target_tracks and #target_tracks > 0 then
-        initial_ui_msg = initial_ui_msg .. "\n\n**Isolated Tracks:**\n- " .. table.concat(target_tracks, "\n- ")
+        initial_ui_msg = initial_ui_msg .. "\n**Isolated Tracks:**\n- " .. table.concat(target_tracks, "\n- ") .. "\n"
     elseif target_mode == 4 then
-        initial_ui_msg = initial_ui_msg .. " (All tracks included)."
+        initial_ui_msg = initial_ui_msg .. " *(All tracks included).* \n"
+    end
+
+    -- Dynamically generate the Markdown Table for the UI
+    initial_ui_msg = initial_ui_msg .. "\n### Regional Audio Metrics\n"
+    initial_ui_msg = initial_ui_msg .. "| Region | Peak | RMS | Crest | Wid | Mono | Sub | Mud | Boxy | Harsh | Sib |\n"
+    initial_ui_msg = initial_ui_msg .. "|---|---|---|---|---|---|---|---|---|---|---|\n"
+
+    -- Sort the regions alphabetically so 01_Intro comes before 02_Verse
+    local sorted_regions = {}
+    for r_key in pairs(audio_metrics) do table.insert(sorted_regions, r_key) end
+    table.sort(sorted_regions)
+
+    for _, r_key in ipairs(sorted_regions) do
+        local m = audio_metrics[r_key]
+        -- Clean up region name for display (e.g., "01_Verse_1" -> "Verse 1")
+        local clean_name = r_key:gsub("^%d+_", ""):gsub("_", " ")
+        local phase_status = m.stereo.sub_mono == "Phase_Risk" and "Risk" or "Safe"
+
+        -- Append table row data
+        initial_ui_msg = initial_ui_msg .. string.format("| %s | %.1f | %.1f | %.1f | %.0f%% | %s | %.1f%% | %.1f%% | %.1f%% | %.1f%% | %.1f%% |\n",
+            clean_name, m.dyn.peak_db, m.dyn.rms_db, m.dyn.crest_db,
+            m.stereo.width_pct, phase_status,
+            m.tonal.sub60, m.tonal.mud250, m.tonal.boxy500, m.tonal.harsh6k, m.tonal.sib8k)
     end
 
     chat_history = {
