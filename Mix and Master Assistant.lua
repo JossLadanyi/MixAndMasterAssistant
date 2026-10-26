@@ -1548,12 +1548,12 @@ local chat_input_text = ""
 local report_saved_path = nil
 local scroll_to_bottom = false
 
-local function run_fresh_scan(target_mode, model_choice, mute_parallels, bypass_master_fx, duration_pref, output_api, custom_notes)
+local function run_fresh_scan(target_mode, model_choice, mute_parallels, bypass_master_fx, duration_pref, output_api)
     local target_descriptions = { [1] = "Drums & Bass", [2] = "Instruments", [3] = "Vocals", [4] = "Full Mix" }
     local target_name = target_descriptions[target_mode] or "Full Mix"
     local selected_model = get_model_name(model_choice)
 
-    -- 1. Scan and isolate (Now captures the list of soloed tracks)
+    -- 1. Scan and isolate
     local target_tracks = save_and_apply_mix_state(target_mode, mute_parallels, bypass_master_fx)
     local project_yaml, song_regions = extract_full_project_yaml()
 
@@ -1562,9 +1562,7 @@ local function run_fresh_scan(target_mode, model_choice, mute_parallels, bypass_
     local pre_render_guids = {}
     for i = 0, tracks_before - 1 do
         local trk = reaper.GetTrack(0, i)
-        if trk then
-            pre_render_guids[reaper.GetTrackGUID(trk)] = true
-        end
+        if trk then pre_render_guids[reaper.GetTrackGUID(trk)] = true end
     end
 
     reaper.Main_OnCommand(42230, 0)
@@ -1580,39 +1578,16 @@ local function run_fresh_scan(target_mode, model_choice, mute_parallels, bypass_
         return false
     end
 
-	-- 3. Save raw file
-    local full_prompt = build_full_prompt(project_yaml, audio_metrics, target_name, custom_notes, target_tracks)
+    -- 3. Save raw file (Corrected: exactly 4 arguments)
+    local full_prompt = build_full_prompt(project_yaml, audio_metrics, target_name, target_tracks)
     report_saved_path = save_prompt_to_txt(full_prompt, target_name)
 
-    -- 4. Initialize chat history for DeepSeek Prompt Caching
-    local initial_ui_msg = "Please analyze the mix for: **" .. target_name .. "**.\n"
+    -- 4. Initialize chat history
+    local initial_ui_msg = "Please analyze the mix for: **" .. target_name .. "**."
     if target_mode ~= 4 and target_tracks and #target_tracks > 0 then
-        initial_ui_msg = initial_ui_msg .. "\n**Isolated Tracks:**\n- " .. table.concat(target_tracks, "\n- ") .. "\n"
+        initial_ui_msg = initial_ui_msg .. "\n\n**Isolated Tracks:**\n- " .. table.concat(target_tracks, "\n- ")
     elseif target_mode == 4 then
-        initial_ui_msg = initial_ui_msg .. " *(All tracks included).* \n"
-    end
-
-    -- Dynamically generate the Markdown Table for the UI
-    initial_ui_msg = initial_ui_msg .. "\n### Regional Audio Metrics\n"
-    initial_ui_msg = initial_ui_msg .. "| Region | Peak | RMS | Crest | Wid | Mono | Sub | Mud | Boxy | Harsh | Sib |\n"
-    initial_ui_msg = initial_ui_msg .. "|---|---|---|---|---|---|---|---|---|---|---|\n"
-
-    -- Sort the regions alphabetically so 01_Intro comes before 02_Verse
-    local sorted_regions = {}
-    for r_key in pairs(audio_metrics) do table.insert(sorted_regions, r_key) end
-    table.sort(sorted_regions)
-
-    for _, r_key in ipairs(sorted_regions) do
-        local m = audio_metrics[r_key]
-        -- Clean up region name for display (e.g., "01_Verse_1" -> "Verse 1")
-        local clean_name = r_key:gsub("^%d+_", ""):gsub("_", " ")
-        local phase_status = m.stereo.sub_mono == "Phase_Risk" and "Risk" or "Safe"
-
-        -- Append table row data
-        initial_ui_msg = initial_ui_msg .. string.format("| %s | %.1f | %.1f | %.1f | %.0f%% | %s | %.1f%% | %.1f%% | %.1f%% | %.1f%% | %.1f%% |\n",
-            clean_name, m.dyn.peak_db, m.dyn.rms_db, m.dyn.crest_db,
-            m.stereo.width_pct, phase_status,
-            m.tonal.sub60, m.tonal.mud250, m.tonal.boxy500, m.tonal.harsh6k, m.tonal.sib8k)
+        initial_ui_msg = initial_ui_msg .. " (All tracks included)."
     end
 
     chat_history = {
