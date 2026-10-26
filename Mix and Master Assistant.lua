@@ -997,7 +997,6 @@ local function build_full_prompt(project_yaml, audio_metrics, target_str, target
     local prompt = "=== MIXING & MASTERING DIRECTIVES ===\nYou are an elite, multi-platinum audio mixing and mastering engineer.\n"
     prompt = prompt .. "Focus Target: " .. target_str .. "\n\n"
 
-    -- NEW: Explicitly list soloed tracks and restrict AI focus
     prompt = prompt .. "=== TARGET TRACKS ===\n"
     if target_tracks and #target_tracks > 0 then
         prompt = prompt .. "The following tracks are currently isolated (soloed) for this specific analysis:\n"
@@ -1009,7 +1008,6 @@ local function build_full_prompt(project_yaml, audio_metrics, target_str, target
 
     -- UNIFIED INSTRUCTIONS BLOCK
     prompt = prompt .. "=== INSTRUCTIONS FOR ANALYSIS ===\n"
-
     prompt = prompt .. "1. MACRO-DYNAMICS: Compare Crest Factor and RMS across regions. If dynamic contrast is lacking, pinpoint over-compression in the YAML and specify threshold/ratio adjustments.\n"
     prompt = prompt .. "2. LOW/MID FREQUENCY BALANCE: Scrutinize Sub (60Hz), Punch (120Hz), Mud (250Hz), and Boxy (500Hz). Locate masking in the project tracks and suggest surgical EQ cuts.\n"
     prompt = prompt .. "3. HIGH FREQUENCY INTEGRITY: Differentiate Harshness (6kHz) from Sibilance (8kHz). Look for abrasive saturation or identify tracks requiring a De-Esser.\n"
@@ -1507,47 +1505,10 @@ end
 local function render_markdown_text(ctx, text)
     if not text or text == "" then return end
 
-    local in_table = false
-
     for line in text:gmatch("([^\r\n]*)[\r\n]?") do
-        -- Detect Markdown Table Rows (lines starting and ending with |)
-        if line:match("^%s*|.*|%s*$") then
-            if line:match("|%s*%-+.*|") then
-                -- Skip the markdown table separator row (e.g., |---|---|)
-            else
-                if not in_table then
-                    -- Count columns based on pipe characters
-                    local cols = 0
-                    for _ in line:gmatch("|") do cols = cols + 1 end
-                    cols = cols - 1
-
-                    -- Start Native ReaImGui Table
-                    local flags = reaper.ImGui_TableFlags_Borders() | reaper.ImGui_TableFlags_RowBg() | reaper.ImGui_TableFlags_SizingStretchProp()
-                    if reaper.ImGui_BeginTable(ctx, "MarkdownTable", cols, flags) then
-                        in_table = true
-                    end
-                end
-
-                if in_table then
-                    reaper.ImGui_TableNextRow(ctx)
-                    local col_idx = 0
-                    for cell_text in line:gmatch("|([^|]+)") do
-                        reaper.ImGui_TableSetColumnIndex(ctx, col_idx)
-                        local clean_cell = trim_string(cell_text:gsub("%*%*(.-)%*%*", "%1"))
-                        reaper.ImGui_Text(ctx, clean_cell)
-                        col_idx = col_idx + 1
-                    end
-                end
-            end
-        else
-            -- If we were drawing a table and hit a normal line, close the table
-            if in_table then
-                reaper.ImGui_EndTable(ctx)
-                in_table = false
-                reaper.ImGui_Dummy(ctx, 0, 8)
-            end
-
-            if line ~= "" then
+        if line ~= "" then
+            -- Skip raw markdown table code entirely in the chat window so it doesn't break
+            if not line:match("^%s*|") then
                 -- Headers (### Title) -> Gold text with separator
                 if line:match("^#+%s*(.+)") then
                     local header_text = line:match("^#+%s*(.+)")
@@ -1579,11 +1540,6 @@ local function render_markdown_text(ctx, text)
                 end
             end
         end
-    end
-
-    -- Ensure table is closed if it was the very last thing in the text
-    if in_table then
-        reaper.ImGui_EndTable(ctx)
     end
 end
 
@@ -1629,7 +1585,6 @@ local function run_fresh_scan(target_mode, model_choice, mute_parallels, bypass_
     report_saved_path = save_prompt_to_txt(full_prompt, target_name)
 
     -- 4. Initialize chat history for DeepSeek Prompt Caching
-    -- Create a UI-only message to show the tracks in the chatbox without sending them to the API
     local initial_ui_msg = "Please analyze the mix for: **" .. target_name .. "**.\n"
     if target_mode ~= 4 and target_tracks and #target_tracks > 0 then
         initial_ui_msg = initial_ui_msg .. "\n**Isolated Tracks:**\n- " .. table.concat(target_tracks, "\n- ") .. "\n"
@@ -1662,7 +1617,6 @@ local function run_fresh_scan(target_mode, model_choice, mute_parallels, bypass_
 
     chat_history = {
         { role = "system", content = full_prompt },
-        -- 'content' goes to DeepSeek, 'display_content' goes to your ReaImGui screen
         { role = "user", content = "Perform full mix analysis as instructed.", display_content = initial_ui_msg }
     }
 
