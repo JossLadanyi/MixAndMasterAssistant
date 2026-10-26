@@ -530,7 +530,7 @@ local function extract_full_project_yaml()
         tracks = {}
     }
 
-	project_data.notes = "Any routing send volume omitted is at 0.0 dB unity gain."
+	project_data.notes = "- any routing send volume omitted is at 0.0 dB unity gain."
     if proj_notes and proj_notes ~= "" then project_data.notes = project_data.notes .. '\n' .. proj_notes end
 
     -- 1. Master Track
