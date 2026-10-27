@@ -838,112 +838,147 @@ local function process_audio_chunk(take, item_pos, analyze_start, analyze_dur)
     if not ok then return nil end
 
 	-- Convert C++ buffer to a native 1-based Lua table
-    local samples = buffer
+    -- Convert C++ buffer to a native 1-based Lua table
+    local audio_samples = buffer
     if type(buffer) == "userdata" and buffer.table then
-        samples = buffer.table()
+        audio_samples = buffer.table()
     end
 
-    if type(samples) ~= "table" then return nil end
-
-    local total_sample_count = #samples
+    if type(audio_samples) ~= "table" then return nil end
+    local total_sample_count = #audio_samples
     if total_sample_count < 2 then return nil end
 
     local peak_left, peak_right = 0, 0
-    local sum_sq_mid, sum_sq_side = 0, 0
+    local sum_squared_mid, sum_squared_side = 0, 0
 
-    -- Energy accumulators
-    local eng_sub, eng_punch, eng_mud, eng_boxy = 0, 0, 0, 0
-    local eng_core, eng_pres, eng_harsh = 0, 0, 0
-    local eng_sib, eng_air, eng_sub_side = 0, 0, 0
+    -- Human-readable energy accumulators for the 9 frequency bands
+    local energy_sub_60hz = 0
+    local energy_punch_120hz = 0
+    local energy_mud_250hz = 0
+    local energy_boxy_500hz = 0
+    local energy_core_1khz = 0
+    local energy_presence_3khz = 0
+    local energy_harsh_6khz = 0
+    local energy_sibilance_8khz = 0
+    local energy_air_12khz = 0
+    local energy_sub_side_channel = 0
 
-    -- Filter Coefficients
-    local f_sub   = 2 * math.sin(math.pi * 60 / SAMPLE_RATE)
-    local f_punch = 2 * math.sin(math.pi * 120 / SAMPLE_RATE)
-    local f_mud   = 2 * math.sin(math.pi * 250 / SAMPLE_RATE)
-    local f_boxy  = 2 * math.sin(math.pi * 500 / SAMPLE_RATE)
-    local f_core  = 2 * math.sin(math.pi * 1000 / SAMPLE_RATE)
-    local f_pres  = 2 * math.sin(math.pi * 3000 / SAMPLE_RATE)
-    local f_harsh = 2 * math.sin(math.pi * 6000 / SAMPLE_RATE)
-    local f_sib   = 2 * math.sin(math.pi * 8000 / SAMPLE_RATE)
-    local f_air   = 2 * math.sin(math.pi * 12000 / SAMPLE_RATE)
+    -- Filter Coefficients for the 9 critical bands
+    local filter_coeff_sub   = 2 * math.sin(math.pi * 60 / SAMPLE_RATE)
+    local filter_coeff_punch = 2 * math.sin(math.pi * 120 / SAMPLE_RATE)
+    local filter_coeff_mud   = 2 * math.sin(math.pi * 250 / SAMPLE_RATE)
+    local filter_coeff_boxy  = 2 * math.sin(math.pi * 500 / SAMPLE_RATE)
+    local filter_coeff_core  = 2 * math.sin(math.pi * 1000 / SAMPLE_RATE)
+    local filter_coeff_pres  = 2 * math.sin(math.pi * 3000 / SAMPLE_RATE)
+    local filter_coeff_harsh = 2 * math.sin(math.pi * 6000 / SAMPLE_RATE)
+    local filter_coeff_sib   = 2 * math.sin(math.pi * 8000 / SAMPLE_RATE)
+    local filter_coeff_air   = 2 * math.sin(math.pi * 12000 / SAMPLE_RATE)
 
-    local l1,b1, l2,b2, l3,b3, l4,b4, l5,b5, l6,b6, l7,b7, l8,b8, l9,b9, ls,bs = 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+    -- Filter state registers (Low-pass and Band-pass nodes for Chamberlin SVF)
+    local low_sub, band_sub       = 0, 0
+    local low_punch, band_punch   = 0, 0
+    local low_mud, band_mud       = 0, 0
+    local low_boxy, band_boxy     = 0, 0
+    local low_core, band_core     = 0, 0
+    local low_pres, band_pres     = 0, 0
+    local low_harsh, band_harsh   = 0, 0
+    local low_sib, band_sib       = 0, 0
+    local low_air, band_air       = 0, 0
+    local low_sub_side, band_sub_side = 0, 0
 
-    -- Fast native table loop (samples[1] = L0, samples[2] = R0, ...)
+    -- Fast native table loop (audio_samples[1] = L0, audio_samples[2] = R0, ...)
     for i = 1, total_sample_count, 2 do
-        local samp_L = samples[i]
-        local samp_R = samples[i+1]
+        local sample_left = audio_samples[i]
+        local sample_right = audio_samples[i+1]
 
-        if math.abs(samp_L) > peak_left then peak_left = math.abs(samp_L) end
-        if math.abs(samp_R) > peak_right then peak_right = math.abs(samp_R) end
+        if math.abs(sample_left) > peak_left then peak_left = math.abs(sample_left) end
+        if math.abs(sample_right) > peak_right then peak_right = math.abs(sample_right) end
 
-        local mid = (samp_L + samp_R) * 0.5
-        local side = (samp_L - samp_R) * 0.5
+        local mid = (sample_left + sample_right) * 0.5
+        local side = (sample_left - sample_right) * 0.5
 
-        sum_sq_mid = sum_sq_mid + (mid * mid)
-        sum_sq_side = sum_sq_side + (side * side)
+        sum_squared_mid = sum_squared_mid + (mid * mid)
+        sum_squared_side = sum_squared_side + (side * side)
 
-        l1=l1+f_sub*b1; b1=b1+f_sub*(mid-l1-FILTER_Q*b1); eng_sub=eng_sub+(b1*b1)
-        l2=l2+f_punch*b2; b2=b2+f_punch*(mid-l2-FILTER_Q*b2); eng_punch=eng_punch+(b2*b2)
-        l3=l3+f_mud*b3; b3=b3+f_mud*(mid-l3-FILTER_Q*b3); eng_mud=eng_mud+(b3*b3)
-        l4=l4+f_boxy*b4; b4=b4+f_boxy*(mid-l4-FILTER_Q*b4); eng_boxy=eng_boxy+(b4*b4)
-        l5=l5+f_core*b5; b5=b5+f_core*(mid-l5-FILTER_Q*b5); eng_core=eng_core+(b5*b5)
-        l6=l6+f_pres*b6; b6=b6+f_pres*(mid-l6-FILTER_Q*b6); eng_pres=eng_pres+(b6*b6)
-        l7=l7+f_harsh*b7; b7=b7+f_harsh*(mid-l7-FILTER_Q*b7); eng_harsh=eng_harsh+(b7*b7)
-        l8=l8+f_sib*b8; b8=b8+f_sib*(mid-l8-FILTER_Q*b8); eng_sib=eng_sib+(b8*b8)
-        l9=l9+f_air*b9; b9=b9+f_air*(mid-l9-FILTER_Q*b9); eng_air=eng_air+(b9*b9)
-        ls=ls+f_sub*bs; bs=bs+f_sub*(side-ls-FILTER_Q*bs); eng_sub_side=eng_sub_side+(bs*bs)
+        -- State-Variable Filter executions on Mid channel
+        low_sub = low_sub + filter_coeff_sub * band_sub
+        band_sub = band_sub + filter_coeff_sub * (mid - low_sub - FILTER_Q * band_sub)
+        energy_sub_60hz = energy_sub_60hz + (band_sub * band_sub)
+
+        low_punch = low_punch + filter_coeff_punch * band_punch
+        band_punch = band_punch + filter_coeff_punch * (mid - low_punch - FILTER_Q * band_punch)
+        energy_punch_120hz = energy_punch_120hz + (band_punch * band_punch)
+
+        low_mud = low_mud + filter_coeff_mud * band_mud
+        band_mud = band_mud + filter_coeff_mud * (mid - low_mud - FILTER_Q * band_mud)
+        energy_mud_250hz = energy_mud_250hz + (band_mud * band_mud)
+
+        low_boxy = low_boxy + filter_coeff_boxy * band_boxy
+        band_boxy = band_boxy + filter_coeff_boxy * (mid - low_boxy - FILTER_Q * band_boxy)
+        energy_boxy_500hz = energy_boxy_500hz + (band_boxy * band_boxy)
+
+        low_core = low_core + filter_coeff_core * band_core
+        band_core = band_core + filter_coeff_core * (mid - low_core - FILTER_Q * band_core)
+        energy_core_1khz = energy_core_1khz + (band_core * band_core)
+
+        low_pres = low_pres + filter_coeff_pres * band_pres
+        band_pres = band_pres + filter_coeff_pres * (mid - low_pres - FILTER_Q * band_pres)
+        energy_presence_3khz = energy_presence_3khz + (band_pres * band_pres)
+
+        low_harsh = low_harsh + filter_coeff_harsh * band_harsh
+        band_harsh = band_harsh + filter_coeff_harsh * (mid - low_harsh - FILTER_Q * band_harsh)
+        energy_harsh_6khz = energy_harsh_6khz + (band_harsh * band_harsh)
+
+        low_sib = low_sib + filter_coeff_sib * band_sib
+        band_sib = band_sib + filter_coeff_sib * (mid - low_sib - FILTER_Q * band_sib)
+        energy_sibilance_8khz = energy_sibilance_8khz + (band_sib * band_sib)
+
+        low_air = low_air + filter_coeff_air * band_air
+        band_air = band_air + filter_coeff_air * (mid - low_air - FILTER_Q * band_air)
+        energy_air_12khz = energy_air_12khz + (band_air * band_air)
+
+        -- Sub-bass side channel tracking for mono compatibility
+        low_sub_side = low_sub_side + filter_coeff_sub * band_sub_side
+        band_sub_side = band_sub_side + filter_coeff_sub * (side - low_sub_side - FILTER_Q * band_sub_side)
+        energy_sub_side_channel = energy_sub_side_channel + (band_sub_side * band_sub_side)
     end
 
-local true_peak = math.max(peak_left, peak_right)
+    local true_peak = math.max(peak_left, peak_right)
     local peak_db = (true_peak > 0) and (20 * math.log(true_peak, 10)) or -144
-    local total_rms = math.sqrt((sum_sq_mid + sum_sq_side) / num_samples)
-    local rms_db = (total_rms > 0) and (20 * math.log(total_rms, 10)) or -144
+    local rms_db = (sum_squared_mid + sum_squared_side) > 0 and (20 * math.log(math.sqrt((sum_squared_mid + sum_squared_side) / num_samples), 10)) or -144
     local crest_factor = peak_db - rms_db
 
-    -- Stereo Width (If region is essentially silent, width is 0%)
+    local rms_mid = math.sqrt(sum_squared_mid / num_samples)
+    local rms_side = math.sqrt(sum_squared_side / num_samples)
     local width_pct = 0
-    if (sum_sq_mid + sum_sq_side) > 0 and rms_db > -60.0 then
-        width_pct = (math.sqrt(sum_sq_side) / (math.sqrt(sum_sq_mid) + math.sqrt(sum_sq_side))) * 100
+    if (rms_mid + rms_side) > 0 then
+        width_pct = (rms_side / (rms_mid + rms_side)) * 100
     end
 
-    local sub_energy_total = eng_sub + eng_sub_side + 0.000001
-    local sub_side_pct = (eng_sub_side / sub_energy_total) * 100
+    local sub_energy_total = energy_sub_60hz + energy_sub_side_channel + 0.000001
+    local sub_side_percentage = (energy_sub_side_channel / sub_energy_total) * 100
+    local sub_mono_status = (sub_side_percentage > 15.0) and "Phase_Risk" or "Safe"
 
-    -- Calculate absolute RMS level of the 60Hz sub band (in dBFS)
-    local sub_rms = math.sqrt(sub_energy_total / num_samples)
-    local sub_rms_db = (sub_rms > 0) and (20 * math.log(sub_rms, 10)) or -144
-
-    local sub_mono_status = "Safe"
-
-    -- GATE: Only check phase risk if the region has actual audible sound (> -60 dBFS)
-    -- AND the sub-bass energy itself is loud enough to be heard (> -50 dBFS)
-    if rms_db > -60.0 and sub_rms_db > -50.0 then
-        if sub_side_pct > 15.0 then
-            sub_mono_status = "Phase_Risk"
-        else
-            sub_mono_status = "Safe"
-        end
-    else
-        -- If there is no real sub-bass present, there is ZERO phase risk!
-        sub_mono_status = "Safe"
+    -- Helper to convert any raw band energy accumulation into absolute dBFS
+    local function convert_energy_to_db(energy_sum)
+        local band_rms = math.sqrt(energy_sum / num_samples)
+        if band_rms <= 1e-7 then return -144.0 end
+        return round(20 * math.log(band_rms, 10), 1)
     end
-
-    local total_eng = eng_sub + eng_punch + eng_mud + eng_boxy + eng_core + eng_pres + eng_harsh + eng_sib + eng_air + 0.0001
 
     return {
         dyn = { peak_db = round(peak_db, 1), rms_db = round(rms_db, 1), crest_db = round(crest_factor, 1) },
         stereo = { width_pct = round(width_pct, 1), sub_mono = sub_mono_status },
-        tonal = {
-            sub60 = round((eng_sub / total_eng) * 100, 1),
-            punch120 = round((eng_punch / total_eng) * 100, 1),
-            mud250 = round((eng_mud / total_eng) * 100, 1),
-            boxy500 = round((eng_boxy / total_eng) * 100, 1),
-            mid1k = round((eng_core / total_eng) * 100, 1),
-            pres3k = round((eng_pres / total_eng) * 100, 1),
-            harsh6k = round((eng_harsh / total_eng) * 100, 1),
-            sib8k = round((eng_sib / total_eng) * 100, 1),
-            air12k = round((eng_air / total_eng) * 100, 1)
+        tonal_db = {
+            sub60 = convert_energy_to_db(energy_sub_60hz),
+            punch120 = convert_energy_to_db(energy_punch_120hz),
+            mud250 = convert_energy_to_db(energy_mud_250hz),
+            boxy500 = convert_energy_to_db(energy_boxy_500hz),
+            mid1k = convert_energy_to_db(energy_core_1khz),
+            pres3k = convert_energy_to_db(energy_presence_3khz),
+            harsh6k = convert_energy_to_db(energy_harsh_6khz),
+            sib8k = convert_energy_to_db(energy_sibilance_8khz),
+            air12k = convert_energy_to_db(energy_air_12khz)
         }
     }
 end
