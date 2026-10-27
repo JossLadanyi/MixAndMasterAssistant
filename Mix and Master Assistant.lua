@@ -465,16 +465,40 @@ local function get_track_fx_chain(track)
     return #fx_chain > 0 and fx_chain or nil
 end
 
-local function process_track_data(track, is_master, current_depth)
+local function process_track_data(track, is_master, current_depth, any_soloed, has_children)
     local track_name = get_track_identity(track)
+    local parent = reaper.GetParentTrack(track)
+    local parent_name = parent and get_track_identity(parent) or nil
+
+    -- -------------------------------------------------------------------------
+    -- SMART OMISSION RULE: If tracks are soloed, strip tracks that do not
+    -- contribute audio (not soloed, no children, receives no audio)
+    -- -------------------------------------------------------------------------
+    if any_soloed and not is_master then
+        local is_soloed = reaper.GetMediaTrackInfo_Value(track, "I_SOLO") > 0
+        local is_folder = (has_children and has_children[track] == true)
+        -- In REAPER, category -1 queries RECEIVES from other tracks
+        local receives_audio = reaper.GetTrackNumSends(track, -1) > 0
+
+        local keep_full = is_soloed or is_folder or receives_audio
+        if not keep_full then
+            local minimal_data = {
+                track = track_name,
+                flags = { "muted" }
+            }
+            if parent_name then minimal_data.parent = parent_name end
+            return minimal_data
+        end
+    end
+    -- -------------------------------------------------------------------------
+
     local track_data = { track = track_name }
 
     if not is_master and current_depth and current_depth > 0 then
         track_data.depth = current_depth
     end
 
-    local parent = reaper.GetParentTrack(track)
-    if parent then track_data.parent = get_track_identity(parent) end
+    if parent_name then track_data.parent = parent_name end
 
     local folder_depth = reaper.GetMediaTrackInfo_Value(track, "I_FOLDERDEPTH")
     local mute_state = reaper.GetMediaTrackInfo_Value(track, "B_MUTE") == 1
@@ -493,8 +517,6 @@ local function process_track_data(track, is_master, current_depth)
 
     local pan = format_pan_value(reaper.GetMediaTrackInfo_Value(track, "D_PAN"))
     if pan ~= "Center" then track_data.pan = pan end
-
-    -- (Media item duration and count loops were removed from here)
 
     local num_envelopes = reaper.CountTrackEnvelopes(track)
     if num_envelopes > 0 then
@@ -530,18 +552,28 @@ local function extract_full_project_yaml()
         tracks = {}
     }
 
-	project_data.notes = "- any routing send volume omitted is at 0.0 dB unity gain."
+    project_data.notes = "- any routing send volume omitted is at 0.0 dB unity gain."
     if proj_notes and proj_notes ~= "" then project_data.notes = project_data.notes .. '\n' .. proj_notes end
 
+    local any_soloed = reaper.AnyTrackSolo(0)
+    local num_tracks = reaper.CountTracks(0)
+
+    -- Pre-calculate parent folders that actually have children
+    local has_children = {}
+    for i = 0, num_tracks - 1 do
+        local tr = reaper.GetTrack(0, i)
+        local p = reaper.GetParentTrack(tr)
+        if p then has_children[p] = true end
+    end
+
     -- 1. Master Track
-    table.insert(project_data.tracks, process_track_data(reaper.GetMasterTrack(0), true, 0))
+    table.insert(project_data.tracks, process_track_data(reaper.GetMasterTrack(0), true, 0, any_soloed, has_children))
 
     -- 2. Child Tracks & Folders
     local current_depth = 0
-    local num_tracks = reaper.CountTracks(0)
     for i = 0, num_tracks - 1 do
         local track = reaper.GetTrack(0, i)
-        table.insert(project_data.tracks, process_track_data(track, false, current_depth))
+        table.insert(project_data.tracks, process_track_data(track, false, current_depth, any_soloed, has_children))
         local folder_delta = reaper.GetMediaTrackInfo_Value(track, "I_FOLDERDEPTH")
         if folder_delta == 1 then
             current_depth = current_depth + 1
@@ -641,7 +673,6 @@ local function save_and_apply_mix_state(target_mode, mute_parallels, bypass_mast
             local track_guid = reaper.GetTrackGUID(track)
             local _, track_name = reaper.GetSetMediaTrackInfo_String(track, "P_NAME", "", false)
 
-            -- Use the hierarchy-aware category detector!
             local category = get_effective_track_category(track)
             local display_name = (trim_string(track_name) ~= "") and trim_string(track_name) or ("Track " .. (i + 1))
 
@@ -650,8 +681,16 @@ local function save_and_apply_mix_state(target_mode, mute_parallels, bypass_mast
                 mute = reaper.GetMediaTrackInfo_Value(track, "B_MUTE")
             }
 
+            -- Determine if this track is the target
+            local is_target = false
+            if target_mode == 5 then
+                is_target = reaper.IsTrackSelected(track)
+            elseif target_mode ~= 4 then
+                is_target = (category == target_mode)
+            end
+
             if target_mode ~= 4 then
-                if category == target_mode then
+                if is_target then
                     reaper.SetMediaTrackInfo_Value(track, "I_SOLO", 2)
                     if not is_track_hierarchy_muted(track) then
                         table.insert(target_track_names, display_name)
@@ -659,6 +698,9 @@ local function save_and_apply_mix_state(target_mode, mute_parallels, bypass_mast
                 else
                     reaper.SetMediaTrackInfo_Value(track, "I_SOLO", 0)
                 end
+            else
+                -- Mode 4 = Full Mix (Ensure no residual solos interfere)
+                reaper.SetMediaTrackInfo_Value(track, "I_SOLO", 0)
             end
 
             if mute_parallels and category == 99 then
@@ -1604,7 +1646,13 @@ local report_saved_path = nil
 local scroll_to_bottom = false
 
 local function run_fresh_scan(target_mode, model_choice, mute_parallels, bypass_master_fx, duration_pref, output_api)
-    local target_descriptions = { [1] = "Drums & Bass", [2] = "Instruments", [3] = "Vocals", [4] = "Full Mix" }
+    local target_descriptions = {
+        [1] = "Drums & Bass",
+        [2] = "Instruments",
+        [3] = "Vocals",
+        [4] = "Full Mix",
+        [5] = "Selected Tracks Only"
+    }
     local target_name = target_descriptions[target_mode] or "Full Mix"
     local selected_model = get_model_name(model_choice)
 
