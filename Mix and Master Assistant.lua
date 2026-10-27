@@ -1640,7 +1640,7 @@ local function run_fresh_scan(target_mode, model_choice, mute_parallels, bypass_
     -- 4. Initialize chat history for DeepSeek Prompt Caching
     local initial_ui_msg = "Please analyze the mix for: **" .. target_name .. "**.\n"
     if target_mode ~= 4 and target_tracks and #target_tracks > 0 then
-        initial_ui_msg = initial_ui_msg .. "\n**Isolated Tracks:**\n" .. table.concat(target_tracks, ", ") .. ".\n"
+        initial_ui_msg = initial_ui_msg .. "\n**Active Tracks:**\n" .. table.concat(target_tracks, ", ") .. "\n"
     elseif target_mode == 4 then
         initial_ui_msg = initial_ui_msg .. " *(All tracks included).* \n"
     end
