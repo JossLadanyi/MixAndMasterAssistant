@@ -1651,7 +1651,7 @@ local function run_fresh_scan(target_mode, model_choice, mute_parallels, bypass_
         [2] = "Instruments",
         [3] = "Vocals",
         [4] = "Full Mix",
-        [5] = "Selected Tracks Only"
+        [5] = "Soloed Tracks Only"
     }
     local target_name = target_descriptions[target_mode] or "Full Mix"
     local selected_model = get_model_name(model_choice)
