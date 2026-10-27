@@ -1823,7 +1823,7 @@ local function main()
     local duration_idx = 0
     local output_api = true
 
-    local target_items = "Drums & Bass\0Instruments (No Drums/Bass/Vox)\0Vocals\0Full Mix\0\0"
+    local target_items = "Drums & Bass\0Instruments (No Drums/Bass/Vox)\0Vocals\0Full Mix\0Soloed Tracks Only\0\0"
     local model_items = "DeepSeek V4 Pro (Flagship Reasoning)\0DeepSeek Flash (Fast / Low-Cost)\0\0"
     local duration_items = "10 Seconds\0" .. "20 Seconds\0" .. "Full Region\0\0"
 
