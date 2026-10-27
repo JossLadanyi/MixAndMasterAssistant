@@ -1635,7 +1635,9 @@ local function render_markdown_text(ctx, text)
         if line ~= "" then
             -- Detect Markdown Table Rows
             if line:match("^%s*|.*|%s*$") then
-                if line:match("|%s*%-+.*|") then
+                -- FIX: Strictly match ONLY markdown separator rows (e.g., |---|---|)
+                -- Prevents negative dB values (e.g., -12.0) from being deleted
+                if line:match("^%s*[|%-%s:]+$") then
                     -- Skip the markdown table separator row
                 else
                     if not in_table then
@@ -1787,7 +1789,7 @@ local function run_fresh_scan(target_mode, model_choice, mute_parallels, bypass_
 
         -- Populate Tonal Balance Table
         tonal_msg = tonal_msg .. string.format("| %s | %.1f | %.1f | %.1f | %.1f | %.1f | %.1f | %.1f | %.1f | %.1f |\n",
-            clean_name, m.tonal.sub60, m.tonal.punch120, m.tonal.mud250, m.tonal.boxy500, m.tonal.mid1k, m.tonal.pres3k, m.tonal.harsh6k, m.tonal.sib8k, m.tonal.air12k)
+            clean_name, m.tonal_db.sub60, m.tonal_db.punch120, m.tonal_db.mud250, m.tonal_db.boxy500, m.tonal_db.mid1k, m.tonal_db.pres3k, m.tonal_db.harsh6k, m.tonal_db.sib8k, m.tonal_db.air12k)
     end
     initial_ui_msg = initial_ui_msg .. tonal_msg
 
