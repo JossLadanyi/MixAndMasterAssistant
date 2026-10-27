@@ -666,7 +666,7 @@ local function save_and_apply_mix_state(target_mode, mute_parallels, bypass_mast
         if bypass_master_fx then reaper.TrackFX_SetEnabled(master_track, fx_idx, false) end
     end
 
-    -- Backup and set track solos/mutes
+    -- Backup and set track solos/mutes based STRICTLY on I_SOLO
     for i = 0, reaper.CountTracks(0) - 1 do
         local track = reaper.GetTrack(0, i)
         if track then
@@ -676,22 +676,27 @@ local function save_and_apply_mix_state(target_mode, mute_parallels, bypass_mast
             local category = get_effective_track_category(track)
             local display_name = (trim_string(track_name) ~= "") and trim_string(track_name) or ("Track " .. (i + 1))
 
+            local orig_solo = reaper.GetMediaTrackInfo_Value(track, "I_SOLO")
+            local orig_mute = reaper.GetMediaTrackInfo_Value(track, "B_MUTE")
+
             saved_mix_state.tracks[track_guid] = {
-                solo = reaper.GetMediaTrackInfo_Value(track, "I_SOLO"),
-                mute = reaper.GetMediaTrackInfo_Value(track, "B_MUTE")
+                solo = orig_solo,
+                mute = orig_mute
             }
 
-            -- Determine if this track is the target
             local is_target = false
+
+            -- TARGET MODE 5: "Soloed Tracks Only" -> strictly looks at your REAPER Solo buttons!
             if target_mode == 5 then
-                is_target = reaper.IsTrackSelected(track)
+                is_target = (orig_solo > 0)
             elseif target_mode ~= 4 then
+                -- TARGET MODES 1, 2, 3: Automatic stem category soloing
                 is_target = (category == target_mode)
             end
 
             if target_mode ~= 4 then
                 if is_target then
-                    reaper.SetMediaTrackInfo_Value(track, "I_SOLO", 2)
+                    reaper.SetMediaTrackInfo_Value(track, "I_SOLO", 2) -- Solo-in-place
                     if not is_track_hierarchy_muted(track) then
                         table.insert(target_track_names, display_name)
                     end
@@ -699,7 +704,7 @@ local function save_and_apply_mix_state(target_mode, mute_parallels, bypass_mast
                     reaper.SetMediaTrackInfo_Value(track, "I_SOLO", 0)
                 end
             else
-                -- Mode 4 = Full Mix (Ensure no residual solos interfere)
+                -- MODE 4: Full Mix -> clear all solos
                 reaper.SetMediaTrackInfo_Value(track, "I_SOLO", 0)
             end
 
@@ -1674,14 +1679,14 @@ local report_saved_path = nil
 local scroll_to_bottom = false
 
 local function run_fresh_scan(target_mode, model_choice, mute_parallels, bypass_master_fx, duration_pref, output_api)
-    local target_descriptions = {
+	local target_descriptions = {
         [1] = "Drums & Bass",
         [2] = "Instruments",
         [3] = "Vocals",
         [4] = "Full Mix",
         [5] = "Soloed Tracks Only"
     }
-    local target_name = target_descriptions[target_mode] or "Full Mix"
+	local target_name = target_descriptions[target_mode] or "Full Mix"
     local selected_model = get_model_name(model_choice)
 
     -- 1. Scan and isolate
