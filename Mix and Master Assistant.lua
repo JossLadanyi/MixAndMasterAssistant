@@ -1519,47 +1519,48 @@ local function render_markdown_text(ctx, text)
     if not text or text == "" then return end
 
     local in_table = false
+    local table_counter = 0
 
     for line in text:gmatch("([^\r\n]*)[\r\n]?") do
-        -- Detect Markdown Table Rows (lines starting and ending with |)
-        if line:match("^%s*|.*|%s*$") then
-            if line:match("|%s*%-+.*|") then
-                -- Skip the markdown table separator row (e.g., |---|---|)
+        if line ~= "" then
+            -- Detect Markdown Table Rows
+            if line:match("^%s*|.*|%s*$") then
+                if line:match("|%s*%-+.*|") then
+                    -- Skip the markdown table separator row
+                else
+                    if not in_table then
+                        table_counter = table_counter + 1
+                        local cols = 0
+                        for _ in line:gmatch("|") do cols = cols + 1 end
+                        cols = cols - 1
+
+                        -- Start Native ReaImGui Table with a UNIQUE ID
+                        local flags = reaper.ImGui_TableFlags_Borders() | reaper.ImGui_TableFlags_RowBg() | reaper.ImGui_TableFlags_SizingStretchSame()
+                        if reaper.ImGui_BeginTable(ctx, "MarkdownTable_" .. table_counter, cols, flags) then
+                            in_table = true
+                        end
+                    end
+
+                    if in_table then
+                        reaper.ImGui_TableNextRow(ctx)
+                        local col_idx = 0
+                        for cell_text in line:gmatch("|([^|]+)") do
+                            reaper.ImGui_TableSetColumnIndex(ctx, col_idx)
+                            local clean_cell = trim_string(cell_text:gsub("%*%*(.-)%*%*", "%1"))
+                            reaper.ImGui_Text(ctx, clean_cell)
+                            col_idx = col_idx + 1
+                        end
+                    end
+                end
             else
-                if not in_table then
-                    -- Count columns based on pipe characters
-                    local cols = 0
-                    for _ in line:gmatch("|") do cols = cols + 1 end
-                    cols = cols - 1
-
-                    -- Start Native ReaImGui Table (SizingStretchSame perfectly balances column widths)
-                    local flags = reaper.ImGui_TableFlags_Borders() | reaper.ImGui_TableFlags_RowBg() | reaper.ImGui_TableFlags_SizingStretchSame()
-                    if reaper.ImGui_BeginTable(ctx, "MarkdownTable", cols, flags) then
-                        in_table = true
-                    end
-                end
-
+                -- If we were drawing a table and hit a normal line, close the table cleanly
                 if in_table then
-                    reaper.ImGui_TableNextRow(ctx)
-                    local col_idx = 0
-                    for cell_text in line:gmatch("|([^|]+)") do
-                        reaper.ImGui_TableSetColumnIndex(ctx, col_idx)
-                        local clean_cell = trim_string(cell_text:gsub("%*%*(.-)%*%*", "%1"))
-                        reaper.ImGui_Text(ctx, clean_cell)
-                        col_idx = col_idx + 1
-                    end
+                    reaper.ImGui_EndTable(ctx)
+                    in_table = false
+                    reaper.ImGui_Dummy(ctx, 0, 8)
                 end
-            end
-        else
-            -- If we were drawing a table and hit a normal line, close the table cleanly
-            if in_table then
-                reaper.ImGui_EndTable(ctx)
-                in_table = false
-                reaper.ImGui_Dummy(ctx, 0, 8)
-            end
 
-            if line ~= "" then
-                -- Headers (### Title) -> Gold text with separator
+                -- Headers (### Title)
                 if line:match("^#+%s*(.+)") then
                     local header_text = line:match("^#+%s*(.+)")
                     reaper.ImGui_Dummy(ctx, 0, 4)
@@ -1575,7 +1576,7 @@ local function render_markdown_text(ctx, text)
                     reaper.ImGui_SameLine(ctx)
                     reaper.ImGui_TextWrapped(ctx, bullet_text)
 
-                -- Numbered lists (1. Directive) -> Cyan number
+                -- Numbered lists (1. Directive)
                 elseif line:match("^%d+%.%s+(.+)") then
                     local num, item_text = line:match("^(%d+%.)%s+(.+)")
                     item_text = item_text:gsub("%*%*(.-)%*%*", "%1")
@@ -1592,7 +1593,6 @@ local function render_markdown_text(ctx, text)
         end
     end
 
-    -- Ensure table is closed if it was the very last thing in the text
     if in_table then
         reaper.ImGui_EndTable(ctx)
     end
