@@ -838,7 +838,6 @@ local function process_audio_chunk(take, item_pos, analyze_start, analyze_dur)
     if not ok then return nil end
 
 	-- Convert C++ buffer to a native 1-based Lua table
-    -- Convert C++ buffer to a native 1-based Lua table
     local audio_samples = buffer
     if type(buffer) == "userdata" and buffer.table then
         audio_samples = buffer.table()
@@ -957,13 +956,22 @@ local function process_audio_chunk(take, item_pos, analyze_start, analyze_dur)
 
     local sub_energy_total = energy_sub_60hz + energy_sub_side_channel + 0.000001
     local sub_side_percentage = (energy_sub_side_channel / sub_energy_total) * 100
-    local sub_mono_status = (sub_side_percentage > 15.0) and "Phase_Risk" or "Safe"
 
     -- Helper to convert any raw band energy accumulation into absolute dBFS
     local function convert_energy_to_db(energy_sum)
         local band_rms = math.sqrt(energy_sum / num_samples)
         if band_rms <= 1e-7 then return -144.0 end
         return round(20 * math.log(band_rms, 10), 1)
+    end
+
+    local sub_energy_total = energy_sub_60hz + energy_sub_side_channel + 0.000001
+    local sub_side_percentage = (energy_sub_side_channel / sub_energy_total) * 100
+
+    -- Only flag phase risk if there is actual bass playing (louder than -60 dBFS).
+    -- This prevents plugin noise floors or dither in empty regions from triggering a false positive.
+    local sub_mono_status = "Safe"
+    if convert_energy_to_db(energy_sub_60hz) > -60.0 and sub_side_percentage > 15.0 then
+        sub_mono_status = "Phase_Risk"
     end
 
     return {
