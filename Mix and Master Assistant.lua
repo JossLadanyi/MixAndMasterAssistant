@@ -1012,7 +1012,7 @@ local function build_full_prompt(project_yaml, audio_metrics, target_str, target
 
     prompt = prompt .. "=== TARGET TRACKS ===\n"
     if target_tracks and #target_tracks > 0 then
-        prompt = prompt .. "The following tracks are currently isolated (soloed) for this specific analysis:\n"
+        prompt = prompt .. "The following tracks are currently active for this specific analysis:\n"
         prompt = prompt .. table.concat(target_tracks, ", ") .. "\n\n"
         prompt = prompt .. "CRITICAL RESTRICTION: Focus YOUR ENTIRE ANALYSIS and plugin recommendations SOLELY on these specific tracks, plus the Master Bus if relevant. Do not critique or suggest parameter changes for any tracks outside this list.\n\n"
     else
@@ -1025,8 +1025,8 @@ local function build_full_prompt(project_yaml, audio_metrics, target_str, target
     prompt = prompt .. "2. LOW/MID FREQUENCY BALANCE: Scrutinize Sub (60Hz), Punch (120Hz), Mud (250Hz), and Boxy (500Hz). Locate masking in the project tracks and suggest surgical EQ cuts.\n"
     prompt = prompt .. "3. HIGH FREQUENCY INTEGRITY: Differentiate Harshness (6kHz) from Sibilance (8kHz). Look for abrasive saturation or identify tracks requiring a De-Esser.\n"
     prompt = prompt .. "4. STEREO & SUB-MONO INTEGRITY: Check 'width_pct' and 'sub_mono'. If 'Phase_Risk' is flagged on sub-bass, immediately identify which low-end tracks have wide side-channel information and advise how to high-pass or mono their sides.\n"
-    prompt = prompt .. "5. CONTEXT AWARENESS: Look closely at 'active_trks' for each region. ONLY critique or suggest changes to tracks that are actively playing in that specific region.\n"
     prompt = prompt .. "6. PRECISION: Quote exact track names, plugin names, and parameter settings as formatted in the project YAML.\n\n"
+    prompt = prompt .. "5. CONTEXT AWARENESS: Look closely at 'active_trks' for each region. ONLY critique or suggest changes to tracks that are actively playing in that specific region. You should not create a new CONTEXT AWARE section if you already made all suggestions you would list here.\n"
 
     prompt = prompt .. "=== REGIONAL AUDIO ANALYSIS METRICS ===\n" .. to_yaml(audio_metrics) .. "\n\n"
     prompt = prompt .. "=== REAPER PROJECT CONFIGURATION & FX CHAINS ===\n" .. project_yaml .. "\n"
