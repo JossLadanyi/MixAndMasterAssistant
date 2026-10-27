@@ -890,16 +890,44 @@ local function process_audio_chunk(take, item_pos, analyze_start, analyze_dur)
         ls=ls+f_sub*bs; bs=bs+f_sub*(side-ls-FILTER_Q*bs); eng_sub_side=eng_sub_side+(bs*bs)
     end
 
-    local true_peak = math.max(peak_left, peak_right)
+local true_peak = math.max(peak_left, peak_right)
     local peak_db = (true_peak > 0) and (20 * math.log(true_peak, 10)) or -144
-    local rms_db = (sum_sq_mid+sum_sq_side) > 0 and (20 * math.log(math.sqrt((sum_sq_mid+sum_sq_side)/num_samples), 10)) or -144
-    local width_pct = (sum_sq_mid+sum_sq_side) > 0 and (math.sqrt(sum_sq_side)/(math.sqrt(sum_sq_mid)+math.sqrt(sum_sq_side)))*100 or 0
+    local total_rms = math.sqrt((sum_sq_mid + sum_sq_side) / num_samples)
+    local rms_db = (total_rms > 0) and (20 * math.log(total_rms, 10)) or -144
+    local crest_factor = peak_db - rms_db
 
-    local sub_mono_status = ((eng_sub_side / (eng_sub + eng_sub_side + 0.0001)) * 100 > 12) and "Phase_Risk" or "Safe"
+    -- Stereo Width (If region is essentially silent, width is 0%)
+    local width_pct = 0
+    if (sum_sq_mid + sum_sq_side) > 0 and rms_db > -60.0 then
+        width_pct = (math.sqrt(sum_sq_side) / (math.sqrt(sum_sq_mid) + math.sqrt(sum_sq_side))) * 100
+    end
+
+    local sub_energy_total = eng_sub + eng_sub_side + 0.000001
+    local sub_side_pct = (eng_sub_side / sub_energy_total) * 100
+
+    -- Calculate absolute RMS level of the 60Hz sub band (in dBFS)
+    local sub_rms = math.sqrt(sub_energy_total / num_samples)
+    local sub_rms_db = (sub_rms > 0) and (20 * math.log(sub_rms, 10)) or -144
+
+    local sub_mono_status = "Safe"
+
+    -- GATE: Only check phase risk if the region has actual audible sound (> -60 dBFS)
+    -- AND the sub-bass energy itself is loud enough to be heard (> -50 dBFS)
+    if rms_db > -60.0 and sub_rms_db > -50.0 then
+        if sub_side_pct > 15.0 then
+            sub_mono_status = "Phase_Risk"
+        else
+            sub_mono_status = "Safe"
+        end
+    else
+        -- If there is no real sub-bass present, there is ZERO phase risk!
+        sub_mono_status = "Safe"
+    end
+
     local total_eng = eng_sub + eng_punch + eng_mud + eng_boxy + eng_core + eng_pres + eng_harsh + eng_sib + eng_air + 0.0001
 
     return {
-        dyn = { peak_db = round(peak_db, 1), rms_db = round(rms_db, 1), crest_db = round(peak_db - rms_db, 1) },
+        dyn = { peak_db = round(peak_db, 1), rms_db = round(rms_db, 1), crest_db = round(crest_factor, 1) },
         stereo = { width_pct = round(width_pct, 1), sub_mono = sub_mono_status },
         tonal = {
             sub60 = round((eng_sub / total_eng) * 100, 1),
