@@ -1505,10 +1505,47 @@ end
 local function render_markdown_text(ctx, text)
     if not text or text == "" then return end
 
+    local in_table = false
+
     for line in text:gmatch("([^\r\n]*)[\r\n]?") do
-        if line ~= "" then
-            -- Skip raw markdown table code entirely in the chat window so it doesn't break
-            if not line:match("^%s*|") then
+        -- Detect Markdown Table Rows (lines starting and ending with |)
+        if line:match("^%s*|.*|%s*$") then
+            if line:match("|%s*%-+.*|") then
+                -- Skip the markdown table separator row (e.g., |---|---|)
+            else
+                if not in_table then
+                    -- Count columns based on pipe characters
+                    local cols = 0
+                    for _ in line:gmatch("|") do cols = cols + 1 end
+                    cols = cols - 1
+
+                    -- Start Native ReaImGui Table (SizingStretchSame perfectly balances column widths)
+                    local flags = reaper.ImGui_TableFlags_Borders() | reaper.ImGui_TableFlags_RowBg() | reaper.ImGui_TableFlags_SizingStretchSame()
+                    if reaper.ImGui_BeginTable(ctx, "MarkdownTable", cols, flags) then
+                        in_table = true
+                    end
+                end
+
+                if in_table then
+                    reaper.ImGui_TableNextRow(ctx)
+                    local col_idx = 0
+                    for cell_text in line:gmatch("|([^|]+)") do
+                        reaper.ImGui_TableSetColumnIndex(ctx, col_idx)
+                        local clean_cell = trim_string(cell_text:gsub("%*%*(.-)%*%*", "%1"))
+                        reaper.ImGui_Text(ctx, clean_cell)
+                        col_idx = col_idx + 1
+                    end
+                end
+            end
+        else
+            -- If we were drawing a table and hit a normal line, close the table cleanly
+            if in_table then
+                reaper.ImGui_EndTable(ctx)
+                in_table = false
+                reaper.ImGui_Dummy(ctx, 0, 8)
+            end
+
+            if line ~= "" then
                 -- Headers (### Title) -> Gold text with separator
                 if line:match("^#+%s*(.+)") then
                     local header_text = line:match("^#+%s*(.+)")
@@ -1540,6 +1577,11 @@ local function render_markdown_text(ctx, text)
                 end
             end
         end
+    end
+
+    -- Ensure table is closed if it was the very last thing in the text
+    if in_table then
+        reaper.ImGui_EndTable(ctx)
     end
 end
 
@@ -1578,17 +1620,47 @@ local function run_fresh_scan(target_mode, model_choice, mute_parallels, bypass_
         return false
     end
 
-    -- 3. Save raw file (Corrected: exactly 4 arguments)
+    -- 3. Save raw file
     local full_prompt = build_full_prompt(project_yaml, audio_metrics, target_name, target_tracks)
     report_saved_path = save_prompt_to_txt(full_prompt, target_name)
 
-    -- 4. Initialize chat history
-    local initial_ui_msg = "Please analyze the mix for: **" .. target_name .. "**."
+    -- 4. Initialize chat history for DeepSeek Prompt Caching
+    local initial_ui_msg = "Please analyze the mix for: **" .. target_name .. "**.\n"
     if target_mode ~= 4 and target_tracks and #target_tracks > 0 then
-        initial_ui_msg = initial_ui_msg .. "\n\n**Isolated Tracks:**\n- " .. table.concat(target_tracks, "\n- ")
+        initial_ui_msg = initial_ui_msg .. "\n**Isolated Tracks:**\n" .. table.concat(target_tracks, ", ") .. ".\n"
     elseif target_mode == 4 then
-        initial_ui_msg = initial_ui_msg .. " (All tracks included)."
+        initial_ui_msg = initial_ui_msg .. " *(All tracks included).* \n"
     end
+
+    -- =====================================================================
+    -- DYNAMIC METRICS TABLES FOR GUI (Splitting into 2 tables for neatness)
+    -- =====================================================================
+    initial_ui_msg = initial_ui_msg .. "\n### 1. Macro-Dynamics & Stereo Summary\n"
+    initial_ui_msg = initial_ui_msg .. "| Region | Peak | RMS | Crest | Width | Sub-Mono |\n"
+    initial_ui_msg = initial_ui_msg .. "|---|---|---|---|---|---|\n"
+
+    local tonal_msg = "\n### 2. Tonal Balance Summary (%)\n"
+    tonal_msg = tonal_msg .. "| Region | Sub | Punch | Mud | Boxy | Core | Pres | Harsh | Sib | Air |\n"
+    tonal_msg = tonal_msg .. "|---|---|---|---|---|---|---|---|---|---|\n"
+
+    local sorted_regions = {}
+    for r_key in pairs(audio_metrics) do table.insert(sorted_regions, r_key) end
+    table.sort(sorted_regions)
+
+    for _, r_key in ipairs(sorted_regions) do
+        local m = audio_metrics[r_key]
+        local clean_name = r_key:gsub("^%d+_", ""):gsub("_", " ")
+        local phase_status = m.stereo.sub_mono == "Phase_Risk" and "Risk" or "Safe"
+
+        -- Populate Dynamics Table
+        initial_ui_msg = initial_ui_msg .. string.format("| %s | %.1f | %.1f | %.1f | %.0f%% | %s |\n",
+            clean_name, m.dyn.peak_db, m.dyn.rms_db, m.dyn.crest_db, m.stereo.width_pct, phase_status)
+
+        -- Populate Tonal Balance Table
+        tonal_msg = tonal_msg .. string.format("| %s | %.1f | %.1f | %.1f | %.1f | %.1f | %.1f | %.1f | %.1f | %.1f |\n",
+            clean_name, m.tonal.sub60, m.tonal.punch120, m.tonal.mud250, m.tonal.boxy500, m.tonal.mid1k, m.tonal.pres3k, m.tonal.harsh6k, m.tonal.sib8k, m.tonal.air12k)
+    end
+    initial_ui_msg = initial_ui_msg .. tonal_msg
 
     chat_history = {
         { role = "system", content = full_prompt },
@@ -1627,9 +1699,7 @@ local function main()
 
     local ctx = reaper.ImGui_CreateContext("AI_Mix_Assistant")
 
-    -- =========================================================
-    -- LOAD FIXED-WIDTH FONT FOR CHAT (Slightly larger: size 15)
-    -- =========================================================
+    -- Load fixed-width font for chat
     local os_name = reaper.GetOS()
     local font_name = os_name:match("Win") and "Consolas" or "Menlo"
     local chat_font = nil
