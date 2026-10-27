@@ -612,6 +612,17 @@ local function get_effective_track_category(track)
     return get_track_category(track_name)
 end
 
+local function is_track_hierarchy_muted(track)
+    local current = track
+    while current do
+        if reaper.GetMediaTrackInfo_Value(current, "B_MUTE") == 1 then
+            return true
+        end
+        current = reaper.GetParentTrack(current)
+    end
+    return false
+end
+
 local function save_and_apply_mix_state(target_mode, mute_parallels, bypass_master_fx)
     saved_mix_state = { tracks = {}, master_fx = {} }
     local master_track = reaper.GetMasterTrack(0)
@@ -642,7 +653,9 @@ local function save_and_apply_mix_state(target_mode, mute_parallels, bypass_mast
             if target_mode ~= 4 then
                 if category == target_mode then
                     reaper.SetMediaTrackInfo_Value(track, "I_SOLO", 2)
-                    table.insert(target_track_names, display_name)
+                    if not is_track_hierarchy_muted(track) then
+                        table.insert(target_track_names, display_name)
+                    end
                 else
                     reaper.SetMediaTrackInfo_Value(track, "I_SOLO", 0)
                 end
