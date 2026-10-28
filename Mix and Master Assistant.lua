@@ -1568,8 +1568,14 @@ local function ask_deep_seek(chat_history, model_name)
 end
 
 local user_balance_str = "N/A"
+local balance_is_fetching = false
+local balance_temp_file = reaper.GetResourcePath() .. "/temp_balance.txt"
+local balance_done_file = reaper.GetResourcePath() .. "/temp_balance.done"
+local balance_script_file = reaper.GetResourcePath() .. "/temp_balance_script"
 
 local function fetch_deep_seek_balance()
+    if balance_is_fetching then return end
+
     if API_KEY == "YOUR_DEEPSEEK_API_KEY" or API_KEY == "" then
         user_balance_str = "No API Key"
         return
@@ -1581,51 +1587,97 @@ local function fetch_deep_seek_balance()
         return
     end
 
+    user_balance_str = "Fetching..."
+    balance_is_fetching = true
+
+    -- Clean up previous async files
+    os.remove(balance_temp_file)
+    os.remove(balance_done_file)
+
     local os_name = reaper.GetOS()
     local curl_cmd = curl_bin .. ' -sS -H ' .. shell_quote_for_curl('Authorization: Bearer ' .. API_KEY) ..
                      ' https://api.deepseek.com/user/balance'
 
-    -- On Windows, wrap the command in an extra pair of quotes so cmd.exe doesn't strip inner quotes.
-    -- Append 2>&1 so stderr errors (like network/certificate issues) are captured instead of lost.
-    local popen_cmd = os_name:match("Win") and ('"' .. curl_cmd .. ' 2>&1"') or (curl_cmd .. ' 2>&1')
-    local handle = io.popen(popen_cmd)
-    local raw = handle and handle:read("*a") or ""
-    if handle then handle:close() end
+    -- Build and execute background detached shell scripts
+    if os_name:match("Win") then
+        local bat_path = balance_script_file .. ".bat"
+        local bat = io.open(bat_path, "w")
+        if not bat then balance_is_fetching = false; user_balance_str = "I/O Error"; return end
+        bat:write("@echo off\n")
+        bat:write(curl_cmd .. ' > "' .. balance_temp_file .. '" 2>&1\n')
+        bat:write('echo DONE > "' .. balance_done_file .. '"\n')
+        bat:write('del "%~f0"\n') -- Self-deletes when finished
+        bat:close()
 
-    if raw == "" then
-        user_balance_str = "Check Failed"
-        return
+        -- Run silently in the background
+        os.execute('start "" /B "' .. bat_path .. '"')
+    else
+        local sh_path = balance_script_file .. ".sh"
+        local sh = io.open(sh_path, "w")
+        if not sh then balance_is_fetching = false; user_balance_str = "I/O Error"; return end
+        sh:write("#!/bin/sh\n")
+        sh:write(curl_cmd .. ' > "' .. balance_temp_file .. '" 2>&1\n')
+        sh:write('echo DONE > "' .. balance_done_file .. '"\n')
+        sh:write('rm "$0"\n') -- Self-deletes when finished
+        sh:close()
+
+        -- Run silently in the background
+        os.execute('sh "' .. sh_path .. '" &')
     end
+end
 
-    local total_balance = nil
-    local currency = "USD"
+-- Non-blocking UI checker for the background job
+local function poll_deep_seek_balance()
+    if not balance_is_fetching then return end
 
-    -- 1. Parse via JSON decoder
-    local ok_json, data = parse_json(raw)
-    if ok_json and type(data) == "table" then
-        if data.error then
-            user_balance_str = data.error.message or "API Error"
+    -- Check if background script created the completion flag
+    local f = io.open(balance_done_file, "r")
+    if f then
+        f:close()
+        balance_is_fetching = false
+
+        -- Safely read the result
+        local res_f = io.open(balance_temp_file, "r")
+        local raw = res_f and res_f:read("*a") or ""
+        if res_f then res_f:close() end
+
+        -- Cleanup
+        os.remove(balance_temp_file)
+        os.remove(balance_done_file)
+
+        if raw == "" then
+            user_balance_str = "Check Failed"
             return
         end
-        -- DeepSeek balance is nested inside balance_infos[1]
-        local info = (data.balance_infos and data.balance_infos[1]) or data
-        total_balance = info.total_balance or info.total or info.balance
-        currency = info.currency or currency
-    end
 
-    -- 2. Direct regex fallback (guarantees extraction even if JSON structure varies)
-    if not total_balance then
-        total_balance = raw:match('"total_balance"%s*:%s*"(.-)"')
-        currency = raw:match('"currency"%s*:%s*"(.-)"') or currency
-    end
+        local total_balance = nil
+        local currency = "USD"
 
-    if total_balance then
-        local symbol = (currency == "USD") and "$" or "¥"
-        user_balance_str = symbol .. tostring(total_balance)
-    else
-        user_balance_str = "Check Failed"
-        -- Print exact server output to the console for instant diagnostics
-        reaper.ShowConsoleMsg("\n[DeepSeek Balance Error]\nRaw Server Output:\n" .. tostring(raw) .. "\n")
+        -- 1. Parse via JSON decoder
+        local ok_json, data = parse_json(raw)
+        if ok_json and type(data) == "table" then
+            if data.error then
+                user_balance_str = data.error.message or "API Error"
+                return
+            end
+            local info = (data.balance_infos and data.balance_infos[1]) or data
+            total_balance = info.total_balance or info.total or info.balance
+            currency = info.currency or currency
+        end
+
+        -- 2. Direct regex fallback
+        if not total_balance then
+            total_balance = raw:match('"total_balance"%s*:%s*"(.-)"')
+            currency = raw:match('"currency"%s*:%s*"(.-)"') or currency
+        end
+
+        if total_balance then
+            local symbol = (currency == "USD") and "$" or "¥"
+            user_balance_str = symbol .. tostring(total_balance)
+        else
+            user_balance_str = "Check Failed"
+            reaper.ShowConsoleMsg("\n[DeepSeek Balance Error]\nRaw Server Output:\n" .. tostring(raw) .. "\n")
+        end
     end
 end
 
@@ -1881,7 +1933,9 @@ local function main()
     local model_items = "DeepSeek V4 Pro (Flagship Reasoning)\0DeepSeek Flash (Fast / Low-Cost)\0\0"
     local duration_items = "10 Seconds\0" .. "20 Seconds\0" .. "Full Region\0\0"
 
-    local function loop()
+	local function loop()
+        poll_deep_seek_balance()
+
         reaper.ImGui_SetNextWindowSize(ctx, 720, 680, reaper.ImGui_Cond_FirstUseEver())
         local window_flags = reaper.ImGui_WindowFlags_NoCollapse() | reaper.ImGui_WindowFlags_TopMost()
         local visible, open = reaper.ImGui_Begin(ctx, "Mix and Master Assistant", true, window_flags)
