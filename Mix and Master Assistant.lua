@@ -1507,10 +1507,11 @@ local function ask_deep_seek(chat_history, model_name)
     -- Windows cmd.exe quote-stripping protection
     local os_name = reaper.GetOS()
     if os_name:match("Win") then
-        curl_command = '"' .. curl_command .. '"'
+        -- REAPER's ExecProcess runs completely hidden. Timeout 0 means "wait until finished".
+        reaper.ExecProcess('cmd.exe /c "' .. curl_command .. '"', 0)
+    else
+        os.execute(curl_command)
     end
-
-    os.execute(curl_command)
 
     local response_file = io.open(temp_response_path, "r")
     if not response_file then
@@ -1593,36 +1594,47 @@ local function fetch_deep_seek_balance()
     -- Clean up previous async files
     os.remove(balance_temp_file)
     os.remove(balance_done_file)
+    os.remove(balance_script_file .. ".bat")
+    os.remove(balance_script_file .. ".vbs")
+    os.remove(balance_script_file .. ".sh")
 
     local os_name = reaper.GetOS()
     local curl_cmd = curl_bin .. ' -sS -H ' .. shell_quote_for_curl('Authorization: Bearer ' .. API_KEY) ..
                      ' https://api.deepseek.com/user/balance'
 
-    -- Build and execute background detached shell scripts
     if os_name:match("Win") then
         local bat_path = balance_script_file .. ".bat"
+        local vbs_path = balance_script_file .. ".vbs"
+
+        -- 1. Create the Batch script
         local bat = io.open(bat_path, "w")
         if not bat then balance_is_fetching = false; user_balance_str = "I/O Error"; return end
         bat:write("@echo off\n")
         bat:write(curl_cmd .. ' > "' .. balance_temp_file .. '" 2>&1\n')
         bat:write('echo DONE > "' .. balance_done_file .. '"\n')
-        bat:write('del "%~f0"\n') -- Self-deletes when finished
         bat:close()
 
-        -- Run silently in the background
-        os.execute('start "" /B "' .. bat_path .. '"')
+        -- 2. Create the VBScript wrapper using safe quotes to prevent any syntax hanging
+        local vbs = io.open(vbs_path, "w")
+        if not vbs then balance_is_fetching = false; user_balance_str = "I/O Error"; return end
+        vbs:write('Set objShell = CreateObject("WScript.Shell")\n')
+        vbs:write('objShell.Run "cmd.exe /c " & Chr(34) & "' .. bat_path .. '" & Chr(34), 0, False\n')
+        vbs:close()
+
+        -- 3. Launch via native REAPER ExecProcess using -1 (Launch detached and immediately return)
+        -- This guarantees the UI thread will not block waiting for curl to finish.
+        reaper.ExecProcess('wscript.exe "' .. vbs_path .. '"', -1)
     else
+        -- Mac/Linux invisible background execution (stream redirect to fully detach handles)
         local sh_path = balance_script_file .. ".sh"
         local sh = io.open(sh_path, "w")
         if not sh then balance_is_fetching = false; user_balance_str = "I/O Error"; return end
         sh:write("#!/bin/sh\n")
         sh:write(curl_cmd .. ' > "' .. balance_temp_file .. '" 2>&1\n')
         sh:write('echo DONE > "' .. balance_done_file .. '"\n')
-        sh:write('rm "$0"\n') -- Self-deletes when finished
         sh:close()
 
-        -- Run silently in the background
-        os.execute('sh "' .. sh_path .. '" &')
+        os.execute('sh "' .. sh_path .. '" >/dev/null 2>&1 &')
     end
 end
 
@@ -1641,9 +1653,12 @@ local function poll_deep_seek_balance()
         local raw = res_f and res_f:read("*a") or ""
         if res_f then res_f:close() end
 
-        -- Cleanup
+        -- Complete cleanup of all temporary scripts and files
         os.remove(balance_temp_file)
         os.remove(balance_done_file)
+        os.remove(balance_script_file .. ".bat")
+        os.remove(balance_script_file .. ".vbs")
+        os.remove(balance_script_file .. ".sh")
 
         if raw == "" then
             user_balance_str = "Check Failed"
