@@ -1817,7 +1817,7 @@ local function render_markdown_text(ctx, text)
                         cols = cols - 1
 
 						-- Start Native ReaImGui Table with a UNIQUE ID. Columns auto-size intelligently
-                        local flags = reaper.ImGui_TableFlags_Borders() | reaper.ImGui_TableFlags_RowBg() | reaper.ImGui_TableFlags_SizingStretchProp()
+                        local flags = reaper.ImGui_TableFlags_Borders() | reaper.ImGui_TableFlags_RowBg() | reaper.ImGui_TableFlags_SizingFixedFit()
                         if reaper.ImGui_BeginTable(ctx, "MarkdownTable_" .. table_counter, cols, flags) then
                             in_table = true
                             for c = 0, cols - 1 do
@@ -1832,8 +1832,8 @@ local function render_markdown_text(ctx, text)
                         for cell_text in line:gmatch("|([^|]+)") do
                             reaper.ImGui_TableSetColumnIndex(ctx, col_idx)
                             local clean_cell = trim_string(cell_text:gsub("%*%*(.-)%*%*", "%1"))
-                            -- Use TextWrapped instead of Text so long region names or values never clip
-                            reaper.ImGui_TextWrapped(ctx, clean_cell)
+                            -- FIX: Use standard ImGui_Text so letters are never stacked vertically
+                            reaper.ImGui_Text(ctx, clean_cell)
                             col_idx = col_idx + 1
                         end
                     end
