@@ -1210,6 +1210,77 @@ local function save_prompt_to_txt(full_prompt, target_str)
     end
 end
 
+local function save_tables_to_html(audio_metrics, txt_file_path, target_str)
+    if not txt_file_path then return end
+
+    -- Swap .txt extension for .html
+    local html_path = txt_file_path:gsub("%.txt$", ".html")
+    local file = io.open(html_path, "w")
+    if not file then return end
+
+    local html = [[
+<!DOCTYPE html>
+<html>
+<head>
+<style>
+    body { background-color: #1e1e1e; color: #d4d4d4; font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; padding: 25px; }
+    h2 { color: #FFD54F; font-weight: normal; margin-bottom: 25px; }
+    h3 { color: #e0e0e0; margin-top: 30px; border-bottom: 1px solid #444; padding-bottom: 5px; }
+    table { border-collapse: collapse; width: 100%; max-width: 1200px; margin-top: 15px; background-color: #252526; box-shadow: 0px 4px 10px rgba(0,0,0,0.5); }
+    th, td { border: 1px solid #333; padding: 12px; text-align: center; }
+    th:first-child, td:first-child { text-align: left; font-weight: bold; }
+    th { background-color: #333; color: #4FC3F7; }
+    .risk { color: #EF5350; font-weight: bold; }
+    .safe { color: #81C784; }
+</style>
+</head>
+<body>
+    <h2>Mix & Master Analysis: <b>]] .. target_str .. [[</b></h2>
+
+    <h3>1. Macro-Dynamics & Stereo Summary</h3>
+    <table>
+        <tr><th>Region</th><th>Peak (dB)</th><th>RMS (dB)</th><th>Crest (dB)</th><th>Width (%)</th><th>Sub-Mono</th></tr>
+]]
+
+    local sorted_regions = {}
+    for r_key in pairs(audio_metrics) do table.insert(sorted_regions, r_key) end
+    table.sort(sorted_regions)
+
+    for _, r_key in ipairs(sorted_regions) do
+        local m = audio_metrics[r_key]
+        local clean_name = r_key:gsub("^%d+_", ""):gsub("_", " ")
+        local phase_status = m.stereo.sub_mono == "Phase_Risk" and "<span class='risk'>Risk</span>" or "<span class='safe'>Safe</span>"
+
+        html = html .. string.format("<tr><td>%s</td><td>%.1f</td><td>%.1f</td><td>%.1f</td><td>%.0f%%</td><td>%s</td></tr>\n",
+            clean_name, m.dyn.peak_db, m.dyn.rms_db, m.dyn.crest_db, m.stereo.width_pct, phase_status)
+    end
+
+    html = html .. [[
+    </table>
+
+    <h3>2. Tonal Balance Summary (dBFS)</h3>
+    <table>
+        <tr><th>Region</th><th>Sub (60Hz)</th><th>Punch (120Hz)</th><th>Mud (250Hz)</th><th>Boxy (500Hz)</th><th>Core (1kHz)</th><th>Pres (3kHz)</th><th>Harsh (6kHz)</th><th>Sib (8kHz)</th><th>Air (12kHz)</th></tr>
+]]
+
+    for _, r_key in ipairs(sorted_regions) do
+        local m = audio_metrics[r_key]
+        local clean_name = r_key:gsub("^%d+_", ""):gsub("_", " ")
+
+        html = html .. string.format("<tr><td>%s</td><td>%.1f</td><td>%.1f</td><td>%.1f</td><td>%.1f</td><td>%.1f</td><td>%.1f</td><td>%.1f</td><td>%.1f</td><td>%.1f</td></tr>\n",
+            clean_name, m.tonal_db.sub60, m.tonal_db.punch120, m.tonal_db.mud250, m.tonal_db.boxy500, m.tonal_db.mid1k, m.tonal_db.pres3k, m.tonal_db.harsh6k, m.tonal_db.sib8k, m.tonal_db.air12k)
+    end
+
+    html = html .. [[
+    </table>
+</body>
+</html>
+]]
+
+    file:write(html)
+    file:close()
+end
+
 local function escape_json_string(str)
     local escape_map = {
         ["\\"] = "\\\\", ['"'] = '\\"', ["\n"] = "\\n", ["\r"] = "\\r", ["\t"] = "\\t"
@@ -1830,9 +1901,11 @@ local function run_fresh_scan(target_mode, model_choice, mute_parallels, bypass_
         return false
     end
 
-    -- 3. Save raw file
+    -- 3. Save raw analysis file and numeric values as a HTML
     local full_prompt = build_full_prompt(project_yaml, audio_metrics, target_name, target_tracks)
     report_saved_path = save_prompt_to_txt(full_prompt, target_name)
+	-- Save beautifully formatted HTML tables alongside the txt file
+    save_tables_to_html(audio_metrics, report_saved_path, target_name)
 
     -- 4. Initialize chat history for DeepSeek Prompt Caching
     local initial_ui_msg = "Please analyze the mix for: **" .. target_name .. "**.\n"
