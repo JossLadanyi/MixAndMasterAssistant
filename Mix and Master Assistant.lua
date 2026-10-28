@@ -1771,6 +1771,28 @@ end
 -- 10. UNIFIED CHATBOX & WORKFLOW CONTROLLER
 -- ==============================================================================
 
+local function render_role_badge(ctx, label, bg_color, text_color, id)
+    reaper.ImGui_Dummy(ctx, 0, 4) -- Healthy spacing above badge
+
+    -- Invert colors: Apply colored background and dark text
+    reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Button(),        bg_color)
+    reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_ButtonHovered(), bg_color)
+    reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_ButtonActive(),  bg_color)
+    reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(),          text_color)
+
+    -- Rounded corners and healthy internal top/bottom padding (3px vertical, 8px horizontal)
+    reaper.ImGui_PushStyleVar(ctx, reaper.ImGui_StyleVar_FrameRounding(), 4.0)
+    reaper.ImGui_PushStyleVar(ctx, reaper.ImGui_StyleVar_FramePadding(), 8, 3)
+
+    -- Render as a static pill badge (using unique ID so ImGui doesn't conflict)
+    reaper.ImGui_Button(ctx, label .. "##badge_" .. tostring(id))
+
+    reaper.ImGui_PopStyleVar(ctx, 2)
+    reaper.ImGui_PopStyleColor(ctx, 4)
+
+    reaper.ImGui_Dummy(ctx, 0, 3) -- Healthy spacing below badge
+end
+
 local function render_markdown_text(ctx, text)
     if not text or text == "" then return end
 
@@ -2066,15 +2088,19 @@ local function main()
             if reaper.ImGui_BeginChild(ctx, "ChatScroll", 0, scroll_h) then
                 push_chat_font(15)
 
-                for _, msg in ipairs(chat_history) do
+                for idx, msg in ipairs(chat_history) do
                     if msg.role == "user" then
-                        reaper.ImGui_TextColored(ctx, 0x4FC3F7FF, "YOU: ")
+                        -- Light Blue background with dark text
+                        render_role_badge(ctx, " YOU ", 0x4FC3F7FF, 0x111111FF, idx)
                         local text_to_show = msg.display_content or msg.content
                         render_markdown_text(ctx, text_to_show)
+                        reaper.ImGui_Dummy(ctx, 0, 4)
                         reaper.ImGui_Separator(ctx)
                     elseif msg.role == "assistant" then
-                        reaper.ImGui_TextColored(ctx, 0x81C784FF, "DEEPSEEK: ")
+                        -- Light Green background with dark text
+                        render_role_badge(ctx, " DEEPSEEK ", 0x81C784FF, 0x111111FF, idx)
                         render_markdown_text(ctx, msg.content)
+                        reaper.ImGui_Dummy(ctx, 0, 4)
                         reaper.ImGui_Separator(ctx)
                     end
                 end
