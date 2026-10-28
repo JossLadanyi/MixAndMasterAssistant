@@ -2019,9 +2019,10 @@ local function main()
             -- FOLLOW-UP INPUT AREA (MULTILINE + BUTTON ONLY)
             reaper.ImGui_Separator(ctx)
 
-            -- Multiline text box with fixed-width font
+			-- Multiline text box with fixed-width font
             push_chat_font(15)
-            _, chat_input_text = reaper.ImGui_InputTextMultiline(ctx, "##chat_in", chat_input_text, -95, 52)
+            local chat_flags = reaper.ImGui_InputTextFlags_NoHorizontalScroll()
+            _, chat_input_text = reaper.ImGui_InputTextMultiline(ctx, "##chat_in", chat_input_text, -95, 52, chat_flags)
             pop_chat_font()
 
             reaper.ImGui_SameLine(ctx)
