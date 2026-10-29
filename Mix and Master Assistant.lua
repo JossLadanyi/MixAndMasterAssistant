@@ -2134,11 +2134,13 @@ local function main()
             -- FOLLOW-UP INPUT AREA (MULTILINE + BUTTON ONLY)
             reaper.ImGui_Separator(ctx)
 
-			-- Multiline text box with fixed-width font & native word wrapping
+			-- Multiline text box with fixed-width font
+            -- (Note: ReaImGui does not natively support word-wrap inside input boxes)
             push_chat_font(15)
-            local chat_flags = reaper.ImGui_InputTextFlags_WordWrap()
-            local changed, new_text = reaper.ImGui_InputTextMultiline(ctx, "##chat_in", chat_input_text, -95, 52, chat_flags)
-            if changed then chat_input_text = new_text end
+            local changed, new_text = reaper.ImGui_InputTextMultiline(ctx, "##chat_in", chat_input_text, -95, 52)
+            if changed then
+                chat_input_text = new_text
+            end
             pop_chat_font()
 
             reaper.ImGui_SameLine(ctx)
