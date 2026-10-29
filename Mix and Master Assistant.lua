@@ -1945,12 +1945,27 @@ local function run_fresh_scan(target_mode, model_choice, mute_parallels, bypass_
 
     local audio_metrics, rendered_tracks, dsp_error = analyze_ghost_render(song_regions, duration_pref, tracks_before, pre_render_guids)
 
-    -- If cancelled or failed, clean up and exit immediately (NO YAML EXTRACTION WASTED)
+	-- If cancelled or failed, post a clean alert and exit
     if not audio_metrics then
         if rendered_tracks then
             for _, trk in ipairs(rendered_tracks) do reaper.DeleteTrack(trk) end
         end
         restore_mix_state()
+
+        if dsp_error == "CANCELLED" or (dsp_error and dsp_error:lower():find("cancel")) then
+            table.insert(chat_history, {
+                role = "alert",
+                content = "⚠️ Scan aborted: Render was cancelled by user. Mix state cleanly restored."
+            })
+        else
+            table.insert(chat_history, {
+                role = "alert",
+                content = "❌ Analysis Error: " .. tostring(dsp_error)
+            })
+            reaper.ShowMessageBox(dsp_error or "DSP Processing failed.", "Analysis Error", 0)
+        end
+
+        scroll_to_bottom = true
         return false
     end
 
@@ -2120,7 +2135,7 @@ local function main()
             if reaper.ImGui_BeginChild(ctx, "ChatScroll", 0, scroll_h) then
                 push_chat_font(15)
 
-                for idx, msg in ipairs(chat_history) do
+				for idx, msg in ipairs(chat_history) do
                     if msg.role == "user" then
                         -- Light Blue background with dark text
                         render_role_badge(ctx, " YOU ", 0x4FC3F7FF, 0x111111FF, idx)
@@ -2128,12 +2143,24 @@ local function main()
                         render_markdown_text(ctx, text_to_show)
                         reaper.ImGui_Dummy(ctx, 0, 4)
                         reaper.ImGui_Separator(ctx)
+                        reaper.ImGui_Dummy(ctx, 0, 4)
+
                     elseif msg.role == "assistant" then
                         -- Light Green background with dark text
                         render_role_badge(ctx, " DEEPSEEK ", 0x81C784FF, 0x111111FF, idx)
                         render_markdown_text(ctx, msg.content)
                         reaper.ImGui_Dummy(ctx, 0, 4)
                         reaper.ImGui_Separator(ctx)
+                        reaper.ImGui_Dummy(ctx, 0, 4)
+
+                    elseif msg.role == "alert" then
+                        -- Red badge (0xEF5350FF) with dark text
+                        render_role_badge(ctx, " CANCELLED ", 0xEF5350FF, 0x111111FF, idx)
+                        -- Bright red warning text
+                        reaper.ImGui_TextColored(ctx, 0xEF5350FF, msg.content)
+                        reaper.ImGui_Dummy(ctx, 0, 4)
+                        reaper.ImGui_Separator(ctx)
+                        reaper.ImGui_Dummy(ctx, 0, 4)
                     end
                 end
 
