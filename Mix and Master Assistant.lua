@@ -1817,6 +1817,7 @@ local function render_markdown_text(ctx, text)
                         cols = cols - 1
 
 						-- Start Native ReaImGui Table with a UNIQUE ID. Columns auto-size intelligently
+                        -- FIX: SizingFixedFit automatically hugs the content of each column
                         local flags = reaper.ImGui_TableFlags_Borders() | reaper.ImGui_TableFlags_RowBg() | reaper.ImGui_TableFlags_SizingFixedFit()
                         if reaper.ImGui_BeginTable(ctx, "MarkdownTable_" .. table_counter, cols, flags) then
                             in_table = true
@@ -2120,10 +2121,11 @@ local function main()
             -- FOLLOW-UP INPUT AREA (MULTILINE + BUTTON ONLY)
             reaper.ImGui_Separator(ctx)
 
-			-- Multiline text box with fixed-width font
+			-- Multiline text box with fixed-width font & native word wrapping
             push_chat_font(15)
-            local chat_flags = reaper.ImGui_InputTextFlags_NoHorizontalScroll()
-            _, chat_input_text = reaper.ImGui_InputTextMultiline(ctx, "##chat_in", chat_input_text, -95, 52, chat_flags)
+            local chat_flags = reaper.ImGui_InputTextFlags_WordWrap()
+            local changed, new_text = reaper.ImGui_InputTextMultiline(ctx, "##chat_in", chat_input_text, -95, 52, chat_flags)
+            if changed then chat_input_text = new_text end
             pop_chat_font()
 
             reaper.ImGui_SameLine(ctx)
