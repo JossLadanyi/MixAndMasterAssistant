@@ -1157,7 +1157,7 @@ end
 local function save_prompt_to_txt(full_prompt, target_str)
     local path_separator = package.config:sub(1,1) or "/"
     local sanitized_target = target_str:gsub("[%s%p]+", "_")
-    local filename_only = "AI_Mix_Prompt_" .. sanitized_target .. ".txt"
+    local base_filename = "AI_Mix_Prompt_" .. sanitized_target
 
     local target_dir = nil
     local _, project_filepath = reaper.EnumProjects(-1, "")
@@ -1176,7 +1176,6 @@ local function save_prompt_to_txt(full_prompt, target_str)
     end
 
     -- 3. Fail-safe for unsaved projects: REAPER Resource Directory
-    -- (Always exists and is guaranteed to have user-write permissions)
     if not target_dir or target_dir == "" then
         target_dir = reaper.GetResourcePath()
     end
@@ -1186,14 +1185,28 @@ local function save_prompt_to_txt(full_prompt, target_str)
         target_dir = target_dir .. path_separator
     end
 
-    local output_filename = target_dir .. filename_only
+    -- 4. Auto-Numbering Logic (Prevents overwriting existing files)
+    local output_filename = target_dir .. base_filename .. ".txt"
+    local counter = 1
+
+    while reaper.file_exists(output_filename) do
+        output_filename = target_dir .. base_filename .. string.format("_%02d", counter) .. ".txt"
+        counter = counter + 1
+    end
+
     local file, err = io.open(output_filename, "w")
 
-    -- Emergency Fallback: If project folder is write-protected (e.g. read-only drive),
-    -- redirect file creation to REAPER's user directory
+    -- Emergency Fallback: If project folder is write-protected, redirect to REAPER's resource folder
     if not file then
         local fallback_dir = reaper.GetResourcePath() .. path_separator
-        output_filename = fallback_dir .. filename_only
+        output_filename = fallback_dir .. base_filename .. ".txt"
+        counter = 1
+
+        while reaper.file_exists(output_filename) do
+            output_filename = fallback_dir .. base_filename .. string.format("_%02d", counter) .. ".txt"
+            counter = counter + 1
+        end
+
         file, err = io.open(output_filename, "w")
     end
 
