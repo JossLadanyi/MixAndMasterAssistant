@@ -1053,11 +1053,8 @@ local function analyze_ghost_render(regions, duration_pref, tracks_before, pre_r
         end
     end
 
-    if #render_tracks == 0 then
-        if num_new_tracks <= 0 then
-            return nil, nil, "Render did not create any new tracks. In REAPER, enable 'Render > Add rendered items to new tracks' before running the analysis."
-        end
-        return nil, nil, "Render created temporary tracks, but no valid audio items were generated. Check your time selection, mix bounds, and whether 'Render > Add rendered items to new tracks' is enabled."
+	if #render_tracks == 0 then
+        return nil, nil, "CANCELLED"
     end
 
     local regional_metrics = {}
@@ -1941,28 +1938,37 @@ local function run_fresh_scan(target_mode, model_choice, mute_parallels, bypass_
         if trk then pre_render_guids[reaper.GetTrackGUID(trk)] = true end
     end
 
-    reaper.Main_OnCommand(42230, 0)
+	-- Automatically turn ON "Add rendered items to new tracks" in REAPER
+    local current_opts = math.floor(reaper.GetSetProjectInfo(0, "RENDER_ADDTOPROJ", 0, false))
+    reaper.GetSetProjectInfo(0, "RENDER_ADDTOPROJ", current_opts | 1, true)
 
+	reaper.Main_OnCommand(42230, 0)
+
+	-- 1. Receive dsp_error as the 3rd return value
     local audio_metrics, rendered_tracks, dsp_error = analyze_ghost_render(song_regions, duration_pref, tracks_before, pre_render_guids)
 
-	-- If cancelled or failed, post a clean alert and exit
+    -- 2. If analysis failed, evaluate dsp_error to decide what to show the user
     if not audio_metrics then
         if rendered_tracks then
             for _, trk in ipairs(rendered_tracks) do reaper.DeleteTrack(trk) end
         end
+
+        -- Restore tracks, but keep Master FX intact if already active
         restore_mix_state()
 
+        -- CASE A: User aborted the render
         if dsp_error == "CANCELLED" or (dsp_error and dsp_error:lower():find("cancel")) then
             table.insert(chat_history, {
                 role = "alert",
-                content = "⚠️ Scan aborted: Render was cancelled by user. Mix state cleanly restored."
+                content = "⚠️ Scan aborted: Render was cancelled by user. Mix state restored."
             })
+
+        -- CASE B: Real error (e.g. checkbox missing, empty bounds, silent audio)
         else
             table.insert(chat_history, {
                 role = "alert",
-                content = "❌ Analysis Error: " .. tostring(dsp_error)
+                content = "❌ " .. tostring(dsp_error or "DSP Processing failed.")
             })
-            reaper.ShowMessageBox(dsp_error or "DSP Processing failed.", "Analysis Error", 0)
         end
 
         scroll_to_bottom = true
