@@ -388,7 +388,7 @@ local function get_track_fx_chain(track)
             local params_table = {}
             local disabled_prefixes = {}
             local count = 0
-            local max_inspect = 1000
+            local max_inspect = 256
 
             -- -------------------------------------------------------------
             -- PASS 1: Detect disabled modules using standardized keys
@@ -655,21 +655,29 @@ local function is_track_hierarchy_muted(track)
     return false
 end
 
+local function set_track_info_delta(track, param, target_val)
+    if reaper.GetMediaTrackInfo_Value(track, param) ~= target_val then
+        reaper.SetMediaTrackInfo_Value(track, param, target_val)
+    end
+end
+
 local function save_and_apply_mix_state(target_mode, mute_parallels, bypass_master_fx)
     -- Freeze UI and routing graph updates during mass solo/mute operations
     reaper.PreventUIRefresh(1)
 
-    saved_mix_state = { tracks = {}, master_fx = {} }
+    saved_mix_state = { tracks = {}, master_fx_enabled = 1 }
     local master_track = reaper.GetMasterTrack(0)
     local target_track_names = {}
 
-    -- Backup and bypass master FX
-    for fx_idx = 0, reaper.TrackFX_GetCount(master_track) - 1 do
-        saved_mix_state.master_fx[fx_idx] = reaper.TrackFX_GetEnabled(master_track, fx_idx)
-        if bypass_master_fx then reaper.TrackFX_SetEnabled(master_track, fx_idx, false) end
+    -- 1. Atomic Master FX Bypass (Single PDC recalculation)
+    if master_track then
+        saved_mix_state.master_fx_enabled = reaper.GetMediaTrackInfo_Value(master_track, "I_FXEN")
+        if bypass_master_fx and saved_mix_state.master_fx_enabled == 1 then
+            reaper.SetMediaTrackInfo_Value(master_track, "I_FXEN", 0)
+        end
     end
 
-    -- Backup and set track solos/mutes
+    -- 2. Delta-checked track isolation
     for i = 0, reaper.CountTracks(0) - 1 do
         local track = reaper.GetTrack(0, i)
         if track then
@@ -682,37 +690,30 @@ local function save_and_apply_mix_state(target_mode, mute_parallels, bypass_mast
             local orig_solo = reaper.GetMediaTrackInfo_Value(track, "I_SOLO")
             local orig_mute = reaper.GetMediaTrackInfo_Value(track, "B_MUTE")
 
-            saved_mix_state.tracks[track_guid] = {
-                solo = orig_solo,
-                mute = orig_mute
-            }
+            saved_mix_state.tracks[track_guid] = { solo = orig_solo, mute = orig_mute }
 
             local is_target = false
-
-            -- TARGET MODE 5: "Soloed Tracks Only" -> strictly looks at your REAPER Solo buttons!
             if target_mode == 5 then
                 is_target = (orig_solo > 0)
             elseif target_mode ~= 4 then
-                -- TARGET MODES 1, 2, 3: Automatic stem category soloing
                 is_target = (category == target_mode)
             end
 
             if target_mode ~= 4 then
                 if is_target then
-                    reaper.SetMediaTrackInfo_Value(track, "I_SOLO", 2)
+                    set_track_info_delta(track, "I_SOLO", 2)
                     if not is_track_hierarchy_muted(track) then
                         table.insert(target_track_names, display_name)
                     end
                 else
-                    reaper.SetMediaTrackInfo_Value(track, "I_SOLO", 0)
+                    set_track_info_delta(track, "I_SOLO", 0)
                 end
             else
-                -- MODE 4: Full Mix -> clear all solos
-                reaper.SetMediaTrackInfo_Value(track, "I_SOLO", 0)
+                set_track_info_delta(track, "I_SOLO", 0)
             end
 
             if mute_parallels and category == 99 then
-                reaper.SetMediaTrackInfo_Value(track, "B_MUTE", 1)
+                set_track_info_delta(track, "B_MUTE", 1)
             end
         end
     end
@@ -720,8 +721,6 @@ local function save_and_apply_mix_state(target_mode, mute_parallels, bypass_mast
     -- Unfreeze and commit audio routing changes all at once
     reaper.PreventUIRefresh(-1)
     reaper.TrackList_AdjustWindows(false)
-    reaper.UpdateArrange()
-
     return target_track_names
 end
 
@@ -729,23 +728,22 @@ local function restore_mix_state()
     -- Freeze UI and routing graph updates during mass restoration
     reaper.PreventUIRefresh(1)
 
+    -- 1. Restore Master FX in one atomic call
     local master_track = reaper.GetMasterTrack(0)
+    if master_track and saved_mix_state and saved_mix_state.master_fx_enabled ~= nil then
+        set_track_info_delta(master_track, "I_FXEN", saved_mix_state.master_fx_enabled)
+    end
 
-    if saved_mix_state then
-        for fx_idx, state in pairs(saved_mix_state.master_fx or {}) do
-            if master_track and reaper.TrackFX_GetCount(master_track) > fx_idx then
-                reaper.TrackFX_SetEnabled(master_track, fx_idx, state)
-            end
-        end
-
+    -- 2. Restore only modified tracks
+    if saved_mix_state and saved_mix_state.tracks then
         for i = 0, reaper.CountTracks(0) - 1 do
             local track = reaper.GetTrack(0, i)
             if track then
                 local track_guid = reaper.GetTrackGUID(track)
-                local state = saved_mix_state.tracks and saved_mix_state.tracks[track_guid]
+                local state = saved_mix_state.tracks[track_guid]
                 if state then
-                    reaper.SetMediaTrackInfo_Value(track, "I_SOLO", state.solo)
-                    reaper.SetMediaTrackInfo_Value(track, "B_MUTE", state.mute)
+                    set_track_info_delta(track, "I_SOLO", state.solo)
+                    set_track_info_delta(track, "B_MUTE", state.mute)
                 end
             end
         end
@@ -1920,21 +1918,22 @@ local report_saved_path = nil
 local scroll_to_bottom = false
 
 local function run_fresh_scan(target_mode, model_choice, mute_parallels, bypass_master_fx, duration_pref, output_api)
-	local target_descriptions = {
+    local target_descriptions = {
         [1] = "Drums & Bass",
         [2] = "Instruments",
         [3] = "Vocals",
         [4] = "Full Mix",
         [5] = "Soloed Tracks Only"
     }
-	local target_name = target_descriptions[target_mode] or "Full Mix"
+    local target_name = target_descriptions[target_mode] or "Full Mix"
     local selected_model = get_model_name(model_choice)
 
-    -- 1. Scan and isolate
+    chat_history = {}
     local target_tracks = save_and_apply_mix_state(target_mode, mute_parallels, bypass_master_fx)
-    local project_yaml, song_regions = extract_full_project_yaml()
 
-    -- 2. Render and analyze
+    -- OPTIMIZATION: Only grab arrangement markers before render (instantaneous)
+    local song_regions = get_arrangement_markers()
+
     local tracks_before = reaper.CountTracks(0)
     local pre_render_guids = {}
     for i = 0, tracks_before - 1 do
@@ -1943,25 +1942,32 @@ local function run_fresh_scan(target_mode, model_choice, mute_parallels, bypass_
     end
 
     reaper.Main_OnCommand(42230, 0)
+
     local audio_metrics, rendered_tracks, dsp_error = analyze_ghost_render(song_regions, duration_pref, tracks_before, pre_render_guids)
+
+    -- If cancelled or failed, clean up and exit immediately (NO YAML EXTRACTION WASTED)
+    if not audio_metrics then
+        if rendered_tracks then
+            for _, trk in ipairs(rendered_tracks) do reaper.DeleteTrack(trk) end
+        end
+        restore_mix_state()
+        return false
+    end
+
+    -- Render succeeded! Extract YAML now while target tracks are still isolated
+    local project_yaml = extract_full_project_yaml()
 
     if rendered_tracks then
         for _, trk in ipairs(rendered_tracks) do reaper.DeleteTrack(trk) end
     end
     restore_mix_state()
 
-    if not audio_metrics then
-        reaper.ShowMessageBox(dsp_error or "DSP Processing failed.", "Analysis Error", 0)
-        return false
-    end
-
-    -- 3. Save raw analysis file and numeric values as a HTML
+    -- Stage 6: Build prompt & export
     local full_prompt = build_full_prompt(project_yaml, audio_metrics, target_name, target_tracks)
     report_saved_path = save_prompt_to_txt(full_prompt, target_name)
-	-- Save beautifully formatted HTML tables alongside the txt file
     save_tables_to_html(audio_metrics, report_saved_path, target_name)
 
-    -- 4. Initialize chat history for DeepSeek Prompt Caching
+    -- Populate UI Tables
     local initial_ui_msg = "Please analyze the mix for: **" .. target_name .. "**.\n"
     if target_mode ~= 4 and target_tracks and #target_tracks > 0 then
         initial_ui_msg = initial_ui_msg .. "\n**Active Tracks:**\n" .. table.concat(target_tracks, ", ") .. "\n"
@@ -1973,12 +1979,10 @@ local function run_fresh_scan(target_mode, model_choice, mute_parallels, bypass_
     -- DYNAMIC METRICS TABLES FOR GUI (Splitting into 2 tables for neatness)
     -- =====================================================================
     initial_ui_msg = initial_ui_msg .. "\n### 1. Macro-Dynamics & Stereo Summary\n"
-    initial_ui_msg = initial_ui_msg .. "| Region | Peak | RMS | Crest | Width | Sub-Mono |\n"
-    initial_ui_msg = initial_ui_msg .. "|---|---|---|---|---|---|\n"
+    initial_ui_msg = initial_ui_msg .. "| Region | Peak | RMS | Crest | Width | Sub-Mono |\n|---|---|---|---|---|---|\n"
 
     local tonal_msg = "\n### 2. Tonal Balance Summary (dBFS)\n"
-    tonal_msg = tonal_msg .. "| Region | Sub | Punch | Mud | Boxy | Core | Pres | Harsh | Sib | Air |\n"
-    tonal_msg = tonal_msg .. "|---|---|---|---|---|---|---|---|---|---|\n"
+    tonal_msg = tonal_msg .. "| Region | Sub | Punch | Mud | Boxy | Core | Pres | Harsh | Sib | Air |\n|---|---|---|---|---|---|---|---|---|---|\n"
 
     local sorted_regions = {}
     for r_key in pairs(audio_metrics) do table.insert(sorted_regions, r_key) end
@@ -1999,21 +2003,17 @@ local function run_fresh_scan(target_mode, model_choice, mute_parallels, bypass_
     end
     initial_ui_msg = initial_ui_msg .. tonal_msg
 
-    chat_history = {
-        { role = "system", content = full_prompt },
-        { role = "user", content = "Perform full mix analysis as instructed.", display_content = initial_ui_msg }
-    }
+    table.insert(chat_history, { role = "user", content = "Perform full mix analysis as instructed.", display_content = initial_ui_msg })
 
     if output_api then
         local reply = ask_deep_seek(chat_history, selected_model)
         table.insert(chat_history, { role = "assistant", content = reply })
-        scroll_to_bottom = true
         fetch_deep_seek_balance()
     else
         table.insert(chat_history, { role = "assistant", content = "Analysis saved to file:\n" .. (report_saved_path or "") })
-        scroll_to_bottom = true
     end
 
+    scroll_to_bottom = true
     return true
 end
 
