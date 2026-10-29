@@ -656,6 +656,9 @@ local function is_track_hierarchy_muted(track)
 end
 
 local function save_and_apply_mix_state(target_mode, mute_parallels, bypass_master_fx)
+    -- Freeze UI and routing graph updates during mass solo/mute operations
+    reaper.PreventUIRefresh(1)
+
     saved_mix_state = { tracks = {}, master_fx = {} }
     local master_track = reaper.GetMasterTrack(0)
     local target_track_names = {}
@@ -666,7 +669,7 @@ local function save_and_apply_mix_state(target_mode, mute_parallels, bypass_mast
         if bypass_master_fx then reaper.TrackFX_SetEnabled(master_track, fx_idx, false) end
     end
 
-    -- Backup and set track solos/mutes based STRICTLY on I_SOLO
+    -- Backup and set track solos/mutes
     for i = 0, reaper.CountTracks(0) - 1 do
         local track = reaper.GetTrack(0, i)
         if track then
@@ -696,7 +699,7 @@ local function save_and_apply_mix_state(target_mode, mute_parallels, bypass_mast
 
             if target_mode ~= 4 then
                 if is_target then
-                    reaper.SetMediaTrackInfo_Value(track, "I_SOLO", 2) -- Solo-in-place
+                    reaper.SetMediaTrackInfo_Value(track, "I_SOLO", 2)
                     if not is_track_hierarchy_muted(track) then
                         table.insert(target_track_names, display_name)
                     end
@@ -714,10 +717,18 @@ local function save_and_apply_mix_state(target_mode, mute_parallels, bypass_mast
         end
     end
 
+    -- Unfreeze and commit audio routing changes all at once
+    reaper.PreventUIRefresh(-1)
+    reaper.TrackList_AdjustWindows(false)
+    reaper.UpdateArrange()
+
     return target_track_names
 end
 
 local function restore_mix_state()
+    -- Freeze UI and routing graph updates during mass restoration
+    reaper.PreventUIRefresh(1)
+
     local master_track = reaper.GetMasterTrack(0)
 
     if saved_mix_state then
@@ -739,6 +750,11 @@ local function restore_mix_state()
             end
         end
     end
+
+    -- Unfreeze and commit audio routing changes all at once
+    reaper.PreventUIRefresh(-1)
+    reaper.TrackList_AdjustWindows(false)
+    reaper.UpdateArrange()
 end
 
 -- ==============================================================================
