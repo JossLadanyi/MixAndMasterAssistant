@@ -1819,33 +1819,36 @@ local function render_role_badge(ctx, label, bg_color, text_color, id)
     reaper.ImGui_Dummy(ctx, 0, 3) -- Healthy spacing below badge
 end
 
-local function render_markdown_text(ctx, text)
+local function render_markdown_text(ctx, text, msg_id)
     if not text or text == "" then return end
 
     local in_table = false
     local table_counter = 0
+    local total_cols = 0
 
     for line in text:gmatch("([^\r\n]*)[\r\n]?") do
         if line ~= "" then
             -- Detect Markdown Table Rows
             if line:match("^%s*|.*|%s*$") then
-                -- FIX: Strictly match ONLY markdown separator rows (e.g., |---|---|)
-                -- Prevents negative dB values (e.g., -12.0) from being deleted
+                -- Skip markdown separator row (e.g., |---|---|)
                 if line:match("^%s*[|%-%s:]+$") then
-                    -- Skip the markdown table separator row
+                    -- separator row
                 else
                     if not in_table then
                         table_counter = table_counter + 1
                         local cols = 0
                         for _ in line:gmatch("|") do cols = cols + 1 end
-                        cols = cols - 1
+                        total_cols = math.max(1, cols - 1)
 
-						-- Start Native ReaImGui Table with a UNIQUE ID. Columns auto-size intelligently
-                        -- FIX: SizingFixedFit automatically hugs the content of each column
-                        local flags = reaper.ImGui_TableFlags_Borders() | reaper.ImGui_TableFlags_RowBg() | reaper.ImGui_TableFlags_SizingFixedFit()
-                        if reaper.ImGui_BeginTable(ctx, "MarkdownTable_" .. table_counter, cols, flags) then
+                        local flags = reaper.ImGui_TableFlags_Borders()
+                                    | reaper.ImGui_TableFlags_RowBg()
+                                    | reaper.ImGui_TableFlags_SizingFixedFit()
+                                    | reaper.ImGui_TableFlags_NoSavedSettings()
+
+                        local table_id = "MDTable_" .. tostring(msg_id or 0) .. "_" .. table_counter
+                        if reaper.ImGui_BeginTable(ctx, table_id, total_cols, flags) then
                             in_table = true
-                            for c = 0, cols - 1 do
+                            for c = 0, total_cols - 1 do
                                 reaper.ImGui_TableSetupColumn(ctx, "Col" .. c)
                             end
                         end
@@ -1855,11 +1858,12 @@ local function render_markdown_text(ctx, text)
                         reaper.ImGui_TableNextRow(ctx)
                         local col_idx = 0
                         for cell_text in line:gmatch("|([^|]+)") do
-                            reaper.ImGui_TableSetColumnIndex(ctx, col_idx)
-                            local clean_cell = trim_string(cell_text:gsub("%*%*(.-)%*%*", "%1"))
-                            -- FIX: Use standard ImGui_Text so letters are never stacked vertically
-                            reaper.ImGui_Text(ctx, clean_cell)
-                            col_idx = col_idx + 1
+                            if col_idx < total_cols then
+                                reaper.ImGui_TableSetColumnIndex(ctx, col_idx)
+                                local clean_cell = trim_string(cell_text:gsub("%*%*(.-)%*%*", "%1"))
+                                reaper.ImGui_Text(ctx, clean_cell)
+                                col_idx = col_idx + 1
+                            end
                         end
                     end
                 end
@@ -2163,7 +2167,7 @@ local function main()
                         -- Light Blue background with dark text
                         render_role_badge(ctx, " YOU ", 0x4FC3F7FF, 0x111111FF, idx)
                         local text_to_show = msg.display_content or msg.content
-                        render_markdown_text(ctx, text_to_show)
+						render_markdown_text(ctx, text_to_show, idx)
                         reaper.ImGui_Dummy(ctx, 0, 4)
                         reaper.ImGui_Separator(ctx)
                         reaper.ImGui_Dummy(ctx, 0, 4)
@@ -2171,7 +2175,7 @@ local function main()
                     elseif msg.role == "assistant" then
                         -- Light Green background with dark text
                         render_role_badge(ctx, " DEEPSEEK ", 0x81C784FF, 0x111111FF, idx)
-                        render_markdown_text(ctx, msg.content)
+                        render_markdown_text(ctx, msg.content, idx)
                         reaper.ImGui_Dummy(ctx, 0, 4)
                         reaper.ImGui_Separator(ctx)
                         reaper.ImGui_Dummy(ctx, 0, 4)
