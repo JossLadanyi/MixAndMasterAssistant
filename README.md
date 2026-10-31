@@ -4,30 +4,27 @@
 [![ReaImGui](https://img.shields.io/badge/GUI-ReaImGui-orange.svg)](https://github.com/cfillion/reaimgui)
 [![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 
-An intelligent, token-optimized mixing and mastering engineer embedded directly inside **Cockos REAPER**.
+An audio analysis and AI mixing assistant embedded directly inside **Cockos REAPER**.
 
-This tool performs a non-destructive **"Ghost Render"** of your mix or isolated stems, calculates mastering-grade DSP metrics across every region of your song, serializes your routing matrix and active FX chains into compact YAML, and feeds the entire context to an AI mixing engineer (either natively via the **DeepSeek API** or exported as a standalone prompt for web LLMs).
+The script performs a non-destructive render of your mix or isolated stems, extracts mastering-grade DSP metrics across project regions, serializes routing and FX parameter states into compact YAML, and provides feedback either directly via the **DeepSeek API** or through exportable prompts for web-based LLMs.
 
----
-
-## 🌟 Key Features
+## 🌟 Features
 
 ### 1. 9-Band Mastering DSP Engine
 
-Extracts critical dynamic and tonal metrics per region using an internal Chamberlin State-Variable Filter (SVF) engine:
+Extracts dynamic and tonal metrics per region using a Chamberlin State-Variable Filter (SVF) engine:
 
 - **Dynamics:** True Peak (dBFS), RMS (dBFS), and Crest Factor (dB).
-- **Stereo Field:** Total stereo width percentage (`width_pct`).
-- **Sub-Mono Phase Check:** Monitors stereo information below 120 Hz. Gated to ignore noise floors and dither so empty regions do not trigger false `Phase_Risk` alerts.
-- **9 Frequency Bands:** Sub (60 Hz), Punch (120 Hz), Mud (250 Hz), Boxy (500 Hz), Mid/Core (1 kHz), Presence (3 kHz), Harshness (6 kHz), Sibilance (8 kHz), and Air (12 kHz).
+- **Stereo Field:** Stereo width percentage (`width_pct`).
+- **Gated Sub-Mono Phase Check:** Evaluates stereo energy below 120 Hz using a `-60 dBFS` threshold gate to prevent quiet tails and plugin noise floors from triggering false phase alerts.
+- **9 Frequency Bands (dBFS):** Sub (60 Hz), Punch (120 Hz), Mud (250 Hz), Boxy (500 Hz), Mid/Core (1 kHz), Presence (3 kHz), Harshness (6 kHz), Sibilance (8 kHz), and Air (12 kHz).
 
 ### 2. Mix State Manager & Isolated Target Auditioning
 
-Isolate stems for targeted acoustic and processing critique:
-
-- **Targets:** Drums & Bass, Instruments, Vocals, Full Mix, or Soloed Tracks Only.
-- **Smart Stem Routing:** Understands folder hierarchies and automatically mutes parallel busses or master-bus processing to prevent skewed readings.
-- **Non-Destructive Restoration:** Automatically saves and restores track mutes, solos, and master FX states after every render.
+- **Targets:** Full Mix, Vocals, Drums & Bass, Instruments, or Soloed Tracks Only.
+- **Routing Awareness:** Understands folder hierarchies and can optionally mute parallel busses or bypass Master FX during stem auditioning.
+- **State Restoration:** Restores track mutes, solos, and Master FX to their exact pre-scan states when finished or if a render is cancelled.
+- **Cancellation Handling:** Detects cancelled renders via REAPER project settings and logs the status directly to the chat interface without modal error dialogs.
 
 ### 3. Active Track Detection
 
@@ -35,46 +32,40 @@ Cross-references track audio items against project markers/regions. If an instru
 
 ### 4. Token-Optimized Project Serializer
 
-Converts complex project configurations into compact YAML for LLMs:
+- Suppresses default bypass states, inactive EQ bands, and irrelevant UI controls.
+- Abbreviates common audio parameter names (`freq`, `thr`, `rel`, `att`, `gn`) to minimize token usage when communicating with language models.
 
-- Automatically strips bypass/default states, UI metering parameters, and boilerplate noise.
-- Excludes parameters belonging to disabled EQ bands and dynamic modules.
-- Abbreviates common parameter names (`freq`, `thr`, `rel`, `att`, `gn`, `rat`) to minimize API token consumption.
+### 5. ReaImGui Interface
 
-### 5. Interactive ReaImGui Chat Interface
+- Fixed-fit tables for regional dynamics and tonal balance metrics.
+- Color-coded role badges for conversation history.
+- Asynchronous balance query that does not block the UI during startup or manual refreshes.
 
-- In-DAW chat window with live follow-up capability.
-- Auto-sizing Markdown tables displaying regional dynamics and frequency balances.
-- Inverted role badges (**YOU** in cyan, **DEEPSEEK** in green) for quick readability.
-- Real-time, non-blocking asynchronous balance display.
+### 6. File Exporter with Auto-Numbering
 
-### 6. Dual Export Mode (Free / API-Free Support)
+Every scan exports:
 
-- **Direct API Chat:** Connect directly to DeepSeek (`deepseek-v4-pro` or `deepseek-flash`).
-- **Offline / Free Web-LLM Exporter:** Uncheck the API option to export a complete prompt file (`.txt`) and a styled, dark-mode visual summary report (`.html`) to copy into ChatGPT, Claude, Gemini, or DeepSeek Web.
-
----
+- **Prompt File (`.txt`):** Full project configuration and DSP metrics ready to copy into web LLMs (ChatGPT, Claude, Gemini).
+- **Visual Summary (`.html`):** Standalone, styled HTML tables for viewing regional metrics in any browser.
+- **Auto-Numbering:** Automatically appends sequential counters (`_01`, `_02`) to prevent overwriting previous reports.
 
 ## 📋 Requirements
 
-1. **REAPER** (v6.0 or higher, fully compatible with v7.x).
+1. **REAPER** v6.0 or higher (v7.x supported).
 2. **ReaImGui** extension (installed via ReaPack).
 3. **cURL** (standard on Windows 10/11 and macOS/Linux).
-4. **DeepSeek API Key** _(Optional — only required if querying the API directly inside REAPER)._
-
----
+4. **DeepSeek API Key** _(Optional — only required for direct in-app API queries)._
 
 ## 🚀 Installation
 
-### 1. Install ReaImGui (via ReaPack)
+### 1. Install ReaImGui
 
-1. Open REAPER.
-2. Go to **Extensions > ReaPack > Browse packages...**
-3. Search for `ReaImGui`.
-4. Right-click `ReaImGui: Dear ImGui implementation for REAPER` and choose **Install**.
-5. Click **Apply**, then restart REAPER.
+1. In REAPER, open **Extensions > ReaPack > Browse packages...**
+2. Search for `ReaImGui`.
+3. Right-click `ReaImGui: Dear ImGui implementation for REAPER` and select **Install**.
+4. Click **Apply**, then restart REAPER.
 
-### 2. Add the Script to REAPER
+### 2. Install the Script
 
 1. Download `Mix and Master Assistant.lua` from this repository.
 2. In REAPER, click **Actions > Show action list...** (or press `?`).
@@ -82,28 +73,38 @@ Converts complex project configurations into compact YAML for LLMs:
 4. Select the downloaded `.lua` file.
 5. (Optional) Assign a keyboard shortcut or toolbar icon to the action.
 
----
-
 ## ⚙️ Mandatory One-Time Render Setup
 
-The assistant uses REAPER's native render engine for its "Ghost Render" analysis. Configure these settings once so the script can capture the audio buffer silently:
+The assistant relies on REAPER's native render engine. Set these options once to ensure background analysis functions correctly:
 
-1. Open REAPER's render window: **File > Render...** (`Ctrl+Alt+R` on Windows / `Cmd+Opt+R` on macOS).
-2. Set the following options:
+1. Open **File > Render...** (`Ctrl+Alt+R` on Windows / `Cmd+Opt+R` on macOS).
+2. Configure the following:
     - **Source:** `Master mix`
     - **Bounds:** `Entire project`
-    - **Directory:** Choose your default project folder or any temporary directory (e.g., `C:\temp`).
+    - **Directory:** Set your project folder or a temp directory (e.g., `C:\temp`).
     - **File name:** `temp_mix_render`
     - **Format:** `WAV`, `24-bit PCM`, `44100 Hz`, `Stereo`
+    - **Render Speed:** `Full-speed Offline`
 3. Under **Options**, ensure these three boxes are checked:
-    - [x] **Add rendered items to new tracks in project** _(Mandatory)_
+    - [x] **Add rendered items to new tracks in project**
     - [x] **Silently increment filenames to avoid overwriting**
     - [x] **Auto-close all render windows when finished**
 4. Click **Save settings** (do not click Render).
 
----
+## 📖 Usage
 
-## 🔑 API Configuration (Optional)
+1. **Set Regions:** Add standard REAPER regions across your project timeline (`Verse`, `Chorus`, etc.).
+2. **Run the Script:** Open the assistant from your Actions list or toolbar.
+3. **Configure Your Scan:**
+    - **Target:** Choose what to analyze (_Full Mix_, _Vocals_, _Drums & Bass_, _Instruments_, or _Soloed Tracks Only_).
+    - **Duration:** Set analysis window per section (_10s_, _20s_, or _Full Region_).
+    - **AI Model:** Select `DeepSeek V4 Pro` (reasoning/critique) or `DeepSeek Flash` (fast/budget).
+    - **Mute Parallels / Bypass Master FX:** Recommended checked to evaluate clean stem tone.
+4. **Run Analysis:** Click **Run Fresh Scan & Reset Chat**.
+5. **Review Results:**
+    - Review the regional **Macro-Dynamics** and **Tonal Balance** tables directly in the conversation log.
+    - Send follow-up questions in the chat box (e.g., _"How can I fix the harshness in Chorus 1?"_).
+    - Click **Copy Chat** at any time to copy the entire conversation to your clipboard.
 
 If you plan to use direct in-DAW chat with DeepSeek:
 
@@ -112,3 +113,7 @@ If you plan to use direct in-DAW chat with DeepSeek:
     ```lua
     local API_KEY = "sk-your-actual-deepseek-api-key-here"
     ```
+
+## 📄 License
+
+This project is licensed under the MIT License — see the [LICENSE](LICENSE) file for details.
