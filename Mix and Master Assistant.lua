@@ -875,6 +875,7 @@ local function process_audio_chunk(take, item_pos, analyze_start, analyze_dur)
     local energy_sibilance_8khz = 0
     local energy_air_12khz = 0
     local energy_sub_side_channel = 0
+	local energy_sub_mid_lp = 0
 
     -- Filter Coefficients for the 9 critical bands
     local filter_coeff_sub   = 2 * math.sin(math.pi * 60 / SAMPLE_RATE)
@@ -917,6 +918,7 @@ local function process_audio_chunk(take, item_pos, analyze_start, analyze_dur)
         low_sub = low_sub + filter_coeff_sub * band_sub
         band_sub = band_sub + filter_coeff_sub * (mid - low_sub - FILTER_Q * band_sub)
         energy_sub_60hz = energy_sub_60hz + (band_sub * band_sub)
+		energy_sub_mid_lp = energy_sub_mid_lp + (low_sub * low_sub)
 
         low_punch = low_punch + filter_coeff_punch * band_punch
         band_punch = band_punch + filter_coeff_punch * (mid - low_punch - FILTER_Q * band_punch)
@@ -953,7 +955,7 @@ local function process_audio_chunk(take, item_pos, analyze_start, analyze_dur)
         -- Sub-bass side channel tracking for mono compatibility
         low_sub_side = low_sub_side + filter_coeff_sub * band_sub_side
         band_sub_side = band_sub_side + filter_coeff_sub * (side - low_sub_side - FILTER_Q * band_sub_side)
-        energy_sub_side_channel = energy_sub_side_channel + (band_sub_side * band_sub_side)
+        energy_sub_side_channel = energy_sub_side_channel + (low_sub_side * low_sub_side)
     end
 
     local true_peak = math.max(peak_left, peak_right)
@@ -968,9 +970,6 @@ local function process_audio_chunk(take, item_pos, analyze_start, analyze_dur)
         width_pct = (rms_side / (rms_mid + rms_side)) * 100
     end
 
-    local sub_energy_total = energy_sub_60hz + energy_sub_side_channel + 0.000001
-    local sub_side_percentage = (energy_sub_side_channel / sub_energy_total) * 100
-
     -- Helper to convert any raw band energy accumulation into absolute dBFS
     local function convert_energy_to_db(energy_sum)
         local band_rms = math.sqrt(energy_sum / num_samples)
@@ -978,7 +977,7 @@ local function process_audio_chunk(take, item_pos, analyze_start, analyze_dur)
         return round(20 * math.log(band_rms, 10), 1)
     end
 
-    local sub_energy_total = energy_sub_60hz + energy_sub_side_channel + 0.000001
+    local sub_energy_total = energy_sub_mid_lp + energy_sub_side_channel + 0.000001
     local sub_side_percentage = (energy_sub_side_channel / sub_energy_total) * 100
 
     -- Only flag phase risk if there is actual bass playing (louder than -60 dBFS).
