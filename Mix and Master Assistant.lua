@@ -2024,7 +2024,7 @@ local function run_fresh_scan(target_mode, model_choice, mute_parallels, bypass_
     end
     initial_ui_msg = initial_ui_msg .. tonal_msg
 
-    table.insert(chat_history, { role = "user", content = "Perform full mix analysis as instructed.", display_content = initial_ui_msg })
+    table.insert(chat_history, { role = "user", content = full_prompt, display_content = initial_ui_msg })
 
     if output_api then
         local reply = ask_deep_seek(chat_history, selected_model)
