@@ -793,8 +793,9 @@ local function get_active_tracks(start_time, end_time, max_tracks)
     -- Only loop through tracks that existed BEFORE the render occurred
     local limit = (max_tracks or reaper.CountTracks(0)) - 1
 
-    -- Threshold: Must overlap by at least 100 ms to be considered active
-    local MIN_OVERLAP_SECONDS = 0.1
+    -- Threshold: Must play for at least 10% of the section (minimum 2.0 seconds)
+	local region_dur = end_time - start_time
+	local MIN_OVERLAP_SECONDS = math.max(2.0, region_dur * 0.10)
 
     for i = 0, limit do
         local track = reaper.GetTrack(0, i)
