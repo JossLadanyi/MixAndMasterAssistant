@@ -2096,6 +2096,8 @@ local function main()
     local model_items = "DeepSeek V4 Pro (Flagship Reasoning)\0DeepSeek Flash (Fast / Low-Cost)\0\0"
     local duration_items = "10 Seconds\0" .. "20 Seconds\0" .. "Full Region\0\0"
 
+	local scan_state = 0
+
 	local function loop()
         poll_deep_seek_balance()
 
@@ -2126,11 +2128,26 @@ local function main()
 
                 reaper.ImGui_Dummy(ctx, 0, 4)
 
-                if reaper.ImGui_Button(ctx, "Run Fresh Scan & Reset Chat", -1, 30) then
-                    local dur_map = { [0] = 10, [1] = 20, [2] = 0 }
-                    run_fresh_scan(target_idx + 1, model_idx + 1, mute_parallels, bypass_master_fx, dur_map[duration_idx], output_api)
-                end
-                reaper.ImGui_Separator(ctx)
+                -- 1. Draw button state based on scan_state (0 = idle, 1 = rendering UI, 2 = running)
+				local is_busy = (scan_state and scan_state > 0)
+				if is_busy then reaper.ImGui_BeginDisabled(ctx, true) end
+
+				local btn_label = is_busy and "Scanning in progress..." or "Run Fresh Scan & Reset Chat"
+				if reaper.ImGui_Button(ctx, btn_label, -1, 30) then
+					scan_state = 1
+				end
+
+				if is_busy then reaper.ImGui_EndDisabled(ctx) end
+				reaper.ImGui_Separator(ctx)
+
+				-- 2. Frame delay: Let OS draw the disabled button FIRST, then scan on the next frame
+				if scan_state == 1 then
+					scan_state = 2 -- Frame 1 painted; advance to execution for Frame 2
+				elseif scan_state == 2 then
+					local dur_map = { [0] = 10, [1] = 20, [2] = 0 }
+					run_fresh_scan(target_idx + 1, model_idx + 1, mute_parallels, bypass_master_fx, dur_map[duration_idx], output_api)
+					scan_state = 0 -- Reset to idle
+				end
             end
 
             -- CHAT HISTORY LOG
