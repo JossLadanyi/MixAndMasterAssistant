@@ -1,5 +1,5 @@
 -- ==============================================================================
--- REAPER AI MIX ASSISTANT & SCANNER (v5.2 - MUTE-AWARE VOCAL ISOLATION)
+-- REAPER AI MIX ASSISTANT & SCANNER (v5.4)
 -- ==============================================================================
 -- Features:
 -- 1. Token-Optimized YAML Architecture Scanner (Reduces LLM cost, retains data)
@@ -885,6 +885,9 @@ local function process_audio_chunk(take, item_pos, analyze_start, analyze_dur)
     local energy_air_12khz = 0
 	local sum_sub_LR, sum_sub_LL, sum_sub_RR = 0, 0, 0
 
+    -- Full-Spectrum Phase Correlation Accumulators: sum(L*R), sum(L^2), sum(R^2)
+    local sum_full_LR, sum_full_LL, sum_full_RR = 0, 0, 0
+
     -- Filter Coefficients for the 9 critical bands
     local filter_coeff_sub   = 2 * math.sin(math.pi * 60 / SAMPLE_RATE)
     local filter_coeff_punch = 2 * math.sin(math.pi * 120 / SAMPLE_RATE)
@@ -915,6 +918,11 @@ local function process_audio_chunk(take, item_pos, analyze_start, analyze_dur)
 
         if math.abs(sample_left) > peak_left then peak_left = math.abs(sample_left) end
         if math.abs(sample_right) > peak_right then peak_right = math.abs(sample_right) end
+
+        -- Accumulate full-spectrum stereo cross-correlation metrics
+        sum_full_LR = sum_full_LR + (sample_left * sample_right)
+        sum_full_LL = sum_full_LL + (sample_left * sample_left)
+        sum_full_RR = sum_full_RR + (sample_right * sample_right)
 
         local mid = (sample_left + sample_right) * 0.5
         local side = (sample_left - sample_right) * 0.5
@@ -983,6 +991,10 @@ local function process_audio_chunk(take, item_pos, analyze_start, analyze_dur)
         width_pct = (rms_side / (rms_mid + rms_side)) * 100
     end
 
+    -- Feature #1: Full-Spectrum Phase Correlation calculation (-1.0 to +1.0)
+    local full_denom = math.sqrt(sum_full_LL * sum_full_RR)
+    local phase_corr = full_denom > 0 and (sum_full_LR / full_denom) or 1.0
+
     -- Helper to convert any raw band energy accumulation into absolute dBFS
     local function convert_energy_to_db(energy_sum)
         local band_rms = math.sqrt(energy_sum / num_samples)
@@ -1001,7 +1013,7 @@ local function process_audio_chunk(take, item_pos, analyze_start, analyze_dur)
 
     return {
         dyn = { peak_db = round(peak_db, 1), rms_db = round(rms_db, 1), crest_db = round(crest_factor, 1) },
-        stereo = { width_pct = round(width_pct, 1), sub_mono = sub_mono_status },
+        stereo = { width_pct = round(width_pct, 1), sub_mono = sub_mono_status, phase_corr = round(phase_corr, 2) },
         tonal_db = {
             sub60 = convert_energy_to_db(energy_sub_60hz),
             punch120 = convert_energy_to_db(energy_punch_120hz),
@@ -1164,7 +1176,7 @@ local function build_full_prompt(project_yaml, audio_metrics, target_str, target
     prompt = prompt .. "1. MACRO-DYNAMICS: Compare Crest Factor and RMS across regions. If dynamic contrast is lacking, pinpoint over-compression in the YAML and specify threshold/ratio adjustments.\n"
     prompt = prompt .. "2. LOW/MID FREQUENCY BALANCE: Scrutinize Sub (60Hz), Punch (120Hz), Mud (250Hz), and Boxy (500Hz). Locate masking in the project tracks and suggest surgical EQ cuts.\n"
     prompt = prompt .. "3. HIGH FREQUENCY INTEGRITY: Differentiate Harshness (6kHz) from Sibilance (8kHz). Look for abrasive saturation or identify tracks requiring a De-Esser.\n"
-    prompt = prompt .. "4. STEREO & SUB-MONO INTEGRITY: Check 'width_pct' and 'sub_mono'. If 'Phase_Risk' is flagged on sub-bass, immediately identify which low-end tracks have wide side-channel information and advise how to high-pass or mono their sides.\n"
+    prompt = prompt .. "4. STEREO & SUB-MONO INTEGRITY: Check 'width_pct', 'phase_corr', and 'sub_mono'. 'phase_corr' is full-spectrum phase correlation (-1.0 to +1.0). If 'phase_corr' is low (< 0.5) or 'Phase_Risk' is flagged on sub-bass, identify phase issues across wide stereo elements or plugins and advise how to fix them.\n"
     prompt = prompt .. "Be precise: Quote exact track names, plugin names, and parameter settings as formatted in the project YAML.\n"
     prompt = prompt .. "Look closely at 'active_trks' for each region. ONLY critique or suggest changes to tracks that are actively playing in that specific region.\n"
     prompt = prompt .. "When suggesting dynamic EQ or compressor settings do not suggest threshold, always suggest gain reduction that we should achieve.\n"
@@ -1276,7 +1288,7 @@ local function save_tables_to_html(audio_metrics, txt_file_path, target_str)
 
     <h3>1. Macro-Dynamics & Stereo Summary</h3>
     <table>
-        <tr><th>Region</th><th>Peak (dB)</th><th>RMS (dB)</th><th>Crest (dB)</th><th>Width (%)</th><th>Sub-Mono</th></tr>
+        <tr><th>Region</th><th>Peak (dB)</th><th>RMS (dB)</th><th>Crest (dB)</th><th>Width (%)</th><th>Phase Corr</th><th>Sub-Mono</th></tr>
 ]]
 
     local sorted_regions = {}
@@ -1287,9 +1299,10 @@ local function save_tables_to_html(audio_metrics, txt_file_path, target_str)
         local m = audio_metrics[r_key]
         local clean_name = r_key:gsub("^%d+_", ""):gsub("_", " ")
         local phase_status = m.stereo.sub_mono == "Phase_Risk" and "<span class='risk'>Risk</span>" or "<span class='safe'>Safe</span>"
+        local phase_corr_val = m.stereo.phase_corr or 1.0
 
-        html = html .. string.format("<tr><td>%s</td><td>%.1f</td><td>%.1f</td><td>%.1f</td><td>%.0f%%</td><td>%s</td></tr>\n",
-            clean_name, m.dyn.peak_db, m.dyn.rms_db, m.dyn.crest_db, m.stereo.width_pct, phase_status)
+        html = html .. string.format("<tr><td>%s</td><td>%.1f</td><td>%.1f</td><td>%.1f</td><td>%.0f%%</td><td>%.2f</td><td>%s</td></tr>\n",
+            clean_name, m.dyn.peak_db, m.dyn.rms_db, m.dyn.crest_db, m.stereo.width_pct, phase_corr_val, phase_status)
     end
 
     html = html .. [[
@@ -2022,7 +2035,7 @@ local function run_fresh_scan(target_mode, model_choice, mute_parallels, bypass_
     -- DYNAMIC METRICS TABLES FOR GUI (Splitting into 2 tables for neatness)
     -- =====================================================================
     initial_ui_msg = initial_ui_msg .. "\n### 1. Macro-Dynamics & Stereo Summary\n"
-    initial_ui_msg = initial_ui_msg .. "| Region | Peak | RMS | Crest | Width | Sub-Mono |\n|---|---|---|---|---|---|\n"
+    initial_ui_msg = initial_ui_msg .. "| Region | Peak | RMS | Crest | Width | Phase Corr | Sub-Mono |\n|---|---|---|---|---|---|---|\n"
 
     local tonal_msg = "\n### 2. Tonal Balance Summary (dBFS)\n"
     tonal_msg = tonal_msg .. "| Region | Sub | Punch | Mud | Boxy | Core | Pres | Harsh | Sib | Air |\n|---|---|---|---|---|---|---|---|---|---|\n"
@@ -2035,10 +2048,11 @@ local function run_fresh_scan(target_mode, model_choice, mute_parallels, bypass_
         local m = audio_metrics[r_key]
         local clean_name = r_key:gsub("^%d+_", ""):gsub("_", " ")
         local phase_status = m.stereo.sub_mono == "Phase_Risk" and "Risk" or "Safe"
+        local phase_corr_val = m.stereo.phase_corr or 1.0
 
         -- Populate Dynamics Table
-        initial_ui_msg = initial_ui_msg .. string.format("| %s | %.1f | %.1f | %.1f | %.0f%% | %s |\n",
-            clean_name, m.dyn.peak_db, m.dyn.rms_db, m.dyn.crest_db, m.stereo.width_pct, phase_status)
+        initial_ui_msg = initial_ui_msg .. string.format("| %s | %.1f | %.1f | %.1f | %.0f%% | %.2f | %s |\n",
+            clean_name, m.dyn.peak_db, m.dyn.rms_db, m.dyn.crest_db, m.stereo.width_pct, phase_corr_val, phase_status)
 
         -- Populate Tonal Balance Table
         tonal_msg = tonal_msg .. string.format("| %s | %.1f | %.1f | %.1f | %.1f | %.1f | %.1f | %.1f | %.1f | %.1f |\n",
