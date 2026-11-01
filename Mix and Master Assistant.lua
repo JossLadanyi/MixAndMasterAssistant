@@ -875,8 +875,7 @@ local function process_audio_chunk(take, item_pos, analyze_start, analyze_dur)
     local energy_harsh_6khz = 0
     local energy_sibilance_8khz = 0
     local energy_air_12khz = 0
-    local energy_sub_side_channel = 0
-	local energy_sub_mid_lp = 0
+	local sum_sub_LR, sum_sub_LL, sum_sub_RR = 0, 0, 0
 
     -- Filter Coefficients for the 9 critical bands
     local filter_coeff_sub   = 2 * math.sin(math.pi * 60 / SAMPLE_RATE)
@@ -919,7 +918,6 @@ local function process_audio_chunk(take, item_pos, analyze_start, analyze_dur)
         low_sub = low_sub + filter_coeff_sub * band_sub
         band_sub = band_sub + filter_coeff_sub * (mid - low_sub - FILTER_Q * band_sub)
         energy_sub_60hz = energy_sub_60hz + (band_sub * band_sub)
-		energy_sub_mid_lp = energy_sub_mid_lp + (low_sub * low_sub)
 
         low_punch = low_punch + filter_coeff_punch * band_punch
         band_punch = band_punch + filter_coeff_punch * (mid - low_punch - FILTER_Q * band_punch)
@@ -956,7 +954,13 @@ local function process_audio_chunk(take, item_pos, analyze_start, analyze_dur)
         -- Sub-bass side channel tracking for mono compatibility
         low_sub_side = low_sub_side + filter_coeff_sub * band_sub_side
         band_sub_side = band_sub_side + filter_coeff_sub * (side - low_sub_side - FILTER_Q * band_sub_side)
-        energy_sub_side_channel = energy_sub_side_channel + (low_sub_side * low_sub_side)
+
+		-- Accumulate cross-channel correlation at 60Hz
+		local sub_L = low_sub + low_sub_side
+		local sub_R = low_sub - low_sub_side
+		sum_sub_LR = sum_sub_LR + (sub_L * sub_R)
+		sum_sub_LL = sum_sub_LL + (sub_L * sub_L)
+		sum_sub_RR = sum_sub_RR + (sub_R * sub_R)
     end
 
     local true_peak = math.max(peak_left, peak_right)
@@ -978,15 +982,14 @@ local function process_audio_chunk(take, item_pos, analyze_start, analyze_dur)
         return round(20 * math.log(band_rms, 10), 1)
     end
 
-    local sub_energy_total = energy_sub_mid_lp + energy_sub_side_channel + 0.000001
-    local sub_side_percentage = (energy_sub_side_channel / sub_energy_total) * 100
+	local denom = math.sqrt(sum_sub_LL * sum_sub_RR)
+	local correlation = denom > 0 and (sum_sub_LR / denom) or 1.0
 
-    -- Only flag phase risk if there is actual bass playing (louder than -60 dBFS).
-    -- This prevents plugin noise floors or dither in empty regions from triggering a false positive.
-    local sub_mono_status = "Safe"
-    if convert_energy_to_db(energy_sub_60hz) > -60.0 and sub_side_percentage > 15.0 then
-        sub_mono_status = "Phase_Risk"
-    end
+	-- Only flag if there is actual bass AND phase correlation drops below 0 (canceling out)
+	local sub_mono_status = "Safe"
+	if convert_energy_to_db(energy_sub_60hz) > -50.0 and correlation < 0.0 then
+		sub_mono_status = "Phase_Risk"
+	end
 
     return {
         dyn = { peak_db = round(peak_db, 1), rms_db = round(rms_db, 1), crest_db = round(crest_factor, 1) },
