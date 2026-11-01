@@ -1,5 +1,5 @@
 -- ==============================================================================
--- REAPER AI MIX ASSISTANT & SCANNER (v5.0 - FULL READABILITY EDITION)
+-- REAPER AI MIX ASSISTANT & SCANNER (v5.2 - MUTE-AWARE VOCAL ISOLATION)
 -- ==============================================================================
 -- Features:
 -- 1. Token-Optimized YAML Architecture Scanner (Reduces LLM cost, retains data)
@@ -602,16 +602,21 @@ local function get_track_category(name)
     if name:match("nyc") or name:match("rear") or name:match("parallel") then
         return 99
 
-    -- 1 = Drums & Bass (Drums, Percussion, Kicks, Snares, 808s, Basses)
+    -- 1 = Drums & Bass (Drums, Percussion, Kicks, Snares, 808s, Basses - excluding Brass)
     elseif name:match("drum") or name:match("kick") or name:match("snare") or
            name:match("hat") or name:match("perc") or name:match("cymbal") or
-           name:match("bass") or name:match("808") or name:match("sub") then
+           name:match("808") or name:match("sub") or
+           (name:match("bass") and not name:match("brass")) then
         return 1
 
     -- 3 = Vocals (Lead Vox, Harmonies, BGV, Choirs, Acapellas)
-    elseif name:match("vox") or name:match("vocal") or name:match("choir") or
-           name:match("lead") or name:match("bgv") or name:match("acap") or
-           name:match("harmony") or name:match("chorus") or name:match("backing") then
+    elseif name:match("vox") or name:match("vocal") or name:match("vocals") or
+           name:match("choir") or name:match("choirs") or
+           name:match("bgv") or name:match("bgvs") or name:match("bv") or name:match("bvs") or
+           name:match("acap") or name:match("acapella") or
+           name:match("harmony") or name:match("harmonies") or
+           name:match("lead vocal") or name:match("lead vox") or
+           name:match("backing vocal") or name:match("backing vox") then
         return 3
 
     -- 2 = Instruments (Everything else: Guitars, Keys, Synths, Strings, Horns, FX, Pads)
@@ -693,16 +698,19 @@ local function save_and_apply_mix_state(target_mode, mute_parallels, bypass_mast
             saved_mix_state.tracks[track_guid] = { solo = orig_solo, mute = orig_mute }
 
             local is_target = false
+            -- FIX: Check that the track is NOT muted (or inside a muted folder hierarchy) before targeting/soloing it
+            local is_muted = is_track_hierarchy_muted(track)
+
             if target_mode == 5 then
-                is_target = (orig_solo > 0)
+                is_target = (orig_solo > 0) and not is_muted
             elseif target_mode ~= 4 then
-                is_target = (category == target_mode)
+                is_target = (category == target_mode) and not is_muted
             end
 
             if target_mode ~= 4 then
                 if is_target then
-                    set_track_info_delta(track, "I_SOLO", 2)
-                    if not is_track_hierarchy_muted(track) then
+    				set_track_info_delta(track, "I_SOLO", 1)
+                    if not is_muted then
                         table.insert(target_track_names, display_name)
                     end
                 else
