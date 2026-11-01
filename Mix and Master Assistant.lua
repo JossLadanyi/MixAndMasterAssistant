@@ -1982,12 +1982,19 @@ local function run_fresh_scan(target_mode, model_choice, mute_parallels, bypass_
         return false
     end
 
-    -- Render succeeded! Extract YAML now while target tracks are still isolated
+	-- Render succeeded! Extract YAML now while target tracks are still isolated
     local project_yaml = extract_full_project_yaml()
 
-    if rendered_tracks then
-        for _, trk in ipairs(rendered_tracks) do reaper.DeleteTrack(trk) end
+    -- Automatically undo the render to purge the track AND clear the undo stack
+    local last_undo = reaper.Undo_CanUndo2(0)
+    if last_undo and (last_undo:lower():find("render") or last_undo:lower():find("media")) then
+        reaper.Undo_DoUndo2(0)
+    else
+        if rendered_tracks then
+            for _, trk in ipairs(rendered_tracks) do reaper.DeleteTrack(trk) end
+        end
     end
+
     restore_mix_state()
 
     -- Stage 6: Build prompt & export
