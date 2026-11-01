@@ -2131,41 +2131,73 @@ local function main()
             reaper.ImGui_Separator(ctx)
             reaper.ImGui_Dummy(ctx, 0, 2)
 
-            -- SCAN SETTINGS PANEL
-            if reaper.ImGui_CollapsingHeader(ctx, "Scan Configuration & Controls") then
-                _, target_idx = reaper.ImGui_Combo(ctx, "Target", target_idx, target_items)
-                _, mute_parallels = reaper.ImGui_Checkbox(ctx, "Mute Parallels", mute_parallels)
-                _, bypass_master_fx = reaper.ImGui_Checkbox(ctx, "Bypass Master FX", bypass_master_fx)
-                _, duration_idx = reaper.ImGui_Combo(ctx, "Duration", duration_idx, duration_items)
-                _, output_api = reaper.ImGui_Checkbox(ctx, "Query DeepSeek API (Uncheck for TXT only)", output_api)
-                _, model_idx = reaper.ImGui_Combo(ctx, "AI Model", model_idx, model_items)
+			-- SCAN SETTINGS PANEL
+			reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Button(), 0x333333FF)
+			reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), 0xFFFF33FF)
+			reaper.ImGui_PushStyleVar(ctx, reaper.ImGui_StyleVar_FramePadding(), 8, 8)
+			reaper.ImGui_PushStyleVar(ctx, reaper.ImGui_StyleVar_ButtonTextAlign(), 0.0, 0.5)
 
-                reaper.ImGui_Dummy(ctx, 0, 4)
+			reaper.ImGui_BeginDisabled(ctx, true)
+			reaper.ImGui_Button(ctx, "  SCAN CONFIGURATION & CONTROLS", -1, 0)
+			reaper.ImGui_EndDisabled(ctx)
 
-                -- 1. Draw button state based on scan_state (0 = idle, 1 = rendering UI, 2 = running)
-				local is_busy = (scan_state and scan_state > 0)
-				if is_busy then reaper.ImGui_BeginDisabled(ctx, true) end
+			reaper.ImGui_PopStyleVar(ctx, 2)
+			reaper.ImGui_PopStyleColor(ctx, 2)
+			reaper.ImGui_Dummy(ctx, 0, 4)
 
-				local btn_label = is_busy and "Scanning in progress..." or "Run Fresh Scan & Reset Chat"
-				if reaper.ImGui_Button(ctx, btn_label, -1, 30) then
-					scan_state = 1
-				end
+			_, target_idx = reaper.ImGui_Combo(ctx, "Target", target_idx, target_items)
+			_, mute_parallels = reaper.ImGui_Checkbox(ctx, "Mute Parallels", mute_parallels)
+			_, bypass_master_fx = reaper.ImGui_Checkbox(ctx, "Bypass Master FX", bypass_master_fx)
+			_, duration_idx = reaper.ImGui_Combo(ctx, "Duration", duration_idx, duration_items)
+			_, output_api = reaper.ImGui_Checkbox(ctx, "Query DeepSeek API (Uncheck for TXT only)", output_api)
+			_, model_idx = reaper.ImGui_Combo(ctx, "AI Model", model_idx, model_items)
 
-				if is_busy then reaper.ImGui_EndDisabled(ctx) end
-				reaper.ImGui_Separator(ctx)
+			reaper.ImGui_Dummy(ctx, 0, 4)
 
-				-- 2. Frame delay: Let OS draw the disabled button FIRST, then scan on the next frame
-				if scan_state == 1 then
-					scan_state = 2 -- Frame 1 painted; advance to execution for Frame 2
-				elseif scan_state == 2 then
-					local dur_map = { [0] = 10, [1] = 20, [2] = 0 }
-					run_fresh_scan(target_idx + 1, model_idx + 1, mute_parallels, bypass_master_fx, dur_map[duration_idx], output_api)
-					scan_state = 0 -- Reset to idle
-				end
-            end
+			-- 1. Draw button state based on scan_state
+			local is_busy = (scan_state and scan_state > 0)
+			if is_busy then reaper.ImGui_BeginDisabled(ctx, true) end
 
-            -- CHAT HISTORY LOG
-            reaper.ImGui_TextColored(ctx, 0xFFD54FFF, "Conversation Log:")
+			local btn_label = is_busy and "Scanning in progress..." or "Run Fresh Scan & Reset Chat"
+			local btn_clicked = reaper.ImGui_Button(ctx, btn_label, -1, 30)
+
+			if is_busy then reaper.ImGui_EndDisabled(ctx) end
+			reaper.ImGui_Separator(ctx)
+
+			-- 2. Strict Frame Delay & Click-Absorption Cooldown
+			if btn_clicked and not is_busy then
+				table.insert(chat_history, {
+					role = "assistant",
+					content = "⏳ *Rendering mix and analyzing peaks & frequencies... please wait.*"
+				})
+				scroll_to_bottom = true
+				scan_state = 1
+			elseif scan_state == 1 then scan_state = 2
+			elseif scan_state == 2 then scan_state = 3
+			elseif scan_state == 3 then
+				local dur_map = { [0] = 10, [1] = 20, [2] = 0 }
+				run_fresh_scan(target_idx + 1, model_idx + 1, mute_parallels, bypass_master_fx, dur_map[duration_idx], output_api)
+				scan_state = 4 -- Enter click-absorption cooldown
+			elseif scan_state >= 4 and scan_state < 10 then
+				scan_state = scan_state + 1 -- Absorb queued OS clicks for 6 frames
+			elseif scan_state == 10 then
+				scan_state = 0 -- Reset to idle and re-enable button
+			end
+
+			-- CHAT HISTORY LOG
+			reaper.ImGui_Dummy(ctx, 0, 8)
+			reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Button(), 0x333333FF)
+			reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), 0xFFFF33FF)
+			reaper.ImGui_PushStyleVar(ctx, reaper.ImGui_StyleVar_FramePadding(), 8, 8)
+			reaper.ImGui_PushStyleVar(ctx, reaper.ImGui_StyleVar_ButtonTextAlign(), 0.0, 0.5)
+
+			reaper.ImGui_BeginDisabled(ctx, true)
+			reaper.ImGui_Button(ctx, "  CONVERSATION LOG", -1, 0)
+			reaper.ImGui_EndDisabled(ctx)
+
+			reaper.ImGui_PopStyleVar(ctx, 2)
+			reaper.ImGui_PopStyleColor(ctx, 2)
+			reaper.ImGui_Dummy(ctx, 0, 4)
             local _, avail_h = reaper.ImGui_GetContentRegionAvail(ctx)
             local scroll_h = math.max(150, avail_h - 70)
 
@@ -2184,7 +2216,7 @@ local function main()
 
                     elseif msg.role == "assistant" then
                         -- Light Green background with dark text
-                        render_role_badge(ctx, " DEEPSEEK ", 0x81C784FF, 0x111111FF, idx)
+                        render_role_badge(ctx, " ASSISTANT ", 0x81C784FF, 0x111111FF, idx)
                         render_markdown_text(ctx, msg.content, idx)
                         reaper.ImGui_Dummy(ctx, 0, 4)
                         reaper.ImGui_Separator(ctx)
