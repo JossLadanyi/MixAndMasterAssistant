@@ -2091,8 +2091,8 @@ local function main()
 
     local target_idx = 3
     local model_idx = 0
-    local mute_parallels = true
-    local bypass_master_fx = true
+	local mute_parallels = false
+	local bypass_master_fx = false
     local duration_idx = 0
     local output_api = true
 
