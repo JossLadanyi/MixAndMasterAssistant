@@ -12,12 +12,15 @@ The script performs a non-destructive render of your mix or isolated stems, extr
 
 ### 1. 9-Band Mastering DSP Engine
 
-Extracts dynamic and tonal metrics per region using a Chamberlin State-Variable Filter (SVF) engine:
+Extracts dynamic and tonal metrics per region using accurate biquad (RBJ) band-pass filters:
 
 - **Dynamics:** True Peak (dBFS), RMS (dBFS), and Crest Factor (dB).
-- **Stereo Field:** Stereo width percentage (`width_pct`).
-- **Gated Sub-Mono Phase Check:** Evaluates stereo energy below 120 Hz using a `-60 dBFS` threshold gate to prevent quiet tails and plugin noise floors from triggering false phase alerts.
+- **Stereo Field:** Stereo width percentage (`width_pct`) and full-spectrum phase correlation (`phase_corr`, -1.0 to +1.0).
+- **Gated Sub-Mono Phase Check:** Evaluates stereo phase correlation below 120 Hz using a 24 dB/oct (Linkwitz-Riley) low-pass and a `-50 dBFS` threshold gate, which prevents quiet tails and plugin noise floors from triggering false phase alerts. The cutoff is configurable (`SUB_MONO_CUTOFF_HZ`).
 - **9 Frequency Bands (dBFS):** Sub (60 Hz), Punch (120 Hz), Mud (250 Hz), Boxy (500 Hz), Mid/Core (1 kHz), Presence (3 kHz), Harshness (6 kHz), Sibilance (8 kHz), and Air (12 kHz).
+    - Every band has exact center frequency and 0 dB gain, so levels are true band energy.
+    - Each band is as wide as its closest neighbor allows (1 octave from 60 Hz to 3 kHz, about 0.4 octave for 6 kHz and 8 kHz, about 0.6 octave for 12 kHz), so neighboring bands touch but never overlap.
+    - Levels are **octave-normalized** by default: each value is the level a 1-octave-wide band would have, so narrow and wide bands stay directly comparable. Set `NORMALIZE_BANDS_TO_OCTAVE = false` for raw band-limited RMS.
 
 ### 2. Mix State Manager & Isolated Target Auditioning
 
@@ -28,17 +31,18 @@ Extracts dynamic and tonal metrics per region using a Chamberlin State-Variable 
 
 ### 3. Active Track Detection
 
-Cross-references track audio items against project markers/regions. If an instrument does not play during a specific section, the assistant will not critique or recommend changes for that instrument during that region.
+Cross-references track audio items against project regions. If an instrument does not play during a specific section, the assistant will not critique or recommend changes for that instrument during that region. Only regions are analyzed; markers are ignored for analysis (they still appear in the project YAML).
 
 ### 4. Token-Optimized Project Serializer
 
 - Suppresses default bypass states, inactive EQ bands, and irrelevant UI controls.
-- Abbreviates common audio parameter names (`freq`, `thr`, `rel`, `att`, `gn`) to minimize token usage when communicating with language models.
+- Abbreviates common audio parameter names (`freq`, `thr`, `rel`, `att`, `gn`) in a fixed, deterministic order to minimize token usage when communicating with language models.
 
 ### 5. ReaImGui Interface
 
 - Fixed-fit tables for regional dynamics and tonal balance metrics.
 - Color-coded role badges for conversation history.
+- Chat messages are parsed once and cached, so long conversations stay responsive.
 - Asynchronous balance query that does not block the UI during startup or manual refreshes.
 
 ### 6. File Exporter with Auto-Numbering
@@ -48,6 +52,10 @@ Every scan exports:
 - **Prompt File (`.txt`):** Full project configuration and DSP metrics ready to copy into web LLMs (ChatGPT, Claude, Gemini).
 - **Visual Summary (`.html`):** Standalone, styled HTML tables for viewing regional metrics in any browser.
 - **Auto-Numbering:** Automatically appends sequential counters (`_01`, `_02`) to prevent overwriting previous reports.
+
+### 7. Low-Memory Streaming Analysis
+
+Audio is analyzed in 1-second blocks instead of one large buffer per region, so memory stays flat (about 6 MB for a 60 s region instead of about 128 MB) and even "Full Region" scans of long sections are safe. Results are identical regardless of block size.
 
 ## 📋 Requirements
 
@@ -113,6 +121,43 @@ If you plan to use direct in-DAW chat with DeepSeek:
     ```lua
     local API_KEY = "sk-your-actual-deepseek-api-key-here"
     ```
+
+## 🔧 Tuning
+
+These constants are in the configuration block at the top of the script:
+
+| Constant | Default | Purpose |
+| --- | --- | --- |
+| `API_KEY` | placeholder | DeepSeek API key (not needed for `.txt` export mode). |
+| `MAX_PLUGIN_PARAMS` | `128` | Maximum parameters captured per plugin (precision vs. tokens). |
+| `SUB_MONO_CUTOFF_HZ` | `120` | Everything below this frequency is checked for mono compatibility. |
+| `NORMALIZE_BANDS_TO_OCTAVE` | `true` | Report each tonal band as a 1-octave-equivalent level. `false` gives raw band-limited RMS. |
+
+## 📝 Changelog
+
+### v5.6
+
+**DSP fixes (results change):**
+
+- Replaced the Chamberlin state-variable band filters with RBJ biquad band-pass filters. The old filters had +6 dB peak gain on every band and strong frequency warping in the upper bands at 44.1 kHz (the 6 kHz, 8 kHz and 12 kHz bands actually peaked at about 6.9 kHz, 10 kHz and 22 kHz).
+- Band widths are now derived from the neighboring bands (no overlap), and levels are octave-normalized.
+- The sub-mono check now uses a 24 dB/oct low-pass at 120 Hz, matching its documented range (it previously low-passed at 60 Hz with a shallow slope).
+- Tonal values, especially in the upper bands, will differ from reports made with earlier versions.
+
+**Performance (output unchanged):**
+
+- Streaming 1-second block analysis (about 20x less memory on long regions).
+- Markdown chat rendering is cached per message instead of re-parsed every frame.
+- Plugin parameter names are read once per plugin and cleaned names are cached.
+- Active-track lookup is built once per scan instead of once per region.
+- Balance polling is throttled; duplicated code was consolidated into shared helpers.
+
+**Bug fixes:**
+
+- Fixed a crash during analysis when the project contained markers in addition to regions.
+- Parameter abbreviations are now applied in a fixed order (previously undefined, e.g. for "bandwidth" vs. "width").
+- JSON parser handles UTF-16 surrogate pairs (emoji in AI replies).
+- Removed a leaked global variable in the GUI loop.
 
 ## 📄 License
 

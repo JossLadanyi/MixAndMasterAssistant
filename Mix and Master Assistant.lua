@@ -1,11 +1,11 @@
 -- ==============================================================================
--- REAPER AI MIX ASSISTANT & SCANNER (v5.5)
+-- REAPER AI MIX ASSISTANT & SCANNER (v5.6)
 -- ==============================================================================
 -- Features:
 -- 1. Token-Optimized YAML Architecture Scanner (Reduces LLM cost, retains data)
 -- 2. Mix State Manager (Target Soloing & Parallel / Master FX Muting)
 -- 3. Ghost Render Engine with Auto-Cleanup & Non-Destructive State Restore
--- 4. 9-Band Mastering DSP Engine + Sub-Mono (<120Hz) Phase Check
+-- 4. 9-Band Mastering DSP Engine (accurate biquad band-pass filters) + Sub-Mono (<120Hz) Phase Check
 -- 5. Active Track Detection (Tells AI exactly what is playing in each region)
 -- 6. DeepSeek API Integration & Free Web-LLM Prompt Exporter (.txt)
 -- ==============================================================================
@@ -43,9 +43,16 @@ local API_KEY = "YOUR_DEEPSEEK_API_KEY"
 -- Maximum plugin parameters to capture per effect (Balances precision vs tokens)
 local MAX_PLUGIN_PARAMS = 128
 
--- DSP Sample Rate & Filter Q Factor (Chamberlin State-Variable Filter)
+-- DSP Sample Rate
 local SAMPLE_RATE = 44100
-local FILTER_Q = 0.5
+
+-- Sub-Mono check: everything below this frequency (24 dB/oct low-pass) must be mono-compatible
+local SUB_MONO_CUTOFF_HZ = 120
+
+-- Tonal bands have different widths (see section 7). When true, each band level is reported as the level of a
+-- 1-octave-wide band (dBFS), so the narrow 6k/8k/12k bands stay directly comparable with the wider bands below them.
+-- Set to false for the raw band-limited RMS level of each band.
+local NORMALIZE_BANDS_TO_OCTAVE = true
 
 -- Default plugin property expectations for boilerplate suppression
 local DEFAULT_SETTINGS = {
@@ -861,38 +868,85 @@ end
 local BAND_FREQS = { 60, 120, 250, 500, 1000, 3000, 6000, 8000, 12000 }
 local BAND_KEYS  = { "sub60", "punch120", "mud250", "boxy500", "mid1k", "pres3k", "harsh6k", "sib8k", "air12k" }
 
+local function sinh(x) return (math.exp(x) - math.exp(-x)) / 2 end
+
+-- Band widths are derived once from the centre frequencies: each band is exactly as wide (in octaves) as its
+-- CLOSEST neighbour allows, so neighbouring bands touch at their edges but never overlap.
+-- (60..1k come out 1 octave wide, 6k and 8k ~0.4 octave, 12k ~0.6 octave.)
+local BAND_Q, BAND_OFFSET_DB = {}, {}
+for b, freq in ipairs(BAND_FREQS) do
+    local lower_gap = BAND_FREQS[b - 1] and math.log(freq / BAND_FREQS[b - 1], 2)
+    local upper_gap = BAND_FREQS[b + 1] and math.log(BAND_FREQS[b + 1] / freq, 2)
+    local width_octaves = math.min(lower_gap or upper_gap, upper_gap or lower_gap)
+
+    BAND_Q[b] = 1 / (2 * sinh(math.log(2) / 2 * width_octaves)) -- bandwidth in octaves -> filter Q
+    BAND_OFFSET_DB[b] = NORMALIZE_BANDS_TO_OCTAVE and (-10 * math.log(width_octaves, 10)) or 0
+end
+
 -- Audio is streamed through the analyzer in 1-second blocks instead of one giant buffer,
 -- so memory stays flat even for "Full Region" scans (a 3-minute song used to need ~16 million Lua numbers at once).
 local DSP_BLOCK_FRAMES = SAMPLE_RATE
 
---- Runs one Chamberlin state-variable filter over input[1..n].
--- `state` (low, band, energy) is carried from block to block; the band-pass energy keeps accumulating.
--- If `low_out` is given, the low-pass signal is stored there (needed for the sub-bass phase check).
-local function run_svf(input, n, coeff, state, low_out)
-    local q = FILTER_Q -- local copy: faster than reading the upvalue on every sample
-    local low, band, energy = state.low, state.band, state.energy
-    if low_out then
-        for i = 1, n do
-            low = low + coeff * band
-            band = band + coeff * (input[i] - low - q * band)
-            energy = energy + band * band
-            low_out[i] = low
-        end
-    else
-        for i = 1, n do
-            low = low + coeff * band
-            band = band + coeff * (input[i] - low - q * band)
-            energy = energy + band * band
-        end
-    end
-    state.low, state.band, state.energy = low, band, energy
+-- ------------------------------------------------------------------------------
+-- Biquad filters (RBJ cookbook, bilinear transform). Unlike the old Chamberlin state-variable filter
+-- these keep their exact centre frequency and gain right up to the top bands at 44.1 kHz.
+-- ------------------------------------------------------------------------------
+
+--- Band-pass with 0 dB gain at the centre frequency (so band energy is the true energy inside the band).
+local function design_bandpass(freq, q)
+    local w0 = 2 * math.pi * freq / SAMPLE_RATE
+    local alpha = math.sin(w0) / (2 * q)
+    local a0 = 1 + alpha
+    return { b0 = alpha / a0, b2 = -alpha / a0, a1 = -2 * math.cos(w0) / a0, a2 = (1 - alpha) / a0, z1 = 0, z2 = 0, energy = 0 }
 end
 
--- Helper to convert any raw band energy accumulation into absolute dBFS
-local function convert_energy_to_db(energy_sum, num_samples)
+--- 4th-order Linkwitz-Riley low-pass (24 dB/oct, -6 dB at the cutoff): two identical 2nd-order Butterworth
+--- stages in series. One set of coefficients, two sets of filter memory (z1/z2 = stage 1, z3/z4 = stage 2).
+local function design_lowpass4(freq)
+    local w0 = 2 * math.pi * freq / SAMPLE_RATE
+    local cos_w0 = math.cos(w0)
+    local alpha = math.sin(w0) / (2 * 0.70710678)
+    local a0 = 1 + alpha
+    local b = (1 - cos_w0) / a0
+    return { b0 = b / 2, b1 = b, b2 = b / 2, a1 = -2 * cos_w0 / a0, a2 = (1 - alpha) / a0, z1 = 0, z2 = 0, z3 = 0, z4 = 0 }
+end
+
+--- Runs a band-pass biquad over input[1..n]; the filter state carries from block to block and the output energy keeps accumulating.
+local function run_bandpass(input, n, filter)
+    local b0, b2, a1, a2 = filter.b0, filter.b2, filter.a1, filter.a2
+    local z1, z2, energy = filter.z1, filter.z2, filter.energy
+    for i = 1, n do
+        local x = input[i]
+        local y = b0 * x + z1       -- transposed direct form II (b1 is 0 for a band-pass)
+        z1 = z2 - a1 * y
+        z2 = b2 * x - a2 * y
+        energy = energy + y * y
+    end
+    filter.z1, filter.z2, filter.energy = z1, z2, energy
+end
+
+--- Runs the 4th-order low-pass over input[1..n] and stores the result in output (input and output may be the same table).
+local function run_lowpass4(input, output, n, filter)
+    local b0, b1, b2, a1, a2 = filter.b0, filter.b1, filter.b2, filter.a1, filter.a2
+    local z1, z2, z3, z4 = filter.z1, filter.z2, filter.z3, filter.z4
+    for i = 1, n do
+        local x = input[i]
+        local y = b0 * x + z1       -- stage 1
+        z1 = b1 * x - a1 * y + z2
+        z2 = b2 * x - a2 * y
+        local out = b0 * y + z3     -- stage 2 (same coefficients)
+        z3 = b1 * y - a1 * out + z4
+        z4 = b2 * y - a2 * out
+        output[i] = out
+    end
+    filter.z1, filter.z2, filter.z3, filter.z4 = z1, z2, z3, z4
+end
+
+-- Helper to convert any raw band energy accumulation into absolute dBFS (offset_db = optional octave normalization)
+local function convert_energy_to_db(energy_sum, num_samples, offset_db)
     local band_rms = math.sqrt(energy_sum / num_samples)
     if band_rms <= 1e-7 then return -144.0 end
-    return round(20 * math.log(band_rms, 10), 1)
+    return round(20 * math.log(band_rms, 10) + (offset_db or 0), 1)
 end
 
 local function process_audio_chunk(take, item_pos, analyze_start, analyze_dur)
@@ -911,18 +965,19 @@ local function process_audio_chunk(take, item_pos, analyze_start, analyze_dur)
 
     -- Full-Spectrum Phase Correlation Accumulators: sum(L*R), sum(L^2), sum(R^2)
     local sum_full_LR, sum_full_LL, sum_full_RR = 0, 0, 0
-    -- Same accumulators for the sub-bass (60Hz) region
+    -- Same accumulators for the sub-bass region (below SUB_MONO_CUTOFF_HZ)
     local sum_sub_LR, sum_sub_LL, sum_sub_RR = 0, 0, 0
 
-    -- Filter state for each of the 9 bands (Chamberlin SVF on the Mid channel) plus the Side-channel sub filter
+    -- One band-pass filter per band (applied to the Mid channel)
     local bands = {}
-    for b, freq in ipairs(BAND_FREQS) do
-        bands[b] = { coeff = 2 * math.sin(math.pi * freq / SAMPLE_RATE), low = 0, band = 0, energy = 0 }
-    end
-    local sub_side = { low = 0, band = 0, energy = 0 }
+    for b, freq in ipairs(BAND_FREQS) do bands[b] = design_bandpass(freq, BAND_Q[b]) end
+
+    -- Sub-Mono low-pass (24 dB/oct), one for the Mid and one for the Side channel
+    local sub_mid_lp = design_lowpass4(SUB_MONO_CUTOFF_HZ)
+    local sub_side_lp = design_lowpass4(SUB_MONO_CUTOFF_HZ)
 
     -- Per-block work arrays (allocated once, reused for every block)
-    local mid, side, sub_mid_low, sub_side_low = {}, {}, {}, {}
+    local mid, side, sub_mid, sub_side = {}, {}, {}, {}
 
     local frames_done = 0
     while frames_done < num_samples do
@@ -960,18 +1015,19 @@ local function process_audio_chunk(take, item_pos, analyze_start, analyze_dur)
             sum_squared_side = sum_squared_side + (s * s)
         end
 
-        -- State-Variable Filter executions on Mid channel (one tight loop per band keeps the filter state in registers)
+        -- Band-pass filters on the Mid channel (one tight loop per band keeps the filter state in registers)
         for b = 1, #bands do
-            run_svf(mid, n, bands[b].coeff, bands[b], b == 1 and sub_mid_low or nil)
+            run_bandpass(mid, n, bands[b])
         end
 
-        -- Sub-bass side channel tracking for mono compatibility
-        run_svf(side, n, bands[1].coeff, sub_side, sub_side_low)
+        -- Sub-bass low-pass on Mid and Side (linear, so L/R can be rebuilt afterwards) for the mono compatibility check
+        run_lowpass4(mid, sub_mid, n, sub_mid_lp)
+        run_lowpass4(side, sub_side, n, sub_side_lp)
 
-        -- Accumulate cross-channel correlation at 60Hz
+        -- Accumulate cross-channel correlation of the sub-bass region
         for i = 1, n do
-            local sub_L = sub_mid_low[i] + sub_side_low[i]
-            local sub_R = sub_mid_low[i] - sub_side_low[i]
+            local sub_L = sub_mid[i] + sub_side[i]
+            local sub_R = sub_mid[i] - sub_side[i]
             sum_sub_LR = sum_sub_LR + (sub_L * sub_R)
             sum_sub_LL = sum_sub_LL + (sub_L * sub_L)
             sum_sub_RR = sum_sub_RR + (sub_R * sub_R)
@@ -1004,13 +1060,13 @@ local function process_audio_chunk(take, item_pos, analyze_start, analyze_dur)
 
     -- Only flag if there is actual bass AND phase correlation drops below 0 (canceling out)
     local sub_mono_status = "Safe"
-    if convert_energy_to_db(bands[1].energy, num_samples) > -50.0 and correlation < 0.0 then
+    if convert_energy_to_db((sum_sub_LL + sum_sub_RR) / 2, num_samples) > -50.0 and correlation < 0.0 then
         sub_mono_status = "Phase_Risk"
     end
 
     local tonal_db = {}
     for b, key in ipairs(BAND_KEYS) do
-        tonal_db[key] = convert_energy_to_db(bands[b].energy, num_samples)
+        tonal_db[key] = convert_energy_to_db(bands[b].energy, num_samples, BAND_OFFSET_DB[b])
     end
 
     return {
@@ -1249,7 +1305,7 @@ end
 -- RESULT TABLES: one column definition drives BOTH the chat (Markdown) table and the HTML report
 -- ------------------------------------------------------------------------------
 
-local TABLE_TITLES = { "1. Macro-Dynamics & Stereo Summary", "2. Tonal Balance Summary (dBFS)" }
+local TABLE_TITLES = { "1. Macro-Dynamics & Stereo Summary", NORMALIZE_BANDS_TO_OCTAVE and "2. Tonal Balance Summary (dBFS, octave-normalized)" or "2. Tonal Balance Summary (dBFS)" }
 
 -- label = chat header, html = report header, fmt = number format, get(m, html) = cell value
 local DYNAMICS_COLUMNS = {
