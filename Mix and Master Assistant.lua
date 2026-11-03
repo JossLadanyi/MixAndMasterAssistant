@@ -1885,6 +1885,11 @@ local ANALYZER_FX_PATH = "JS:MixAssistant/mix_assistant_analyzer"
 -- gmem layout (must match the JSFX): header | per track-second records | master 100 ms blocks
 local MA_HDR, MA_MAXTR, MA_MAXSEC, MA_STRIDE, MA_MSTRIDE = 256, 128, 1800, 32, 36
 local MA_MBASE = MA_HDR + MA_MAXTR * MA_MAXSEC * MA_STRIDE
+-- Stage 3 short-window dynamics: thresholds are passed to the JSFX through header slots, so changing them needs no JSFX edit
+local MA_ACTIVE_DB, MA_CLIP_THRESHOLD = -60, 1.0 -- 100 ms sub-block is "active" above this stereo RMS (dBFS); clipped frame: |L| or |R| >= this
+local MA_S_LOUDF, MA_S_CLIPS, MA_S_ACTIVE, MA_S_LOUDK, MA_S_ELIG = 26, 27, 28, 29, 30 -- record slots (see CLAUDE.md)
+local MA_H_ACTIVE, MA_H_CLIP_TRK, MA_H_CLIP_MST = 16, 17, 18 -- header slots, Lua -> JSFX
+local MA_H_MCLIPS, MA_H_MSTAMP, MA_H_MPEAK = 19, 20, 21 -- header slots, JSFX -> Lua (master clip frames, run id stamp, max |sample|)
 
 -- Final 15 bands: each 2/3 octave wide, edges = every second ISO 1/3-octave value (the JSFX has the same edges).
 local B15_EDGES = { 20, 31.5, 50, 80, 125, 200, 315, 500, 800, 1250, 2000, 3150, 5000, 8000, 12500, 20000 }
@@ -1935,7 +1940,7 @@ local MA_MAGIC = 20261103
 
 local ANALYZER_JSFX = [==[
 desc:Mix Assistant Analyzer (temp)
-//MA_JSFX_VERSION=2
+//MA_JSFX_VERSION=3
 options:gmem=MixAssistant
 
 slider1:0<0,127,1>Track index
@@ -1948,7 +1953,7 @@ out_pin:left output
 out_pin:right output
 
 @init
-MAGIC = 20261103; VERSION = 2;
+MAGIC = 20261103; VERSION = 3;
 HDR = 256; MAXTR = 128; MAXSEC = 1800; STRIDE = 32;
 MBASE = HDR + MAXTR * MAXSEC * STRIDE; MSTRIDE = 36;
 gmem[0] = MAGIC; gmem[1] = VERSION;
@@ -1980,6 +1985,23 @@ EDG[0] = 20; EDG[1] = 31.5; EDG[2] = 50; EDG[3] = 80; EDG[4] = 125; EDG[5] = 200
 EDG[8] = 800; EDG[9] = 1250; EDG[10] = 2000; EDG[11] = 3150; EDG[12] = 5000; EDG[13] = 8000; EDG[14] = 12500; EDG[15] = 20000;
 SILN = floor(0.1 * srate); silcnt = 0; skip = 0;
 sub_ll = 0; sub_rr = 0; sub_lr = 0;
+// Stage 3: 100 ms sub-blocks aligned to the project second (thresholds come from Lua through gmem[16..18])
+SBMIN = srate * 0.05;
+act_thr = 0; clip_thr = 1; mclip_thr = 1;
+cur_sb = -1; sbcnt = 0; sb_fe = 0; sb_ke = 0;
+sb_maxf = 0; sb_maxk = 0; sb_act = 0; sb_elig = 0; clipc = 0;
+mclipc = 0; mpeak = 0;
+
+function sb_close() global(sbcnt,sb_fe,sb_ke,SBMIN,act_thr,sb_maxf,sb_maxk,sb_act,sb_elig) local(mf,mk) (
+  sbcnt >= SBMIN ? (
+    mf = sb_fe / sbcnt; mk = sb_ke / sbcnt;
+    sb_elig += 1;
+    mf > act_thr ? sb_act += 1;
+    mf > sb_maxf ? sb_maxf = mf;
+    mk > sb_maxk ? sb_maxk = mk;
+  );
+  sbcnt = 0; sb_fe = 0; sb_ke = 0;
+);
 
 function shelf(x) instance(x1,x2,y1,y2) global(sb0,sb1,sb2,sa1,sa2) local(y) (
   y = sb0*x + sb1*x1 + sb2*x2 - sa1*y1 - sa2*y2;
@@ -2011,13 +2033,21 @@ function bandrun(x, sbase, abase) global(CBASE) local(bi,cp,sp,y,o) (
     bi += 1;
   );
 );
-function put_track() global(idx,cur_sec,pkl,pkr,sll,srr,slr,ske,scnt,run,HDR,MAXSEC,STRIDE,ACC,sub_ll,sub_rr,sub_lr,gmem) local(b,bi) (
+function put_track() global(idx,cur_sec,pkl,pkr,sll,srr,slr,ske,scnt,run,HDR,MAXSEC,STRIDE,ACC,sub_ll,sub_rr,sub_lr,gmem,sb_maxf,sb_maxk,sb_act,sb_elig,sbcnt,sb_fe,sb_ke,SBMIN,act_thr,clipc) local(b,bi,pf,pk,pa,pe,mf,mk) (
   b = HDR + (idx * MAXSEC + cur_sec) * STRIDE;
   gmem[b] = pkl; gmem[b+1] = pkr; gmem[b+2] = sll; gmem[b+3] = srr;
   gmem[b+4] = slr; gmem[b+5] = ske; gmem[b+6] = scnt; gmem[b+7] = run;
   bi = 0;
   loop(15, gmem[b+8+bi] = ACC[bi]; bi += 1;);
   gmem[b+23] = sub_ll; gmem[b+24] = sub_rr; gmem[b+25] = sub_lr;
+  // provisional: the in-progress sub-block counts in THIS write only (never added to the persistent state)
+  pf = sb_maxf; pk = sb_maxk; pa = sb_act; pe = sb_elig;
+  sbcnt >= SBMIN ? (
+    mf = sb_fe / sbcnt; mk = sb_ke / sbcnt;
+    pe += 1; mf > act_thr ? pa += 1;
+    mf > pf ? pf = mf; mk > pk ? pk = mk;
+  );
+  gmem[b+26] = pf; gmem[b+27] = clipc; gmem[b+28] = pa; gmem[b+29] = pk; gmem[b+30] = pe;
 );
 function put_master() global(cur_mb,mke,mcnt,run,MBASE,MSTRIDE,ACC,gmem) local(b,bi) (
   b = MBASE + cur_mb * MSTRIDE;
@@ -2036,7 +2066,10 @@ ok = role ? 1 : (idx >= 0 && idx < MAXTR);
 t0 = play_position;
 run != last_run ? (
   last_run = run; cur_sec = -1; cur_mb = -1; exp_t = -1;
-  bq = gmem[185] > 0 ? gmem[185] : 0.6423;
+  cur_sb = -1; sbcnt = 0; sb_fe = 0; sb_ke = 0;
+  sb_maxf = 0; sb_maxk = 0; sb_act = 0; sb_elig = 0; clipc = 0; mclipc = 0; mpeak = 0;
+  act_thr = gmem[16]; clip_thr = gmem[17] > 0 ? gmem[17] : 1; mclip_thr = gmem[18] > 0 ? gmem[18] : 1;
+  bq =gmem[185] > 0 ? gmem[185] : 0.6423;
   bi = 0;
   loop(15,
     bo1 = tan($pi * EDG[bi] / srate);
@@ -2125,6 +2158,7 @@ active ? (
         memset(ACC, 0, 30);
       );
       mke += ke; mcnt += 1;
+      sb_pk = max(abs(spl0), abs(spl1)); sb_pk > mpeak ? mpeak = sb_pk; sb_pk >= mclip_thr ? mclipc += 1;
       !skip ? (
         mdx = (spl0 + spl1) * 0.5; sdx = (spl0 - spl1) * 0.5;
         bandrun(mdx, STM, ACC);
@@ -2151,19 +2185,27 @@ active ? (
         bsLL += xsl * xsl; bsRR += xsr * xsr; bsLR += xsl * xsr;
         acN += 1;
       );
-      n >= samplesblock - 1 ? put_master();
+      n >= samplesblock - 1 ? ( put_master(); gmem[19] = mclipc; gmem[20] = run; gmem[21] = mpeak; );
     ) : (
       sec = t | 0;
       sec != cur_sec ? (
+        sb_close();
         cur_sec >= 0 ? put_track();
         cur_sec = sec;
         pkl = 0; pkr = 0; sll = 0; srr = 0; slr = 0; ske = 0; scnt = 0;
         memset(ACC, 0, 15); sub_ll = 0; sub_rr = 0; sub_lr = 0;
+        sb_maxf = 0; sb_maxk = 0; sb_act = 0; sb_elig = 0; clipc = 0;
       );
+      nb = (t * 10) | 0;
+      nb != cur_sb ? ( sb_close(); cur_sb = nb; );
       a = abs(spl0); a > pkl ? pkl = a;
       a = abs(spl1); a > pkr ? pkr = a;
       sll += spl0 * spl0; srr += spl1 * spl1; slr += spl0 * spl1;
       ske += ke; scnt += 1;
+      sb_e = spl0 * spl0 + spl1 * spl1;
+      sb_fe += sb_e; sb_ke += ke; sbcnt += 1;
+      sb_pk = max(abs(spl0), abs(spl1));
+      sb_pk >= clip_thr ? clipc += 1;
       !skip ? (
         mdx = (spl0 + spl1) * 0.5;
         bandrun(mdx, STM, ACC);
@@ -2300,12 +2342,25 @@ end
 local function level_db(x) return x > 1e-9 and 20 * math.log(x, 10) or -144.0 end
 local function lufs(mean_square) return mean_square > 1e-12 and (-0.691 + 10 * math.log(mean_square, 10)) or -144.0 end
 
---- Reads every valid per-second record of one track and sums them up.
-local function summarize_track(idx, max_sec, run_id)
+--- Nearest-rank percentile (p = 0..100) of a list of numbers (sorts a copy); nil for an empty list.
+local function percentile(list, p)
+    local n = #list
+    if n == 0 then return nil end
+    local c = {}
+    for i = 1, n do c[i] = list[i] end
+    table.sort(c)
+    return c[math.max(1, math.ceil(p / 100 * n))]
+end
+local function median(list) return percentile(list, 50) end
+
+--- Reads every valid per-second record of one track and sums them up (seconds first_sec .. max_sec - 1, first_sec default 0).
+local function summarize_track(idx, max_sec, run_id, first_sec)
     local s = { secs = 0, first = -1, last = -1, samples = 0, ll = 0, rr = 0, lr = 0, ke = 0, peak = 0,
-        bands = {}, sub_ll = 0, sub_rr = 0, sub_lr = 0 } -- bands[1..15]: summed mid band energies
+        bands = {}, sub_ll = 0, sub_rr = 0, sub_lr = 0, clips = 0, viol_loud = 0, viol_act = 0 } -- bands[1..15]: summed mid band energies
     for k = 1, 15 do s.bands[k] = 0 end
-    for sec = 0, max_sec - 1 do
+    local srate = reaper.gmem_read(2)
+    local crest, max_loudf, max_loudk, sum_act, sum_elig = {}, 0, 0, 0, 0
+    for sec = first_sec or 0, max_sec - 1 do
         local b = MA_HDR + (idx * MA_MAXSEC + sec) * MA_STRIDE
         if reaper.gmem_read(b + 7) == run_id then
             s.secs = s.secs + 1
@@ -2321,8 +2376,32 @@ local function summarize_track(idx, max_sec, run_id)
             s.sub_ll = s.sub_ll + reaper.gmem_read(b + 23)
             s.sub_rr = s.sub_rr + reaper.gmem_read(b + 24)
             s.sub_lr = s.sub_lr + reaper.gmem_read(b + 25)
+
+            -- Stage 3: short-window dynamics of this second
+            local scnt, e_ll, e_rr = reaper.gmem_read(b + 6), reaper.gmem_read(b + 2), reaper.gmem_read(b + 3)
+            local loudf = reaper.gmem_read(b + MA_S_LOUDF)
+            local act, elig = reaper.gmem_read(b + MA_S_ACTIVE), reaper.gmem_read(b + MA_S_ELIG)
+            max_loudf = math.max(max_loudf, loudf)
+            max_loudk = math.max(max_loudk, reaper.gmem_read(b + MA_S_LOUDK))
+            sum_act, sum_elig = sum_act + act, sum_elig + elig
+            s.clips = s.clips + reaper.gmem_read(b + MA_S_CLIPS)
+            if act > elig then s.viol_act = s.viol_act + 1 end
+            if scnt > 0 then
+                local mean_fe = (e_ll + e_rr) / scnt -- mean(L^2 + R^2), same convention as the loudest-100 ms slot
+                local rms_db = level_db(math.sqrt(mean_fe / 2))
+                if scnt >= 0.999 * srate and mean_fe > 1e-12 and loudf < mean_fe * 10 ^ -0.01 then
+                    s.viol_loud = s.viol_loud + 1 -- loudest 100 ms more than 0.1 dB below the full second's own rms
+                end
+                if scnt >= 0.9 * srate and rms_db > MA_ACTIVE_DB then
+                    crest[#crest + 1] = level_db(math.max(reaper.gmem_read(b), reaper.gmem_read(b + 1))) - rms_db
+                end
+            end
         end
     end
+    s.crest_n, s.crest_med, s.crest_p90 = #crest, median(crest), percentile(crest, 90)
+    s.loud100_db = sum_elig > 0 and (max_loudf > 1e-12 and 10 * math.log(max_loudf / 2, 10) or -144.0) or nil
+    s.loudk100 = lufs(max_loudk)
+    s.act_pct = sum_elig > 0 and 100 * sum_act / sum_elig or nil
     return s
 end
 
@@ -2497,11 +2576,21 @@ local function run_collection_test(compare)
 
         -- Comparison needs the rendered file in the project; the normal test renders without adding it
         reaper.GetSetProjectInfo(0, "RENDER_ADDTOPROJ", compare and (render_opts | 1) or (render_opts & ~1), true)
+        -- Stage 3 thresholds (the JSFX reads them when the run id changes, so they go in before slot 9)
+        local master_vol = reaper.GetMediaTrackInfo_Value(reaper.GetMasterTrack(0), "D_VOL")
+        if master_vol < 1e-9 then master_vol = 1e9 end
+        reaper.gmem_write(MA_H_ACTIVE, 2 * 10 ^ (MA_ACTIVE_DB / 10))
+        reaper.gmem_write(MA_H_CLIP_TRK, MA_CLIP_THRESHOLD)
+        reaper.gmem_write(MA_H_CLIP_MST, MA_CLIP_THRESHOLD / master_vol)
+        reaper.gmem_write(MA_H_MCLIPS, 0)
+        reaper.gmem_write(MA_H_MSTAMP, 0)
+        reaper.gmem_write(MA_H_MPEAK, 0)
 		reaper.gmem_write(9, run_id)
         reaper.gmem_write(7, 0)
         reaper.gmem_write(6, 1)
         local render_t0 = reaper.time_precise()
-        reaper.Main_OnCommand(42230, 0)
+        -- 43349 = dry run render (no file written); the Lua DSP comparison needs the rendered file, so it keeps 42230
+        reaper.Main_OnCommand(compare and 42230 or 43349, 0)
         local render_s = reaper.time_precise() - render_t0
         reaper.gmem_write(6, 0)
 
@@ -2510,7 +2599,8 @@ local function run_collection_test(compare)
         local project_sr = reaper.GetSetProjectInfo(0, "PROJECT_SRATE", 0, false)
         out[#out + 1] = string.format("Project length %.1f s | project SR %d | JSFX reported SR %d | master seen: %s",
             proj_len, project_sr, reaper.gmem_read(2), reaper.gmem_read(10) == run_id and "yes" or "NO")
-        out[#out + 1] = string.format("Render time %.1f s (%.1fx realtime)", render_s, proj_len / math.max(render_s, 0.001))
+        out[#out + 1] = string.format("Render time %.1f s (%.1fx realtime, %s)", render_s, proj_len / math.max(render_s, 0.001),
+            compare and "normal render" or "dry run")
 
         local jsfx_sr = reaper.gmem_read(2)
         if jsfx_sr < 8000 then jsfx_sr = project_sr end
@@ -2567,10 +2657,38 @@ local function run_collection_test(compare)
             out[#out + 1] = line .. string.format("  %6.2f %5.2f", delta, subc)
         end
 
+        -- Stage 3: short-window dynamics (crest over active seconds, loudest 100 ms, active share, clipped frames)
+        local function num(v, w) return v and string.format("%" .. w .. ".1f", v) or string.format("%" .. w .. "s", "n/a") end
+        out[#out + 1] = "\nDYNAMICS (crest dB: all = overall peak - overall rms, med/p90 = per-second over active seconds)"
+        out[#out + 1] = " idx name                  crest(all) crest(med) crest(p90) loud100(dB) loudK100(LUFS) active%  clips"
+        local viol_loud, viol_act = 0, 0
+        for _, e in ipairs(sums) do
+            local s = e.s
+            local rms_all = level_db(math.sqrt((s.ll + s.rr) / (2 * math.max(s.samples, 1))))
+            out[#out + 1] = string.format("%4d %-24s %s %s %s %s %s %s %6d", e.t.idx, e.t.name:sub(1, 24),
+                num(level_db(s.peak) - rms_all, 10), num(s.crest_med, 10), num(s.crest_p90, 10),
+                num(s.loud100_db, 11), num(s.loudk100, 14), num(s.act_pct, 7), s.clips)
+            viol_loud, viol_act = viol_loud + s.viol_loud, viol_act + s.viol_act
+        end
+        out[#out + 1] = string.format("self-check: loudest100<rms violations %d, active>eligible violations %d", viol_loud, viol_act)
+
         local m = summarize_master(max_sec, run_id)
         local master_fader = level_db(reaper.GetMediaTrackInfo_Value(reaper.GetMasterTrack(0), "D_VOL"))
         out[#out + 1] = string.format("\nMASTER (pre-fader, fader = %.1f dB): valid 100 ms blocks %d | integrated %.1f LUFS | max momentary %.1f | max short-term %.1f",
             master_fader, m.valid_blocks, m.integrated, m.max_m, m.max_s)
+        -- Stage 3: max 100 ms K level (blocks with at least half of 100 ms), master peak/clips from the header slots
+        local max_100 = -144.0
+        for k = 0, math.min(18000, max_sec * 10) - 1 do
+            local b = MA_MBASE + k * MA_MSTRIDE
+            local cnt = reaper.gmem_read(b + 1)
+            if reaper.gmem_read(b + 2) == run_id and cnt >= 0.05 * jsfx_sr then
+                max_100 = math.max(max_100, lufs(reaper.gmem_read(b) / cnt))
+            end
+        end
+        local stamped = reaper.gmem_read(MA_H_MSTAMP) == run_id
+        out[#out + 1] = string.format("  max 100 ms K %.1f LUFS | peak %.1f dBFS post-fader | clip frames %s (|sample| >= %.2f post-fader) | master fader automation ignored",
+            max_100, stamped and (level_db(reaper.gmem_read(MA_H_MPEAK)) + master_fader) or -144.0,
+            stamped and string.format("%d", reaper.gmem_read(MA_H_MCLIPS)) or "n/a", MA_CLIP_THRESHOLD)
         if m.samples > 0 then
             local mline, sline = "  mid ", " side "
             for b = 1, 15 do
