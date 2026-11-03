@@ -1874,7 +1874,392 @@ local function poll_deep_seek_balance()
 end
 
 -- ==============================================================================
--- 10. UNIFIED CHATBOX & WORKFLOW CONTROLLER
+-- 10. JSFX DATA COLLECTION (STAGE 1: peaks, stereo sums, K-weighted energy, master 100 ms blocks)
+-- ==============================================================================
+
+local GMEM_NAME = "MixAssistant"
+local ANALYZER_FX_PATH = "JS:MixAssistant/mix_assistant_analyzer"
+-- gmem layout (must match the JSFX): header | per track-second records | master 100 ms blocks
+local MA_HDR, MA_MAXTR, MA_MAXSEC, MA_STRIDE, MA_MSTRIDE = 256, 128, 1800, 8, 4
+local MA_MBASE = MA_HDR + MA_MAXTR * MA_MAXSEC * MA_STRIDE
+local MA_MAGIC = 20261103
+
+local ANALYZER_JSFX = [==[
+desc:Mix Assistant Analyzer (temp)
+//MA_JSFX_VERSION=1
+options:gmem=MixAssistant
+
+slider1:0<0,127,1>Track index
+slider2:0<0,1,1{Track,Master}>Role
+
+in_pin:left input
+in_pin:right input
+out_pin:left output
+out_pin:right output
+
+@init
+MAGIC = 20261103; VERSION = 1;
+HDR = 256; MAXTR = 128; MAXSEC = 1800; STRIDE = 8;
+MBASE = HDR + MAXTR * MAXSEC * STRIDE; MSTRIDE = 4;
+gmem[0] = MAGIC; gmem[1] = VERSION;
+invsr = 1 / srate;
+
+// K-weighting (ITU-R BS.1770), coefficients designed for the real sample rate
+K = tan($pi * 1681.974450955533 / srate);
+Q = 0.7071752369554196;
+Vh = pow(10, 3.999843853973347 / 20);
+Vb = pow(Vh, 0.4996667741545416);
+a0 = 1 + K / Q + K * K;
+sb0 = (Vh + Vb * K / Q + K * K) / a0;
+sb1 = 2 * (K * K - Vh) / a0;
+sb2 = (Vh - Vb * K / Q + K * K) / a0;
+sa1 = 2 * (K * K - 1) / a0;
+sa2 = (1 - K / Q + K * K) / a0;
+K = tan($pi * 38.13547087602444 / srate);
+Q = 0.5003270373238773;
+a0 = 1 + K / Q + K * K;
+hb0 = 1; hb1 = -2; hb2 = 1;
+ha1 = 2 * (K * K - 1) / a0;
+ha2 = (1 - K / Q + K * K) / a0;
+
+cur_sec = -1; cur_mb = -1; last_run = -1;
+
+function shelf(x) instance(x1,x2,y1,y2) global(sb0,sb1,sb2,sa1,sa2) local(y) (
+  y = sb0*x + sb1*x1 + sb2*x2 - sa1*y1 - sa2*y2;
+  x2 = x1; x1 = x; y2 = y1; y1 = y;
+  y;
+);
+function hpf(x) instance(x1,x2,y1,y2) global(hb0,hb1,hb2,ha1,ha2) local(y) (
+  y = hb0*x + hb1*x1 + hb2*x2 - ha1*y1 - ha2*y2;
+  x2 = x1; x1 = x; y2 = y1; y1 = y;
+  y;
+);
+function put_track() global(idx,cur_sec,pkl,pkr,sll,srr,slr,ske,scnt,run,HDR,MAXSEC,STRIDE,gmem) local(b) (
+  b = HDR + (idx * MAXSEC + cur_sec) * STRIDE;
+  gmem[b] = pkl; gmem[b+1] = pkr; gmem[b+2] = sll; gmem[b+3] = srr;
+  gmem[b+4] = slr; gmem[b+5] = ske; gmem[b+6] = scnt; gmem[b+7] = run;
+);
+function put_master() global(cur_mb,mke,mcnt,run,MBASE,MSTRIDE,gmem) local(b) (
+  b = MBASE + cur_mb * MSTRIDE;
+  gmem[b] = mke; gmem[b+1] = mcnt; gmem[b+2] = run;
+);
+@slider
+idx = slider1 | 0;
+role = slider2 | 0;
+
+@block
+run = gmem[9];
+ok = role ? 1 : (idx >= 0 && idx < MAXTR);
+t0 = play_position;
+run != last_run ? ( last_run = run; cur_sec = -1; cur_mb = -1; exp_t = -1; );
+synced = (exp_t >= 0 && abs(t0 - exp_t) < 0.004) || abs(t0 - gmem[7]) < 0.05;
+exp_t = t0 + samplesblock * invsr;
+active = (gmem[6] == 1) && (run > 0) && ok && synced;
+n = 0;
+active ? (
+  role ? ( gmem[10] = run; ) : ( gmem[32 + idx] = run; );
+  gmem[2] = srate;
+);
+
+@sample
+active ? (
+  t = t0 + n * invsr;
+  (t >= 0 && t < MAXSEC) ? (
+    kl = hpl.hpf(shl.shelf(spl0));
+    kr = hpr.hpf(shr.shelf(spl1));
+    ke = kl * kl + kr * kr;
+    role ? (
+      mb = (t * 10) | 0;
+      mb != cur_mb ? (
+        cur_mb >= 0 ? put_master();
+        cur_mb = mb; mke = 0; mcnt = 0;
+      );
+      mke += ke; mcnt += 1;
+      n >= samplesblock - 1 ? put_master();
+    ) : (
+      sec = t | 0;
+      sec != cur_sec ? (
+        cur_sec >= 0 ? put_track();
+        cur_sec = sec;
+        pkl = 0; pkr = 0; sll = 0; srr = 0; slr = 0; ske = 0; scnt = 0;
+      );
+      a = abs(spl0); a > pkl ? pkl = a;
+      a = abs(spl1); a > pkr ? pkr = a;
+      sll += spl0 * spl0; srr += spl1 * spl1; slr += spl0 * spl1;
+      ske += ke; scnt += 1;
+      n >= samplesblock - 1 ? put_track();
+    );
+  );
+);
+n += 1;
+]==]
+
+local function analyzer_dir()
+    return reaper.GetResourcePath() .. PATH_SEPARATOR .. "Effects" .. PATH_SEPARATOR .. "MixAssistant"
+end
+
+local function write_analyzer_file()
+    local dir = analyzer_dir()
+    reaper.RecursiveCreateDirectory(dir, 0)
+    local path = dir .. PATH_SEPARATOR .. "mix_assistant_analyzer"
+    local f, err = io.open(path, "w")
+    if not f then return nil, "Cannot write analyzer file:\n" .. path .. "\n" .. tostring(err) end
+    f:write(ANALYZER_JSFX)
+    f:close()
+    return path
+end
+
+local function remove_analyzer_file()
+    os.remove(analyzer_dir() .. PATH_SEPARATOR .. "mix_assistant_analyzer")
+    os.remove(analyzer_dir()) -- only succeeds when empty
+end
+
+local function is_analyzer_name(name)
+    local n = (name or ""):lower()
+    return n:find("mix assistant analyzer", 1, true) ~= nil or n:find("mix_assistant_analyzer", 1, true) ~= nil
+end
+
+--- Deletes every analyzer instance (also leftovers from a crash). Returns how many were removed.
+local function remove_all_analyzers()
+    local removed = 0
+    local function sweep(track)
+        for i = reaper.TrackFX_GetCount(track) - 1, 0, -1 do
+            local _, name = reaper.TrackFX_GetFXName(track, i)
+            if is_analyzer_name(name) then
+                reaper.TrackFX_Delete(track, i)
+                removed = removed + 1
+            end
+        end
+    end
+    reaper.PreventUIRefresh(1)
+    sweep(reaper.GetMasterTrack(0))
+    for i = 0, reaper.CountTracks(0) - 1 do sweep(reaper.GetTrack(0, i)) end
+    reaper.PreventUIRefresh(-1)
+    return removed
+end
+
+--- True when the track's audio can reach the master (main/parent send, or a non-muted send on channels 1/2).
+local function reaches_master(track, memo)
+    if memo[track] ~= nil then return memo[track] end
+    memo[track] = false -- cycle guard
+    local result = false
+    if reaper.GetMediaTrackInfo_Value(track, "B_MAINSEND") == 1 then
+        local parent = reaper.GetParentTrack(track)
+        result = (parent == nil) or reaches_master(parent, memo)
+    end
+    if not result then
+        for s = 0, reaper.GetTrackNumSends(track, 0) - 1 do
+            local dest = reaper.GetTrackSendInfo_Value(track, 0, s, "P_DESTTRACK")
+            local send_muted = reaper.GetTrackSendInfo_Value(track, 0, s, "B_MUTE") == 1
+            local dst_chan = math.floor(reaper.GetTrackSendInfo_Value(track, 0, s, "I_DSTCHAN")) & 1023
+            if dest and dest ~= 0 and not send_muted and dst_chan < 2 and reaches_master(dest, memo) then
+                result = true
+                break
+            end
+        end
+    end
+    memo[track] = result
+    return result
+end
+
+local function should_analyze(track, has_children, memo)
+    if is_track_hierarchy_muted(track) then return false end
+    local can_sound = reaper.CountTrackMediaItems(track) > 0
+        or reaper.TrackFX_GetInstrument(track) >= 0
+        or reaper.GetTrackNumSends(track, -1) > 0
+        or has_children[track] == true
+    return can_sound and reaches_master(track, memo)
+end
+
+--- Adds one analyzer to every qualifying track (+ master). Returns list, skipped count | nil, error.
+local function inject_analyzers()
+    local num_tracks = reaper.CountTracks(0)
+    local has_children = {}
+    for i = 0, num_tracks - 1 do
+        local p = reaper.GetParentTrack(reaper.GetTrack(0, i))
+        if p then has_children[p] = true end
+    end
+
+    local list, skipped, memo, err = {}, 0, {}, nil
+    reaper.PreventUIRefresh(1)
+    for i = 0, num_tracks - 1 do
+        local track = reaper.GetTrack(0, i)
+        if i >= MA_MAXTR or not should_analyze(track, has_children, memo) then
+            skipped = skipped + 1
+        else
+            local fx = reaper.TrackFX_AddByName(track, ANALYZER_FX_PATH, false, -1)
+            if fx < 0 then
+                err = "TrackFX_AddByName could not find the analyzer JSFX (returned -1)."
+                break
+            end
+            reaper.TrackFX_SetParam(track, fx, 0, i)
+            reaper.TrackFX_SetParam(track, fx, 1, 0)
+            list[#list + 1] = { idx = i, name = get_track_identity(track) }
+        end
+    end
+    if not err then
+        local master = reaper.GetMasterTrack(0)
+        local fx = reaper.TrackFX_AddByName(master, ANALYZER_FX_PATH, false, -1)
+        if fx < 0 then
+            err = "Could not add the analyzer to the master track."
+        else
+            reaper.TrackFX_SetParam(master, fx, 0, 0)
+            reaper.TrackFX_SetParam(master, fx, 1, 1)
+        end
+    end
+    reaper.PreventUIRefresh(-1)
+
+    if err then return nil, nil, err end
+    return list, skipped
+end
+
+local function level_db(x) return x > 1e-9 and 20 * math.log(x, 10) or -144.0 end
+local function lufs(mean_square) return mean_square > 1e-12 and (-0.691 + 10 * math.log(mean_square, 10)) or -144.0 end
+
+--- Reads every valid per-second record of one track and sums them up.
+local function summarize_track(idx, max_sec, run_id)
+    local s = { secs = 0, first = -1, last = -1, samples = 0, ll = 0, rr = 0, lr = 0, ke = 0, peak = 0 }
+    for sec = 0, max_sec - 1 do
+        local b = MA_HDR + (idx * MA_MAXSEC + sec) * MA_STRIDE
+        if reaper.gmem_read(b + 7) == run_id then
+            s.secs = s.secs + 1
+            if s.first < 0 then s.first = sec end
+            s.last = sec
+            s.peak = math.max(s.peak, reaper.gmem_read(b), reaper.gmem_read(b + 1))
+            s.ll = s.ll + reaper.gmem_read(b + 2)
+            s.rr = s.rr + reaper.gmem_read(b + 3)
+            s.lr = s.lr + reaper.gmem_read(b + 4)
+            s.ke = s.ke + reaper.gmem_read(b + 5)
+            s.samples = s.samples + reaper.gmem_read(b + 6)
+        end
+    end
+    return s
+end
+
+--- Master loudness from the 100 ms K-weighted blocks (BS.1770: 400 ms momentary, 3 s short-term, two-stage gating).
+local function summarize_master(max_sec, run_id)
+    local nblk = math.min(18000, max_sec * 10)
+    local pe, pc, pv = { [0] = 0 }, { [0] = 0 }, { [0] = 0 }
+    for k = 0, nblk - 1 do
+        local b = MA_MBASE + k * MA_MSTRIDE
+        local ok = reaper.gmem_read(b + 2) == run_id
+        pe[k + 1] = pe[k] + (ok and reaper.gmem_read(b) or 0)
+        pc[k + 1] = pc[k] + (ok and reaper.gmem_read(b + 1) or 0)
+        pv[k + 1] = pv[k] + (ok and 1 or 0)
+    end
+
+    local function window_ms(k, len)
+        if k + len > nblk or pv[k + len] - pv[k] ~= len then return nil end
+        local c = pc[k + len] - pc[k]
+        return c > 0 and (pe[k + len] - pe[k]) / c or nil
+    end
+
+    local gated, max_m, max_s = {}, -144.0, -144.0
+    for k = 0, nblk - 4 do
+        local ms = window_ms(k, 4)
+        if ms then
+            max_m = math.max(max_m, lufs(ms))
+            if lufs(ms) > -70 then gated[#gated + 1] = ms end
+        end
+    end
+    for k = 0, nblk - 30 do
+        local ms = window_ms(k, 30)
+        if ms then max_s = math.max(max_s, lufs(ms)) end
+    end
+
+    local integrated = -144.0
+    if #gated > 0 then
+        local sum = 0
+        for _, ms in ipairs(gated) do sum = sum + ms end
+        local rel_gate = lufs(sum / #gated) - 10
+        local sum2, n2 = 0, 0
+        for _, ms in ipairs(gated) do
+            if lufs(ms) > rel_gate then sum2 = sum2 + ms; n2 = n2 + 1 end
+        end
+        if n2 > 0 then integrated = lufs(sum2 / n2) end
+    end
+    return { valid_blocks = pv[nblk], integrated = integrated, max_m = max_m, max_s = max_s }
+end
+
+--- Stage 1 test: inject -> render (nothing added to the project) -> read gmem -> print numbers -> clean up.
+local function run_collection_test()
+    reaper.ClearConsole()
+    remove_all_analyzers() -- leftovers from an earlier crash
+
+    local path, write_err = write_analyzer_file()
+    if not path then reaper.ShowMessageBox(write_err, "Analyzer file", 0) return end
+
+	reaper.Undo_BeginBlock2(0)
+    local render_opts = math.floor(reaper.GetSetProjectInfo(0, "RENDER_ADDTOPROJ", 0, false))
+    local out = {}
+
+    local ok, err = pcall(function()
+        reaper.gmem_attach(GMEM_NAME)
+
+        local top = 8388607
+        reaper.gmem_write(top, 12345.5)
+        out[#out + 1] = "gmem top index write/read: " .. (reaper.gmem_read(top) == 12345.5 and "OK" or "FAILED")
+        reaper.gmem_write(top, 0)
+
+        reaper.gmem_write(0, 0)
+        reaper.gmem_write(6, 0)
+        local run_id = math.floor(reaper.time_precise() * 1000) % 2000000000 + 1
+
+        local tracks, skipped, inject_err = inject_analyzers()
+        if not tracks then error(inject_err, 0) end
+        out[#out + 1] = string.format("Analyzers: %d tracks + master (%d tracks skipped)", #tracks, skipped)
+        out[#out + 1] = "JSFX handshake after injection: " .. (reaper.gmem_read(0) == MA_MAGIC and "yes" or "no (advisory only)")
+
+        -- Render without adding the result to the project (nothing to undo or delete afterwards)
+        reaper.GetSetProjectInfo(0, "RENDER_ADDTOPROJ", render_opts & ~1, true)
+		reaper.gmem_write(9, run_id)
+        reaper.gmem_write(7, 0)
+        reaper.gmem_write(6, 1)
+        reaper.Main_OnCommand(42230, 0)
+        reaper.gmem_write(6, 0)
+
+        local proj_len = reaper.GetProjectLength(0)
+        local max_sec = math.min(MA_MAXSEC, math.ceil(proj_len) + 2)
+        local project_sr = reaper.GetSetProjectInfo(0, "PROJECT_SRATE", 0, false)
+        out[#out + 1] = string.format("Project length %.1f s | project SR %d | JSFX reported SR %d | master seen: %s",
+            proj_len, project_sr, reaper.gmem_read(2), reaper.gmem_read(10) == run_id and "yes" or "NO")
+
+        out[#out + 1] = "\n idx name                      secs  first-last   samples   peak   Kdb   corr"
+		for _, t in ipairs(tracks) do
+            local s = summarize_track(t.idx, max_sec, run_id)
+            if s.secs == 0 then
+                out[#out + 1] = string.format("%4d %-24s  NO DATA", t.idx, t.name:sub(1, 24))
+            else
+                local corr = (s.ll * s.rr > 0) and (s.lr / math.sqrt(s.ll * s.rr)) or 1
+                out[#out + 1] = string.format("%4d %-24s %5d  %4d-%-5d %9d  %6.1f %6.1f  %5.2f",
+                    t.idx, t.name:sub(1, 24), s.secs, s.first, s.last, s.samples,
+                    level_db(s.peak), lufs(s.ke / s.samples), corr)
+            end
+        end
+
+        local m = summarize_master(max_sec, run_id)
+        local master_fader = level_db(reaper.GetMediaTrackInfo_Value(reaper.GetMasterTrack(0), "D_VOL"))
+        out[#out + 1] = string.format("\nMASTER (pre-fader, fader = %.1f dB): valid 100 ms blocks %d | integrated %.1f LUFS | max momentary %.1f | max short-term %.1f",
+            master_fader, m.valid_blocks, m.integrated, m.max_m, m.max_s)
+    end)
+
+    -- Cleanup ALWAYS runs (success, error or cancelled render)
+    reaper.gmem_write(6, 0)
+    remove_all_analyzers()
+    remove_analyzer_file()
+    reaper.GetSetProjectInfo(0, "RENDER_ADDTOPROJ", render_opts, true)
+    reaper.UpdateArrange()
+
+	local block_name = "Mix Assistant temp collection"
+    reaper.Undo_EndBlock2(0, block_name, -1)
+    if reaper.Undo_CanUndo2(0) == block_name then reaper.Undo_DoUndo2(0) end
+
+    if not ok then out[#out + 1] = "ERROR: " .. tostring(err) end
+    reaper.ShowConsoleMsg(table.concat(out, "\n") .. "\n")
+end
+
+-- ==============================================================================
+-- 11. UNIFIED CHATBOX & WORKFLOW CONTROLLER
 -- ==============================================================================
 
 local function render_role_badge(ctx, label, bg_color, text_color, id)
@@ -2257,7 +2642,11 @@ local function main()
             if is_busy then reaper.ImGui_EndDisabled(ctx) end
             reaper.ImGui_Separator(ctx)
 
-            -- 2. Strict Frame Delay & Click-Absorption Cooldown
+			if reaper.ImGui_SmallButton(ctx, "JSFX Collection Test (Stage 1)") and not is_busy then
+                run_collection_test()
+            end
+
+			-- 2. Strict Frame Delay & Click-Absorption Cooldown
             if btn_clicked and not is_busy then
                 table.insert(chat_history, {
                     role = "assistant",
