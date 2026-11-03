@@ -1899,6 +1899,15 @@ local B15_NAMES = { "rumble", "deep sub", "sub", "bass/punch", "body/warmth", "m
 -- The filter is designed from the pre-warped edges, so this holds at any sample rate (sent to the JSFX in gmem[185]).
 local B15_C = 0.6423
 
+-- Stage 4 (feeding the JSFX data to the AI): all constants in ONE table to spare top-level locals.
+local MA_A = {
+    TOP_N = 6, NOTABLE_DB = 3, BAND_RANGE_DB = 30, REGION_DEV_DB = 3, MASK_SHARE = 0.25, MASK_PAN = 100,
+    ACTIVE_MIN_PCT = 5, ENV_APPROX_DB = 6, PAN_AUTO = 50, TOKEN_CEILING = 8000,
+    ENV_MULT = true, -- true: an active Volume envelope multiplies the fader (D_VOL); false: it replaces the fader (tested: multiplies; removed in task 4c)
+    PAN_ENV_SIGN = 1, -- -1 if a Pan envelope value turns out to have the opposite sign of the pan position
+    KEYS = { "rmb", "dsub", "sub", "bass", "body", "mud", "boxy", "honk", "nasal", "bite", "pres", "harsh", "sib", "sizz", "air" },
+}
+
 --- Biquad of one band stage (b1 = 0, b2 = -b0); the JSFX uses the same maths.
 local function band15_coefs(b, sr)
     local o1 = math.tan(math.pi * B15_EDGES[b] / sr)
@@ -2354,37 +2363,48 @@ end
 local function median(list) return percentile(list, 50) end
 
 --- Reads every valid per-second record of one track and sums them up (seconds first_sec .. max_sec - 1, first_sec default 0).
-local function summarize_track(idx, max_sec, run_id, first_sec)
+-- opts (optional, stage 4 region use): gain2[sec] = automation energy factor, weight[sec] = share of that second inside the region (0..1),
+-- tie_sec = the second where a weight of exactly 0.5 counts as the larger part. Without opts the result is the plain sum.
+local function summarize_track(idx, max_sec, run_id, first_sec, opts)
     local s = { secs = 0, first = -1, last = -1, samples = 0, ll = 0, rr = 0, lr = 0, ke = 0, peak = 0,
         bands = {}, sub_ll = 0, sub_rr = 0, sub_lr = 0, clips = 0, viol_loud = 0, viol_act = 0 } -- bands[1..15]: summed mid band energies
     for k = 1, 15 do s.bands[k] = 0 end
+    if opts then s.wsecs = 0 end -- total weight of the seconds used
+    local gain2, weight = opts and opts.gain2, opts and opts.weight
     local srate = reaper.gmem_read(2)
     local crest, max_loudf, max_loudk, sum_act, sum_elig = {}, 0, 0, 0, 0
     for sec = first_sec or 0, max_sec - 1 do
         local b = MA_HDR + (idx * MA_MAXSEC + sec) * MA_STRIDE
-        if reaper.gmem_read(b + 7) == run_id then
+        if reaper.gmem_read(b + 7) == run_id and (not weight or (weight[sec] or 0) > 0) then
+            local w = weight and weight[sec] or 1
+            local g = gain2 and gain2[sec] or 1 -- automation energy factor
+            local gs, wg = math.sqrt(g), w * g
+            local major = w > 0.5 or (w == 0.5 and sec == (opts and opts.tie_sec)) -- maxima, crest and clips belong to the larger part
             s.secs = s.secs + 1
+            if opts then s.wsecs = s.wsecs + w end
             if s.first < 0 then s.first = sec end
             s.last = sec
-            s.peak = math.max(s.peak, reaper.gmem_read(b), reaper.gmem_read(b + 1))
-            s.ll = s.ll + reaper.gmem_read(b + 2)
-            s.rr = s.rr + reaper.gmem_read(b + 3)
-            s.lr = s.lr + reaper.gmem_read(b + 4)
-            s.ke = s.ke + reaper.gmem_read(b + 5)
-            s.samples = s.samples + reaper.gmem_read(b + 6)
-            for k = 1, 15 do s.bands[k] = s.bands[k] + reaper.gmem_read(b + 7 + k) end
-            s.sub_ll = s.sub_ll + reaper.gmem_read(b + 23)
-            s.sub_rr = s.sub_rr + reaper.gmem_read(b + 24)
-            s.sub_lr = s.sub_lr + reaper.gmem_read(b + 25)
+            if major then s.peak = math.max(s.peak, reaper.gmem_read(b) * gs, reaper.gmem_read(b + 1) * gs) end
+            s.ll = s.ll + reaper.gmem_read(b + 2) * wg
+            s.rr = s.rr + reaper.gmem_read(b + 3) * wg
+            s.lr = s.lr + reaper.gmem_read(b + 4) * wg
+            s.ke = s.ke + reaper.gmem_read(b + 5) * wg
+            s.samples = s.samples + reaper.gmem_read(b + 6) * w
+            for k = 1, 15 do s.bands[k] = s.bands[k] + reaper.gmem_read(b + 7 + k) * wg end
+            s.sub_ll = s.sub_ll + reaper.gmem_read(b + 23) * wg
+            s.sub_rr = s.sub_rr + reaper.gmem_read(b + 24) * wg
+            s.sub_lr = s.sub_lr + reaper.gmem_read(b + 25) * wg
 
             -- Stage 3: short-window dynamics of this second
             local scnt, e_ll, e_rr = reaper.gmem_read(b + 6), reaper.gmem_read(b + 2), reaper.gmem_read(b + 3)
             local loudf = reaper.gmem_read(b + MA_S_LOUDF)
             local act, elig = reaper.gmem_read(b + MA_S_ACTIVE), reaper.gmem_read(b + MA_S_ELIG)
-            max_loudf = math.max(max_loudf, loudf)
-            max_loudk = math.max(max_loudk, reaper.gmem_read(b + MA_S_LOUDK))
-            sum_act, sum_elig = sum_act + act, sum_elig + elig
-            s.clips = s.clips + reaper.gmem_read(b + MA_S_CLIPS)
+            if major then
+                max_loudf = math.max(max_loudf, loudf * g)
+                max_loudk = math.max(max_loudk, reaper.gmem_read(b + MA_S_LOUDK) * g)
+                s.clips = s.clips + reaper.gmem_read(b + MA_S_CLIPS)
+            end
+            sum_act, sum_elig = sum_act + act * w, sum_elig + elig * w
             if act > elig then s.viol_act = s.viol_act + 1 end
             if scnt > 0 then
                 local mean_fe = (e_ll + e_rr) / scnt -- mean(L^2 + R^2), same convention as the loudest-100 ms slot
@@ -2392,7 +2412,7 @@ local function summarize_track(idx, max_sec, run_id, first_sec)
                 if scnt >= 0.999 * srate and mean_fe > 1e-12 and loudf < mean_fe * 10 ^ -0.01 then
                     s.viol_loud = s.viol_loud + 1 -- loudest 100 ms more than 0.1 dB below the full second's own rms
                 end
-                if scnt >= 0.9 * srate and rms_db > MA_ACTIVE_DB then
+                if major and scnt >= 0.9 * srate and rms_db > MA_ACTIVE_DB then
                     crest[#crest + 1] = level_db(math.max(reaper.gmem_read(b), reaper.gmem_read(b + 1))) - rms_db
                 end
             end
@@ -2406,15 +2426,18 @@ local function summarize_track(idx, max_sec, run_id, first_sec)
 end
 
 --- Master loudness from the 100 ms K-weighted blocks (BS.1770: 400 ms momentary, 3 s short-term, two-stage gating).
-local function summarize_master(max_sec, run_id)
+-- blk0, blk1 (optional, inclusive): only this block range counts (a region); windows must lie fully inside it. Default: whole song.
+local function summarize_master(max_sec, run_id, blk0, blk1)
     local nblk = math.min(18000, max_sec * 10)
+    blk0 = blk0 or 0
+    blk1 = blk1 and math.min(blk1, nblk - 1) or nblk - 1
     local pe, pc, pv = { [0] = 0 }, { [0] = 0 }, { [0] = 0 }
     local mid_e, side_e = {}, {} -- summed band energies of the valid blocks
     for i = 1, 15 do mid_e[i], side_e[i] = 0, 0 end
     for k = 0, nblk - 1 do
         local b = MA_MBASE + k * MA_MSTRIDE
         local ok = reaper.gmem_read(b + 2) == run_id
-        if ok then
+        if ok and k >= blk0 and k <= blk1 then
             for i = 1, 15 do
                 mid_e[i] = mid_e[i] + reaper.gmem_read(b + 2 + i)
                 side_e[i] = side_e[i] + reaper.gmem_read(b + 17 + i)
@@ -2426,22 +2449,38 @@ local function summarize_master(max_sec, run_id)
     end
 
     local function window_ms(k, len)
-        if k + len > nblk or pv[k + len] - pv[k] ~= len then return nil end
+        if k < blk0 or k + len - 1 > blk1 or pv[k + len] - pv[k] ~= len then return nil end
         local c = pc[k + len] - pc[k]
         return c > 0 and (pe[k + len] - pe[k]) / c or nil
     end
 
-    local gated, max_m, max_s = {}, -144.0, -144.0
-    for k = 0, nblk - 4 do
+    local gated, short, max_m, max_s = {}, {}, -144.0, -144.0
+    for k = blk0, blk1 - 3 do
         local ms = window_ms(k, 4)
         if ms then
             max_m = math.max(max_m, lufs(ms))
             if lufs(ms) > -70 then gated[#gated + 1] = ms end
         end
     end
-    for k = 0, nblk - 30 do
+    for k = blk0, blk1 - 29 do
         local ms = window_ms(k, 30)
-        if ms then max_s = math.max(max_s, lufs(ms)) end
+        if ms then
+            max_s = math.max(max_s, lufs(ms))
+            if lufs(ms) > -70 then short[#short + 1] = ms end -- absolute gate for the loudness range
+        end
+    end
+
+    -- Loudness range (EBU Tech 3342): short-term values every 100 ms, relative gate 20 LU below their power mean, LRA = p95 - p10
+    local lra
+    if #short > 0 then
+        local sum = 0
+        for _, ms in ipairs(short) do sum = sum + ms end
+        local rel_gate = lufs(sum / #short) - 20
+        local lv = {}
+        for _, ms in ipairs(short) do
+            if lufs(ms) > rel_gate then lv[#lv + 1] = lufs(ms) end
+        end
+        if #lv >= 2 then lra = percentile(lv, 95) - percentile(lv, 10) end
     end
 
     local integrated = -144.0
@@ -2455,8 +2494,562 @@ local function summarize_master(max_sec, run_id)
         end
         if n2 > 0 then integrated = lufs(sum2 / n2) end
     end
-    return { valid_blocks = pv[nblk], integrated = integrated, max_m = max_m, max_s = max_s,
-        samples = pc[nblk], mid = mid_e, side = side_e }
+    return { valid_blocks = pv[blk1 + 1] - pv[blk0], integrated = integrated, max_m = max_m, max_s = max_s,
+        samples = pc[blk1 + 1] - pc[blk0], mid = mid_e, side = side_e, ke = pe[blk1 + 1] - pe[blk0], lra = lra }
+end
+
+-- ------------------------------------------------------------------------------
+-- Stage 4, task 4a: routing, region aggregation, contribution model (console output only, no AI yet)
+-- ------------------------------------------------------------------------------
+
+--- Left/right gain of REAPER's pan at position pos (-1 = left .. +1 = right) for a pan law given as the linear centre gain
+-- (1 = 0 dB, 0.707 = -3 dB, 0.5 = -6 dB). Only the classic (0) and balance (3) modes are reproduced; any other mode gets the centre gains.
+-- The ReaScript docs give no formulas: 0 dB law = balance (min(1, 2x)), -3 dB = sine, -6 dB = linear, other laws are interpolated.
+local function pan_gains(pos, mode, law)
+    if mode ~= 0 and mode ~= 3 then pos = 0 end
+    law = math.min(1, math.max(0.5, law))
+    local function f(x)
+        local lin, sn, bal = x, math.sin(x * math.pi / 2), math.min(1, 2 * x)
+        if law >= 0.7071 then return sn + (bal - sn) * (law - 0.7071) / 0.2929 end
+        return lin + (sn - lin) * (law - 0.5) / 0.2071
+    end
+    local x = (math.max(-1, math.min(1, pos)) + 1) / 2
+    return f(1 - x), f(x)
+end
+
+--- Role, main-path gain, pan, automation and approximation reasons of every analyzed track (A1.1, A1.2).
+-- tracks = the list from inject_analyzers. Returns routing[track idx], project pan law (linear), where the law came from.
+local function track_routing(tracks, max_sec)
+    local function gmi(tr, key) return reaper.GetMediaTrackInfo_Value(tr, key) end
+
+    -- Project default pan law and pan mode are not in the ReaScript API: read them from the saved project file (header lines PANLAW / PANMODE)
+    local proj_law, proj_mode, law_src = 1.0, 3, "assumed default"
+    local _, proj_file = reaper.EnumProjects(-1)
+    local fh = (proj_file and proj_file ~= "") and io.open(proj_file, "r") or nil
+    if fh then
+        local n = 0
+        for line in fh:lines() do
+            n = n + 1
+            if n > 300 or line:match("^%s*<TRACK") then break end
+            local v = tonumber(line:match("^%s*PANLAW%s+(%S+)"))
+            if v then proj_law, law_src = v, "project file" end
+            v = tonumber(line:match("^%s*PANMODE%s+(%S+)"))
+            if v then proj_mode = v end
+        end
+        fh:close()
+    end
+
+    local sr = reaper.GetSetProjectInfo(0, "PROJECT_SRATE", 0, false)
+    if sr < 8000 then sr = 44100 end
+    local has_children = {}
+    for i = 0, reaper.CountTracks(0) - 1 do
+        local p = reaper.GetParentTrack(reaper.GetTrack(0, i))
+        if p then has_children[p] = true end
+    end
+
+    -- Active (not bypassed) envelope of that name, or nil
+    local function active_env(tr, name)
+        local env = reaper.GetTrackEnvelopeByName(tr, name)
+        if not env then return nil end
+        local _, act = reaper.GetSetEnvelopeInfo_String(env, "ACTIVE", "", false)
+        return act == "1" and env or nil
+    end
+
+    -- Pan position (-1..1), left/right gain, whether those gains reproduce REAPER's pan exactly, mode, law
+    local function pan_state(tr)
+        local mode = math.floor(gmi(tr, "I_PANMODE") + 0.5)
+        if mode < 0 then mode = proj_mode end
+        local law = gmi(tr, "D_PANLAW")
+        if law < 0 then law = proj_law end
+        local pos, exact = gmi(tr, "D_PAN"), true
+        if mode == 6 then
+            local dl, dr = gmi(tr, "D_DUALPANL"), gmi(tr, "D_DUALPANR")
+            pos, exact = (dl + dr) / 2, math.abs(dl + 1) < 0.005 and math.abs(dr - 1) < 0.005 -- default dual pan = hard L + hard R = unity
+        elseif mode ~= 0 and mode ~= 3 then
+            exact = math.abs(pos) < 0.005
+        end
+        if math.abs(gmi(tr, "D_WIDTH") - 1) > 0.005 then exact = false end
+        local gl, gr = pan_gains(pos, mode, law)
+        return pos, gl, gr, exact, mode, law
+    end
+
+    local routing = {}
+    for _, t in ipairs(tracks) do
+        local tr = reaper.GetTrack(0, t.idx)
+        local r = { reasons = {}, song_flags = {} }
+        routing[t.idx] = r
+        r.role = has_children[tr] and "bus" or "trk" -- "bus" = folder bus, never ranked (it would double-count its children); send buses ("sbus") are set after this loop
+
+        -- Fader gain along the main path: own fader x every parent's fader, as long as each track sends to its parent
+        local lin, cur, send_only, p_env, p_pan = 1, tr, false, false, false
+        while cur do
+            lin = lin * gmi(cur, "D_VOL")
+            if cur ~= tr then
+                if active_env(cur, "Volume") or active_env(cur, "Trim Volume") then p_env = true end
+                local pp, _, _, pex = pan_state(cur)
+                if math.abs(pp) >= 0.005 or not pex then p_pan = true end
+            end
+            if gmi(cur, "B_MAINSEND") ~= 1 then send_only = true break end
+            cur = reaper.GetParentTrack(cur)
+        end
+        r.gain_db = level_db(lin)
+
+        local pos, gl, gr, exact, mode, law = pan_state(tr)
+        local pan_env = active_env(tr, "Pan")
+        if pan_env and mode ~= 0 and mode ~= 3 then exact = false end
+        r.pos, r.gl, r.gr, r.mode, r.law = pos, gl, gr, mode, law
+        r.pan100 = pos >= 0 and math.floor(pos * 100 + 0.5) or -math.floor(-pos * 100 + 0.5)
+        -- No direct path to the master (main send off somewhere on the chain, or a fader at -inf): the track is not counted at all.
+        -- Whatever it feeds through sends is measured on the receiving tracks.
+        r.no_direct = send_only and "send-only" or (r.gain_db <= -100 and "fader off" or nil)
+        if p_env then r.reasons[#r.reasons + 1] = "parent env" end
+        if p_pan then r.reasons[#r.reasons + 1] = "parent pan" end
+        if not exact then r.reasons[#r.reasons + 1] = "pan mode" end
+
+        -- Volume / Trim Volume automation: energy factor per second, sampled in the middle of the second
+        local venv, tenv = active_env(tr, "Volume"), active_env(tr, "Trim Volume")
+        if venv or tenv then
+            local fader = gmi(tr, "D_VOL")
+            local vm = venv and reaper.GetEnvelopeScalingMode(venv)
+            local tm = tenv and reaper.GetEnvelopeScalingMode(tenv)
+            local lo, hi = math.huge, -math.huge
+            r.gain2 = {}
+            for sec = 0, max_sec - 1 do
+                local ga, g = 1, 1 -- ga = envelope gain as REAPER reads it, g = factor on top of the fader (what gain_db does not contain)
+                if venv then
+                    local _, v = reaper.Envelope_Evaluate(venv, sec + 0.5, sr, 1)
+                    ga = reaper.ScaleFromEnvelopeMode(vm, v)
+                    g = MA_A.ENV_MULT and ga or (fader > 1e-9 and ga / fader or 0)
+                end
+                if tenv then
+                    local _, v = reaper.Envelope_Evaluate(tenv, sec + 0.5, sr, 1)
+                    local tv = reaper.ScaleFromEnvelopeMode(tm, v)
+                    ga, g = ga * tv, g * tv
+                end
+                r.gain2[sec] = g * g
+                local db = level_db(ga)
+                lo, hi = math.min(lo, db), math.max(hi, db)
+            end
+            r.env_min, r.env_max = lo, hi
+            if hi - lo > MA_A.ENV_APPROX_DB then r.song_flags[#r.song_flags + 1] = "auto" end
+        end
+        if pan_env then
+            local lo, hi = 1, -1
+            r.pan_sec = {}
+            for sec = 0, max_sec - 1 do
+                local _, v = reaper.Envelope_Evaluate(pan_env, sec + 0.5, sr, 1)
+                v = math.max(-1, math.min(1, v * MA_A.PAN_ENV_SIGN))
+                r.pan_sec[sec] = v
+                lo, hi = math.min(lo, v), math.max(hi, v)
+            end
+            r.pan_min, r.pan_max = lo, hi
+            if (hi - lo) * 100 > MA_A.PAN_AUTO then r.song_flags[#r.song_flags + 1] = "auto pan" end
+        end
+    end
+    -- Send buses (parallel / FX / return): no media items, no instrument, and an unmuted send into channels 1/2 from a track that itself
+    -- reaches the master. Sidechain-only receives and multi-out hosts (whose only sender has no direct path) do not make a send bus.
+    for _, t in ipairs(tracks) do
+        local r = routing[t.idx]
+        local tr = reaper.GetTrack(0, t.idx)
+        if r.role == "trk" and not r.no_direct and reaper.CountTrackMediaItems(tr) == 0 and reaper.TrackFX_GetInstrument(tr) < 0 then
+            for k = 0, reaper.GetTrackNumSends(tr, -1) - 1 do
+                local src = reaper.GetTrackSendInfo_Value(tr, -1, k, "P_SRCTRACK")
+                local dst = math.floor(reaper.GetTrackSendInfo_Value(tr, -1, k, "I_DSTCHAN")) & 1023
+                local sr_ = src and src ~= 0 and routing[math.floor(gmi(src, "IP_TRACKNUMBER")) - 1] or nil
+                if reaper.GetTrackSendInfo_Value(tr, -1, k, "B_MUTE") ~= 1 and dst < 2 and sr_ and not sr_.no_direct then
+                    r.role = "sbus"
+                    break
+                end
+            end
+        end
+    end
+    return routing, proj_law, law_src
+end
+
+--- Notable bands of a track (15 dB values): a band stands out against the mean of its two neighbours (the end bands: against their
+-- single neighbour, bumps only). Bands more than BAND_RANGE_DB below the loudest band are ignored. Returns { {key=, dev=, band=}, ... } low to high.
+local function notable_bands(levels)
+    local top = -1e9
+    for b = 1, 15 do top = math.max(top, levels[b]) end
+    local floor_db = top - MA_A.BAND_RANGE_DB
+    local function lv(b) return math.max(levels[b], floor_db) end
+    local list = {}
+    for b = 1, 15 do
+        if levels[b] >= floor_db then
+            local edge = (b == 1 or b == 15)
+            local dev
+            if b == 1 then dev = lv(1) - lv(2)
+            elseif b == 15 then dev = lv(15) - lv(14)
+            else dev = lv(b) - (lv(b - 1) + lv(b + 1)) / 2 end
+            if (edge and dev or math.abs(dev)) >= MA_A.NOTABLE_DB - 1e-9 then
+                list[#list + 1] = { key = MA_A.KEYS[b], dev = dev, band = b }
+            end
+        end
+    end
+    return list
+end
+
+--- Region and song aggregation (A1.3-A1.5): master numbers per region, per-track stats, K-energy share, top-N selection,
+-- masking hints and the approx list. Returns D = { song, over = {stats per track, whole song}, regions = {...}, ... } | nil, error.
+local function collect_region_data(tracks, route, max_sec, run_id, offsets)
+    local proj_len = reaper.GetProjectLength(0)
+    local song = summarize_master(max_sec, run_id)
+    if song.samples <= 0 then return nil, "the master has no valid data" end
+    song.mid_db, song.side_db = {}, {}
+    for b = 1, 15 do
+        song.mid_db[b] = convert_energy_to_db(song.mid[b], song.samples, offsets[b])
+        song.side_db[b] = convert_energy_to_db(song.side[b], song.samples, offsets[b])
+    end
+    local D = { song = song, over = {}, regions = {}, proj_len = proj_len, tracks_with_data = 0, dropped = 0 }
+
+    -- Region pan: median of the sampled Pan envelope inside the window; also whether it moves more than PAN_AUTO
+    local function pick_pan(r, w, s0, s1)
+        if not r.pan_sec then return r.pos, r.gl, r.gr, false end
+        local list, lo, hi = {}, 1, -1
+        for sec = s0, s1 - 1 do
+            local v = r.pan_sec[sec]
+            if v and (not w or (w[sec] or 0) > 0) then
+                list[#list + 1] = v
+                lo, hi = math.min(lo, v), math.max(hi, v)
+            end
+        end
+        if #list == 0 then return r.pos, r.gl, r.gr, false end
+        local pos = median(list)
+        local gl, gr = pan_gains(pos, r.mode, r.law)
+        return pos, gl, gr, (hi - lo) * 100 > MA_A.PAN_AUTO
+    end
+
+    -- Range (dB) of the Volume/Trim automation inside the window
+    local function env_range(r, w, s0, s1)
+        if not r.gain2 then return 0 end
+        local lo, hi = math.huge, -math.huge
+        for sec = s0, s1 - 1 do
+            local g = r.gain2[sec]
+            if g and (not w or (w[sec] or 0) > 0) then
+                local db = level_db(math.sqrt(g))
+                lo, hi = math.min(lo, db), math.max(hi, db)
+            end
+        end
+        return hi > lo and hi - lo or 0
+    end
+
+    -- Stats of one track over seconds s0 .. s1 - 1 (w = region weights or nil); nil when the track has no data there
+    local function window(r, t, s0, s1, w, master_ke)
+        local opts = (r.gain2 or w) and { gain2 = r.gain2, weight = w, tie_sec = s0 } or nil
+        local s = summarize_track(t.idx, s1, run_id, s0, opts)
+        if s.secs == 0 or s.samples <= 0 then return nil end
+        local pos, gl, gr, auto_pan = pick_pan(r, w, s0, s1)
+        local d = { s = s, t = t, r = r }
+        local mean_ke = s.ke / s.samples
+        d.L = lufs(mean_ke) + r.gain_db
+        d.pk = level_db(s.peak) + r.gain_db
+        d.crest, d.act = s.crest_med, s.act_pct
+        local mm, ss = (s.ll + s.rr + 2 * s.lr) / 4, (s.ll + s.rr - 2 * s.lr) / 4
+        local rm, rs = math.sqrt(math.max(mm, 0)), math.sqrt(math.max(ss, 0))
+        d.width = (rm + rs) > 0 and 100 * rs / (rm + rs) or 0
+        d.corr = (s.ll * s.rr > 0) and s.lr / math.sqrt(s.ll * s.rr) or 1
+        local sub_corr = (s.sub_ll * s.sub_rr > 0) and s.sub_lr / math.sqrt(s.sub_ll * s.sub_rr) or 1
+        d.sub_risk = convert_energy_to_db((s.sub_ll + s.sub_rr) / 2, s.samples) > -50.0 and sub_corr < 0
+        d.bands = {}
+        for b = 1, 15 do d.bands[b] = convert_energy_to_db(s.bands[b], s.samples, offsets[b]) end
+        d.notable = notable_bands(d.bands)
+        -- pan energy factor from the track's own L/R energies, then the energy this track puts on the master input
+        local fp = (s.ll + s.rr) > 0 and (gl * gl * s.ll + gr * gr * s.rr) / (s.ll + s.rr) or (gl * gl + gr * gr) / 2
+        d.gain_lin = 10 ^ (r.gain_db / 10) * fp
+        d.num = mean_ke * d.gain_lin -- energy this track puts on the master input
+        d.master_pct = master_ke > 0 and 100 * d.num / master_ke or 0 -- as a share of the measured master (does not add up to 100)
+        d.pan100 = pos >= 0 and math.floor(pos * 100 + 0.5) or -math.floor(-pos * 100 + 0.5)
+        d.reasons = {}
+        for _, x in ipairs(r.reasons) do d.reasons[#d.reasons + 1] = x end
+        if env_range(r, w, s0, s1) > MA_A.ENV_APPROX_DB then d.reasons[#d.reasons + 1] = "auto" end
+        if auto_pan then d.reasons[#d.reasons + 1] = "auto pan" end
+        return d
+    end
+
+    -- Shares are normalised: each track's energy as a percentage of all non-bus tracks together (they add up to 100), so master FX and
+    -- bus processing, which the track analyzers cannot see, do not scale the numbers. Buses get a share too but are not part of the total.
+    local function normalise(list)
+        local tot = 0
+        for _, d in ipairs(list) do if d.r.role ~= "bus" then tot = tot + d.num end end
+        for _, d in ipairs(list) do d.share = tot > 0 and 100 * d.num / tot or 0 end
+    end
+
+    -- Tracks with a direct path to the master; the others are not counted (see track_routing)
+    local live = {}
+    for _, t in ipairs(tracks) do
+        if route[t.idx].no_direct then D.dropped = D.dropped + 1 else live[#live + 1] = t end
+    end
+
+    -- Whole song (also the seconds between regions)
+    local song_ke = song.ke / song.samples
+    for _, t in ipairs(live) do
+        local d = window(route[t.idx], t, 0, max_sec, nil, song_ke)
+        if d then
+            D.over[#D.over + 1] = d
+            D.tracks_with_data = D.tracks_with_data + 1
+        end
+    end
+    normalise(D.over)
+
+    -- Regions (without regions: the whole song as one region); region ends are clipped to the project length
+    local regs = {}
+    for _, e in ipairs(get_arrangement_markers() or {}) do
+        local e_end = e.end_s and math.min(e.end_s, proj_len)
+        if e_end and e_end > e.start_s then regs[#regs + 1] = { name = e.name, start_s = e.start_s, end_s = e_end } end
+    end
+    table.sort(regs, function(a, b) return a.start_s < b.start_s end)
+    if #regs == 0 then regs[1] = { name = "Song", start_s = 0, end_s = proj_len } end
+
+    local total_w, covered, cover_end, n_na = 0, 0, 0, 0
+    for _, rg in ipairs(regs) do
+        local s0, s1 = math.floor(rg.start_s + 1e-9), math.ceil(rg.end_s - 1e-9)
+        local w, wsum = {}, 0
+        for sec = s0, s1 - 1 do
+            w[sec] = math.max(0, math.min(1, math.min(sec + 1, rg.end_s) - math.max(sec, rg.start_s)))
+            wsum = wsum + w[sec]
+        end
+        total_w = total_w + wsum
+        if rg.end_s > math.max(rg.start_s, cover_end) then
+            covered = covered + rg.end_s - math.max(rg.start_s, cover_end)
+            cover_end = rg.end_s
+        end
+
+        local reg = { name = rg.name, start_s = rg.start_s, end_s = rg.end_s, wsum = wsum, all = {}, sel = {}, mask = {}, approx = {}, cover = 0 }
+        D.regions[#D.regions + 1] = reg
+        if wsum < 1 then
+            reg.na = true
+            n_na = n_na + 1
+        else
+            local blk0, blk1 = math.ceil(rg.start_s * 10 - 1e-6), math.floor(rg.end_s * 10 + 1e-6) - 1
+            local mr = blk1 >= blk0 and summarize_master(max_sec, run_id, blk0, blk1) or nil
+            if mr and mr.samples > 0 then
+                reg.mr = mr
+                -- width from the calibrated mid and side band energies
+                local em, es = 0, 0
+                for b = 1, 15 do
+                    local c = 10 ^ (offsets[b] / 10)
+                    em, es = em + mr.mid[b] * c, es + mr.side[b] * c
+                end
+                local rm, rs = math.sqrt(em), math.sqrt(es)
+                reg.width = (rm + rs) > 0 and 100 * rs / (rm + rs) or 0
+                -- band deviations from the song average (mid bands), normalised by the loudness difference
+                reg.dev = {}
+                if mr.integrated > -70 and song.integrated > -70 then
+                    for b = 1, 15 do
+                        local rb = convert_energy_to_db(mr.mid[b], mr.samples, offsets[b])
+                        if rb > -143 and song.mid_db[b] > -143 then
+                            local dev = (rb - song.mid_db[b]) - (mr.integrated - song.integrated)
+                            if math.abs(dev) >= MA_A.REGION_DEV_DB - 1e-9 then
+                                reg.dev[#reg.dev + 1] = { key = MA_A.KEYS[b], dev = dev, band = b }
+                            end
+                        end
+                    end
+                end
+
+                local master_ke = mr.ke / mr.samples
+                local cand = {}
+                for _, t in ipairs(live) do
+                    local r = route[t.idx]
+                    local d = window(r, t, s0, s1, w, master_ke)
+                    if d then
+                        reg.all[#reg.all + 1] = d
+                        if r.role ~= "bus" then
+                            reg.cover = reg.cover + d.master_pct
+                            if d.act and d.act >= MA_A.ACTIVE_MIN_PCT then cand[#cand + 1] = d end
+                        end
+                    end
+                end
+                normalise(reg.all)
+                table.sort(cand, function(a, b) return a.share > b.share end)
+                for i = 1, math.min(MA_A.TOP_N, #cand) do reg.sel[i] = cand[i] end
+
+                -- Masking: a band where 2+ selected tracks each hold >= MASK_SHARE of the band energy of all non-bus tracks together
+                -- and are not on opposite sides
+                for b = 1, 15 do
+                    local den = 0
+                    for _, d in ipairs(reg.all) do
+                        if d.r.role ~= "bus" then den = den + d.s.bands[b] * d.gain_lin end
+                    end
+                    if den > 0 then
+                        local c = {}
+                        for _, d in ipairs(reg.sel) do
+                            local sh = d.s.bands[b] * d.gain_lin / den
+                            if sh >= MA_A.MASK_SHARE then c[#c + 1] = { d = d, sh = sh } end
+                        end
+                        local inc, list = {}, {}
+                        for i = 1, #c do
+                            for j = i + 1, #c do
+                                if math.abs(c[i].d.pan100 - c[j].d.pan100) <= MA_A.MASK_PAN then inc[i], inc[j] = true, true end
+                            end
+                        end
+                        for i = 1, #c do if inc[i] then list[#list + 1] = c[i] end end
+                        if #list >= 2 then
+                            table.sort(list, function(x, y) return x.sh > y.sh end)
+                            reg.mask[#reg.mask + 1] = { band = b, list = list }
+                        end
+                    end
+                end
+                for _, d in ipairs(reg.sel) do
+                    if #d.reasons > 0 then reg.approx[#reg.approx + 1] = d end
+                end
+            end
+        end
+    end
+    D.check = { weights = total_w, gaps = proj_len - covered, n_na = n_na }
+    return D
+end
+
+--- Stage 4 console output (append to the collection test): ROUTING, SONG, regions, OVERVIEW, DRAFT DATA BLOCK, TOKENS, SELF-CHECK.
+local function print_region_summary(out, tracks, max_sec, run_id, offsets)
+    local route, pan_law, law_src = track_routing(tracks, max_sec)
+    local D, err = collect_region_data(tracks, route, max_sec, run_id, offsets)
+    if not D then out[#out + 1] = "\nREGION SUMMARY skipped: " .. tostring(err) return end
+    local song, KEYS = D.song, MA_A.KEYS
+
+    local function f1(v) return (v and math.abs(v) < 1e6) and string.format("%.1f", v) or "n/a" end
+    local function n1(v) return (v and v > -143) and string.format("%.1f", v) or "n/a" end
+    local function i0(v) return (v and math.abs(v) < 1e9) and string.format("%d", math.floor(v + 0.5)) or "n/a" end
+    local function c2(v) return (string.format("%.2f", v):gsub("^(%-?)0%.", "%1.")) end
+    local function nm(s) return (s:gsub("%s+", "_")) end
+    local function pan_label(p) return p == 0 and "pC" or (p < 0 and ("pL" .. -p) or ("pR" .. p)) end
+    local function devs(list, int)
+        local l = {}
+        for _, e in ipairs(list) do
+            l[#l + 1] = e.key .. (int and string.format("%+d", math.floor(e.dev + 0.5)) or string.format("%+.1f", e.dev))
+        end
+        return table.concat(l, " ")
+    end
+
+    -- ROUTING
+    out[#out + 1] = string.format("\nROUTING (gain = own fader x parent faders, before the master fader | project pan law %.3f = %.1f dB (%s) | Volume envelope: %s)",
+        pan_law, level_db(pan_law), law_src, MA_A.ENV_MULT and "multiplies the fader" or "replaces the fader")
+    out[#out + 1] = " idx name                     role    gain  pan    mode envelopes          approx"
+    for _, t in ipairs(tracks) do
+        local r = route[t.idx]
+        local env, why = {}, {}
+        if r.env_min then env[#env + 1] = string.format("vol %.1f..%.1f", r.env_min, r.env_max) end
+        if r.pan_min then
+            local function p100(x) return x >= 0 and math.floor(x * 100 + 0.5) or -math.floor(-x * 100 + 0.5) end
+            env[#env + 1] = "pan " .. pan_label(p100(r.pan_min)) .. ".." .. pan_label(p100(r.pan_max))
+        end
+        if r.no_direct then why[#why + 1] = "NOT COUNTED (" .. r.no_direct .. ", no direct path to the master)" end
+        for _, x in ipairs(r.reasons) do why[#why + 1] = x end
+        for _, x in ipairs(r.song_flags) do why[#why + 1] = x end
+        out[#out + 1] = string.format("%4d %-24s %-4s %7.1f  %-6s m%d   %-18s %s", t.idx, t.name:sub(1, 24), r.role, r.gain_db,
+            pan_label(r.pan100), r.mode, #env > 0 and table.concat(env, " ") or "-", table.concat(why, ", "))
+    end
+
+    -- SONG
+    local master_fader = level_db(reaper.GetMediaTrackInfo_Value(reaper.GetMasterTrack(0), "D_VOL"))
+    local stamped = reaper.gmem_read(MA_H_MSTAMP) == run_id
+    local m_peak = stamped and (level_db(reaper.gmem_read(MA_H_MPEAK)) + master_fader) or nil
+    local m_clips = stamped and math.floor(reaper.gmem_read(MA_H_MCLIPS) + 0.5) or nil
+    out[#out + 1] = string.format("\nSONG (%.1f s) | integrated %s LUFS | max M %s | max S %s | LRA %s LU | peak %s dBFS post-fader | clips %s",
+        D.proj_len, n1(song.integrated), n1(song.max_m), n1(song.max_s), n1(song.lra), f1(m_peak), m_clips and tostring(m_clips) or "n/a")
+    local hdr, mline, sline = "      ", "  mid ", " side "
+    for b = 1, 15 do
+        local fc = math.sqrt(B15_EDGES[b] * B15_EDGES[b + 1])
+        hdr = hdr .. string.format("%6s", fc >= 1000 and (string.format("%.3g", fc / 1000) .. "k") or string.format("%.3g", fc))
+        mline = mline .. string.format("%6.1f", song.mid_db[b])
+        sline = sline .. string.format("%6.1f", song.side_db[b])
+    end
+    out[#out + 1] = hdr .. "\n" .. mline .. "\n" .. sline
+
+    -- One track line (region or overview)
+    local function track_line(d, indent, with_clips)
+        local tail = devs(d.notable)
+        return string.format("%s%-22s %-4s s%5.1f%%  L%7.1f  pk%7.1f  cr%6s  a%6s  W%4.0f  c%6.2f  %-6s %s%s%s", indent,
+            d.t.name:sub(1, 22), d.r.role, d.share, d.L, d.pk, n1(d.crest), n1(d.act), d.width, d.corr, pan_label(d.pan100),
+            d.sub_risk and "sub! " or "", with_clips and ("clips " .. string.format("%.0f", d.s.clips) .. " ") or "",
+            tail ~= "" and ("| " .. tail) or "")
+    end
+
+    -- Regions
+    for i, reg in ipairs(D.regions) do
+        if reg.na or not reg.mr then
+            out[#out + 1] = string.format("\nR%d %s %.1f-%.1f (%.1f s) | n/a (under 1 s or no master data)", i, reg.name, reg.start_s, reg.end_s, reg.wsum)
+        else
+            local mr = reg.mr
+            out[#out + 1] = string.format("\nR%d %s %.1f-%.1f (%.1f s used) | I %s M %s S %s LRA %s W %.0f | vs song: %s", i, reg.name,
+                reg.start_s, reg.end_s, reg.wsum, n1(mr.integrated), n1(mr.max_m), n1(mr.max_s), n1(mr.lra), reg.width,
+                #reg.dev > 0 and devs(reg.dev) or "-")
+            for _, d in ipairs(reg.sel) do out[#out + 1] = track_line(d, "  ", false) end
+            local mk = {}
+            for _, m in ipairs(reg.mask) do
+                local who = {}
+                for _, e in ipairs(m.list) do who[#who + 1] = e.d.t.name .. " " .. i0(e.sh * 100) end
+                mk[#mk + 1] = KEYS[m.band] .. ": " .. table.concat(who, " ")
+            end
+            out[#out + 1] = "  masking: " .. (#mk > 0 and table.concat(mk, " | ") or "none")
+            local ap = {}
+            for _, d in ipairs(reg.approx) do ap[#ap + 1] = d.t.name .. " (" .. table.concat(d.reasons, ", ") .. ")" end
+            out[#out + 1] = string.format("  approx: %s | the counted tracks add up to %.0f%% of the measured master K energy (the rest: master FX, bus processing, phase)",
+                #ap > 0 and table.concat(ap, "; ") or "none", reg.cover)
+        end
+    end
+
+    -- OVERVIEW (whole song, every track with data)
+    out[#out + 1] = "\nOVERVIEW (whole song, every counted track with data; s = share of the K energy of all counted tracks except folder buses, adds up to 100; trk = plain track, bus = folder bus (children inside it), sbus = send/parallel/FX bus fed by sends)"
+    for _, d in ipairs(D.over) do out[#out + 1] = track_line(d, string.format("%3d ", d.t.idx), true) end
+
+    -- DRAFT DATA BLOCK (what the prompt would send; final format in task 4e), mixed rounding
+    local function bandlist(db)
+        local l = {}
+        for b = 1, 15 do l[b] = KEYS[b] .. f1(db[b]) end
+        return table.concat(l, " ")
+    end
+    local function tok(d)
+        return string.format("L%s pk%s%s a%s W%s c%s %s%s", f1(d.L), f1(d.pk), d.crest and (" cr" .. i0(d.crest)) or "", i0(d.act),
+            i0(d.width), c2(d.corr), pan_label(d.pan100), d.sub_risk and " sub!" or "")
+    end
+    local draft, omitted = {}, 0
+    draft[1] = string.format("SONG I%s M%s S%s LRA%s pk%s clip%s | mid %s | side %s", f1(song.integrated), f1(song.max_m), f1(song.max_s),
+        f1(song.lra), f1(m_peak), m_clips and tostring(m_clips) or "n/a", bandlist(song.mid_db), bandlist(song.side_db))
+    for _, d in ipairs(D.over) do
+        if d.act and d.act >= MA_A.ACTIVE_MIN_PCT then
+            local nb = #d.notable > 0 and (" | " .. devs(d.notable, true)) or ""
+            draft[#draft + 1] = string.format("T %s%s s%s %s%s%s", nm(d.t.name), d.r.role ~= "trk" and (" " .. d.r.role) or "", i0(d.share), tok(d),
+                d.s.clips > 0 and (" clip" .. string.format("%.0f", d.s.clips)) or "", nb)
+        else
+            omitted = omitted + 1
+        end
+    end
+    for i, reg in ipairs(D.regions) do
+        if reg.na or not reg.mr then
+            draft[#draft + 1] = string.format("R%d %s %s-%s | n/a", i, nm(reg.name), f1(reg.start_s), f1(reg.end_s))
+        else
+            local mr = reg.mr
+            draft[#draft + 1] = string.format("R%d %s %s-%s | I%s M%s S%s LRA%s W%s%s", i, nm(reg.name), f1(reg.start_s), f1(reg.end_s),
+                f1(mr.integrated), f1(mr.max_m), f1(mr.max_s), f1(mr.lra), i0(reg.width),
+                #reg.dev > 0 and (" | " .. devs(reg.dev, true)) or "")
+            for _, d in ipairs(reg.sel) do
+                draft[#draft + 1] = string.format(" %s s%s %s%s", nm(d.t.name), i0(d.share), tok(d),
+                    #d.notable > 0 and (" | " .. devs(d.notable, true)) or "")
+            end
+            local mk, ap = {}, {}
+            for _, m in ipairs(reg.mask) do
+                local who = {}
+                for _, e in ipairs(m.list) do who[#who + 1] = nm(e.d.t.name) .. " " .. i0(e.sh * 100) end
+                mk[#mk + 1] = KEYS[m.band] .. " " .. table.concat(who, " ")
+            end
+            for _, d in ipairs(reg.approx) do ap[#ap + 1] = nm(d.t.name) end
+            if #mk > 0 or #ap > 0 then
+                draft[#draft + 1] = " " .. (#mk > 0 and ("mask " .. table.concat(mk, "; ")) or "") ..
+                    ((#mk > 0 and #ap > 0) and " | " or "") .. (#ap > 0 and ("approx: " .. table.concat(ap, ",")) or "")
+            end
+        end
+    end
+    local text = table.concat(draft, "\n")
+    out[#out + 1] = "\nDRAFT DATA BLOCK (compact text the prompt would send; final format in task 4e):\n" .. text
+
+    -- TOKENS and SELF-CHECK
+    local est = math.floor(#text / 4 + 0.5)
+    out[#out + 1] = string.format("\nTOKENS (rough, characters / 4): draft block %d chars = about %d tokens = %.0f%% of the %d ceiling | %d tracks below %d%% active left out of the overview",
+        #text, est, 100 * est / MA_A.TOKEN_CEILING, MA_A.TOKEN_CEILING, omitted, MA_A.ACTIVE_MIN_PCT)
+    local chk = D.check
+    out[#out + 1] = string.format("SELF-CHECK: region weights %.2f s + gap seconds %.2f s = %.2f s vs song %.2f s (%s) | regions n/a: %d | tracks counted with data: %d of %d (%d not counted: no direct path to the master)",
+        chk.weights, chk.gaps, chk.weights + chk.gaps, D.proj_len, math.abs(chk.weights + chk.gaps - D.proj_len) < 0.05 and "OK" or "MISMATCH",
+        chk.n_na, D.tracks_with_data, #tracks, D.dropped)
 end
 
 local DEBUG_DURATION = 20 -- seconds of the region compared against the Lua DSP
@@ -2528,7 +3121,7 @@ local function print_dsp_comparison(out, region, run_id, lua_m, win0, win1, fade
     out[#out + 1] = "sub-mono status: Lua " .. tostring(lua_m.stereo.sub_mono) .. " | JSFX " .. jsfx_status
 end
 
---- Stage 1 test: inject -> render (nothing added to the project) -> read gmem -> print numbers -> clean up.
+--- JSFX collection test: inject -> render (nothing added to the project) -> read gmem -> print numbers -> clean up.
 -- compare = true: also render into the project and compare the Lua DSP with the JSFX master values.
 local function run_collection_test(compare)
     reaper.ClearConsole()
@@ -2698,6 +3291,8 @@ local function run_collection_test(compare)
             out[#out + 1] = hdr .. "\n" .. mline .. "\n" .. sline
         end
 
+        if not compare then print_region_summary(out, tracks, max_sec, run_id, offsets) end
+
         if compare then
             local lua_m = analyze_region(find_new_tracks(old_guids), region, DEBUG_DURATION)
             if not lua_m then error("Lua DSP found no rendered item for the region", 0) end
@@ -2721,6 +3316,26 @@ local function run_collection_test(compare)
     if reaper.Undo_CanUndo2(0) == block_name then reaper.Undo_DoUndo2(0) end
 
     if not ok then out[#out + 1] = "ERROR: " .. tostring(err) end
+    if ok and not compare then
+        -- Size of the project-structure YAML (read-only; measured after the cleanup so the analyzers are not in it)
+        local yok, yaml = pcall(extract_full_project_yaml)
+        if yok and type(yaml) == "string" then
+            out[#out + 1] = string.format("YAML (project structure, rough, characters / 4): %d chars = about %d tokens", #yaml, math.floor(#yaml / 4 + 0.5))
+        else
+            out[#out + 1] = "YAML size estimate failed: " .. tostring(yaml)
+        end
+    end
+    -- The console window drops the oldest lines when the text is long, so the full report is also saved to a file next to the script
+    local script_dir = (debug.getinfo(1, "S").source or ""):match("^@(.*[\\/])") or (reaper.GetResourcePath() .. PATH_SEPARATOR)
+    local report_path = script_dir .. "MixAssistant_report.txt"
+    local rf = io.open(report_path, "w")
+    if rf then
+        rf:write(table.concat(out, "\n"), "\n")
+        rf:close()
+        out[#out + 1] = "Full report saved to: " .. report_path
+    else
+        out[#out + 1] = "Could not save the report file: " .. report_path
+    end
     reaper.ShowConsoleMsg(table.concat(out, "\n") .. "\n")
 end
 
@@ -3108,7 +3723,7 @@ local function main()
             if is_busy then reaper.ImGui_EndDisabled(ctx) end
             reaper.ImGui_Separator(ctx)
 
-			if reaper.ImGui_SmallButton(ctx, "JSFX Collection Test (Stage 1)") and not is_busy then
+			if reaper.ImGui_SmallButton(ctx, "JSFX Collection Test") and not is_busy then
                 run_collection_test()
             end
             reaper.ImGui_SameLine(ctx)
