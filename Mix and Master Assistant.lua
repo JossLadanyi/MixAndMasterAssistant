@@ -949,6 +949,8 @@ local function convert_energy_to_db(energy_sum, num_samples, offset_db)
     return round(20 * math.log(band_rms, 10) + (offset_db or 0), 1)
 end
 
+local dsp_debug = {} -- test-only: values the YAML metrics do not carry
+
 local function process_audio_chunk(take, item_pos, analyze_start, analyze_dur)
     local num_samples = math.floor(analyze_dur * SAMPLE_RATE)
     if num_samples < 1 then return nil end
@@ -1057,6 +1059,7 @@ local function process_audio_chunk(take, item_pos, analyze_start, analyze_dur)
 
     local denom = math.sqrt(sum_sub_LL * sum_sub_RR)
     local correlation = denom > 0 and (sum_sub_LR / denom) or 1.0
+    dsp_debug.sub_corr = correlation
 
     -- Only flag if there is actual bass AND phase correlation drops below 0 (canceling out)
     local sub_mono_status = "Safe"
@@ -1880,17 +1883,64 @@ end
 local GMEM_NAME = "MixAssistant"
 local ANALYZER_FX_PATH = "JS:MixAssistant/mix_assistant_analyzer"
 -- gmem layout (must match the JSFX): header | per track-second records | master 100 ms blocks
-local MA_HDR, MA_MAXTR, MA_MAXSEC, MA_STRIDE, MA_MSTRIDE = 256, 128, 1800, 8, 4
+local MA_HDR, MA_MAXTR, MA_MAXSEC, MA_STRIDE, MA_MSTRIDE = 256, 128, 1800, 32, 36
 local MA_MBASE = MA_HDR + MA_MAXTR * MA_MAXSEC * MA_STRIDE
+
+-- Final 15 bands: each 2/3 octave wide, edges = every second ISO 1/3-octave value (the JSFX has the same edges).
+local B15_EDGES = { 20, 31.5, 50, 80, 125, 200, 315, 500, 800, 1250, 2000, 3150, 5000, 8000, 12500, 20000 }
+local B15_NAMES = { "rumble", "deep sub", "sub", "bass/punch", "body/warmth", "mud", "boxy", "hollow/honk",
+    "nasal", "bite", "presence", "harsh", "sibilance", "sizzle", "air" }
+-- Per stage the band edges sit at -1.5 dB (analog Q * bandwidth / centre = sqrt(10^0.15 - 1)); two cascaded stages give -3 dB.
+-- The filter is designed from the pre-warped edges, so this holds at any sample rate (sent to the JSFX in gmem[185]).
+local B15_C = 0.6423
+
+--- Biquad of one band stage (b1 = 0, b2 = -b0); the JSFX uses the same maths.
+local function band15_coefs(b, sr)
+    local o1 = math.tan(math.pi * B15_EDGES[b] / sr)
+    local o2 = math.tan(math.pi * B15_EDGES[b + 1] / sr)
+    local o0 = math.sqrt(o1 * o2)
+    local bw = (o2 - o1) / B15_C -- centre / Q of the analog prototype
+    local d0 = 1 + bw + o0 * o0
+    return bw / d0, (2 * o0 * o0 - 2) / d0, (1 - bw + o0 * o0) / d0
+end
+
+--- Response of the two-stage band filter (same RBJ design as the JSFX) at the JSFX sample rate:
+-- per band the calibration offset (dB, so the band level is the energy between its edges) and the pair's response at both edges.
+local function band15_calibration(sr)
+    local function pair_power(b0, a1, a2, f)
+        local w = 2 * math.pi * f / sr
+        local re = 1 + a1 * math.cos(w) + a2 * math.cos(2 * w)
+        local im = a1 * math.sin(w) + a2 * math.sin(2 * w)
+        local p = b0 * b0 * (2 - 2 * math.cos(2 * w)) / (re * re + im * im) -- |H|^2 of one stage
+        return p * p
+    end
+    local offsets, edge_lo, edge_hi = {}, {}, {}
+    local steps, f_min = 4000, 1.0
+    local ratio = math.log((sr / 2 * 0.9999) / f_min)
+    for b = 1, 15 do
+        local lo, hi = B15_EDGES[b], B15_EDGES[b + 1]
+        local b0, a1, a2 = band15_coefs(b, sr)
+        local enbw = 0 -- equivalent noise bandwidth (Hz), integrated on a log frequency axis
+        for i = 0, steps - 1 do
+            local f = f_min * math.exp(ratio * (i + 0.5) / steps)
+            enbw = enbw + pair_power(b0, a1, a2, f) * f * ratio / steps
+        end
+        offsets[b] = 10 * math.log((hi - lo) / enbw, 10)
+        edge_lo[b] = 10 * math.log(pair_power(b0, a1, a2, lo), 10)
+        edge_hi[b] = 10 * math.log(pair_power(b0, a1, a2, hi), 10)
+    end
+    return offsets, edge_lo, edge_hi
+end
 local MA_MAGIC = 20261103
 
 local ANALYZER_JSFX = [==[
 desc:Mix Assistant Analyzer (temp)
-//MA_JSFX_VERSION=1
+//MA_JSFX_VERSION=2
 options:gmem=MixAssistant
 
 slider1:0<0,127,1>Track index
 slider2:0<0,1,1{Track,Master}>Role
+slider3:0<0,1,1{Off,On}>Debug: Lua DSP check (master only)
 
 in_pin:left input
 in_pin:right input
@@ -1898,9 +1948,9 @@ out_pin:left output
 out_pin:right output
 
 @init
-MAGIC = 20261103; VERSION = 1;
-HDR = 256; MAXTR = 128; MAXSEC = 1800; STRIDE = 8;
-MBASE = HDR + MAXTR * MAXSEC * STRIDE; MSTRIDE = 4;
+MAGIC = 20261103; VERSION = 2;
+HDR = 256; MAXTR = 128; MAXSEC = 1800; STRIDE = 32;
+MBASE = HDR + MAXTR * MAXSEC * STRIDE; MSTRIDE = 36;
 gmem[0] = MAGIC; gmem[1] = VERSION;
 invsr = 1 / srate;
 
@@ -1923,6 +1973,13 @@ ha1 = 2 * (K * K - 1) / a0;
 ha2 = (1 - K / Q + K * K) / a0;
 
 cur_sec = -1; cur_mb = -1; last_run = -1;
+FBASE = 256; dbg = 0; dw0 = 0; dw1 = 0;
+// local memory: 0 band coefs (15x4), 64 mid states, 128 side states (15x4 each), 192 accumulators (15 mid + 15 side), 224 band edges, 256 debug filters
+CBASE = 0; STM = 64; STS = 128; ACC = 192; EDG = 224;
+EDG[0] = 20; EDG[1] = 31.5; EDG[2] = 50; EDG[3] = 80; EDG[4] = 125; EDG[5] = 200; EDG[6] = 315; EDG[7] = 500;
+EDG[8] = 800; EDG[9] = 1250; EDG[10] = 2000; EDG[11] = 3150; EDG[12] = 5000; EDG[13] = 8000; EDG[14] = 12500; EDG[15] = 20000;
+SILN = floor(0.1 * srate); silcnt = 0; skip = 0;
+sub_ll = 0; sub_rr = 0; sub_lr = 0;
 
 function shelf(x) instance(x1,x2,y1,y2) global(sb0,sb1,sb2,sa1,sa2) local(y) (
   y = sb0*x + sb1*x1 + sb2*x2 - sa1*y1 - sa2*y2;
@@ -1934,24 +1991,99 @@ function hpf(x) instance(x1,x2,y1,y2) global(hb0,hb1,hb2,ha1,ha2) local(y) (
   x2 = x1; x1 = x; y2 = y1; y1 = y;
   y;
 );
-function put_track() global(idx,cur_sec,pkl,pkr,sll,srr,slr,ske,scnt,run,HDR,MAXSEC,STRIDE,gmem) local(b) (
+function lp4(x) instance(z1,z2,z3,z4) global(lb0,lb1,lb2,la1,la2) local(y,o) (
+  y = lb0*x + z1; z1 = lb1*x - la1*y + z2; z2 = lb2*x - la2*y;
+  o = lb0*y + z3; z3 = lb1*y - la1*o + z4; z4 = lb2*y - la2*o;
+  o;
+);
+// two cascaded band-pass biquads (RBJ, 0 dB peak: b1 = 0, b2 = -b0) per band; adds the output energy to abase[band]
+function bandrun(x, sbase, abase) global(CBASE) local(bi,cp,sp,y,o) (
+  bi = 0;
+  loop(15,
+    cp = CBASE + bi * 4; sp = sbase + bi * 4;
+    y = cp[0] * x + sp[0];
+    sp[0] = sp[1] - cp[1] * y;
+    sp[1] = -cp[0] * x - cp[2] * y;
+    o = cp[0] * y + sp[2];
+    sp[2] = sp[3] - cp[1] * o;
+    sp[3] = -cp[0] * y - cp[2] * o;
+    abase[bi] += o * o;
+    bi += 1;
+  );
+);
+function put_track() global(idx,cur_sec,pkl,pkr,sll,srr,slr,ske,scnt,run,HDR,MAXSEC,STRIDE,ACC,sub_ll,sub_rr,sub_lr,gmem) local(b,bi) (
   b = HDR + (idx * MAXSEC + cur_sec) * STRIDE;
   gmem[b] = pkl; gmem[b+1] = pkr; gmem[b+2] = sll; gmem[b+3] = srr;
   gmem[b+4] = slr; gmem[b+5] = ske; gmem[b+6] = scnt; gmem[b+7] = run;
+  bi = 0;
+  loop(15, gmem[b+8+bi] = ACC[bi]; bi += 1;);
+  gmem[b+23] = sub_ll; gmem[b+24] = sub_rr; gmem[b+25] = sub_lr;
 );
-function put_master() global(cur_mb,mke,mcnt,run,MBASE,MSTRIDE,gmem) local(b) (
+function put_master() global(cur_mb,mke,mcnt,run,MBASE,MSTRIDE,ACC,gmem) local(b,bi) (
   b = MBASE + cur_mb * MSTRIDE;
   gmem[b] = mke; gmem[b+1] = mcnt; gmem[b+2] = run;
+  bi = 0;
+  loop(30, gmem[b+3+bi] = ACC[bi]; bi += 1;);
 );
 @slider
 idx = slider1 | 0;
 role = slider2 | 0;
+dbg = slider3 | 0;
 
 @block
 run = gmem[9];
 ok = role ? 1 : (idx >= 0 && idx < MAXTR);
 t0 = play_position;
-run != last_run ? ( last_run = run; cur_sec = -1; cur_mb = -1; exp_t = -1; );
+run != last_run ? (
+  last_run = run; cur_sec = -1; cur_mb = -1; exp_t = -1;
+  bq = gmem[185] > 0 ? gmem[185] : 0.6423;
+  bi = 0;
+  loop(15,
+    bo1 = tan($pi * EDG[bi] / srate);
+    bo2 = tan($pi * EDG[bi + 1] / srate);
+    bo0 = sqrt(bo1 * bo2);
+    bbw = (bo2 - bo1) / bq;
+    bd0 = 1 + bbw + bo0 * bo0;
+    cp = CBASE + bi * 4;
+    cp[0] = bbw / bd0; cp[1] = (2 * bo0 * bo0 - 2) / bd0; cp[2] = (1 - bbw + bo0 * bo0) / bd0;
+    bi += 1;
+  );
+  memset(STM, 0, 124);
+  subhz = gmem[162] > 0 ? gmem[162] : 120;
+  lw = 2 * $pi * subhz / srate;
+  lal = sin(lw) / 1.41421356;
+  la0 = 1 + lal;
+  lbg = (1 - cos(lw)) / la0;
+  lb0 = lbg / 2; lb1 = lbg; lb2 = lbg / 2;
+  la1 = -2 * cos(lw) / la0; la2 = (1 - lal) / la0;
+  lpl.z1 = lpl.z2 = lpl.z3 = lpl.z4 = 0;
+  lpr.z1 = lpr.z2 = lpr.z3 = lpr.z4 = 0;
+  silcnt = 0;
+  role && dbg ? (
+    dw0 = gmem[160]; dw1 = gmem[161];
+    acN = acPL = acPR = acLL = acRR = acLR = acMM = acSS = bsLL = bsRR = bsLR = 0;
+    memset(FBASE, 0, 72);
+    kb = 0;
+    loop(9,
+      dq = gmem[176 + kb];
+      dwr = 2 * $pi * gmem[164 + kb] / srate;
+      dal = sin(dwr) / (2 * dq);
+      da0 = 1 + dal;
+      dp = FBASE + kb * 8;
+      dp[0] = dal / da0; dp[1] = -dal / da0;
+      dp[2] = -2 * cos(dwr) / da0; dp[3] = (1 - dal) / da0;
+      kb += 1;
+    );
+    dwr = 2 * $pi * gmem[162] / srate;
+    dal = sin(dwr) / 1.41421356;
+    da0 = 1 + dal;
+    lbg = (1 - cos(dwr)) / da0;
+    lb0 = lbg / 2; lb1 = lbg; lb2 = lbg / 2;
+    la1 = -2 * cos(dwr) / da0; la2 = (1 - dal) / da0;
+    dlm.z1 = dlm.z2 = dlm.z3 = dlm.z4 = 0;
+    dls.z1 = dls.z2 = dls.z3 = dls.z4 = 0;
+  );
+);
 synced = (exp_t >= 0 && abs(t0 - exp_t) < 0.004) || abs(t0 - gmem[7]) < 0.05;
 exp_t = t0 + samplesblock * invsr;
 active = (gmem[6] == 1) && (run > 0) && ok && synced;
@@ -1959,6 +2091,15 @@ n = 0;
 active ? (
   role ? ( gmem[10] = run; ) : ( gmem[32 + idx] = run; );
   gmem[2] = srate;
+  role && dbg ? (
+    gmem[192] = acN; gmem[193] = acPL; gmem[194] = acPR;
+    gmem[195] = acLL; gmem[196] = acRR; gmem[197] = acLR;
+    gmem[198] = acMM; gmem[199] = acSS;
+    gmem[200] = bsLL; gmem[201] = bsRR; gmem[202] = bsLR;
+    gmem[203] = run;
+    kb = 0;
+    loop(9, dp = FBASE + kb * 8; gmem[204 + kb] = dp[6]; kb += 1;);
+  );
 );
 
 @sample
@@ -1968,13 +2109,48 @@ active ? (
     kl = hpl.hpf(shl.shelf(spl0));
     kr = hpr.hpf(shr.shelf(spl1));
     ke = kl * kl + kr * kr;
+    // after 100 ms of exact digital silence: reset the band/sub filters once and skip them until audio returns
+    (spl0 == 0 && spl1 == 0) ? ( silcnt += 1; ) : ( silcnt = 0; );
+    silcnt == SILN ? (
+      memset(STM, 0, 124);
+      lpl.z1 = lpl.z2 = lpl.z3 = lpl.z4 = 0;
+      lpr.z1 = lpr.z2 = lpr.z3 = lpr.z4 = 0;
+    );
+    skip = silcnt >= SILN;
     role ? (
       mb = (t * 10) | 0;
       mb != cur_mb ? (
         cur_mb >= 0 ? put_master();
         cur_mb = mb; mke = 0; mcnt = 0;
+        memset(ACC, 0, 30);
       );
       mke += ke; mcnt += 1;
+      !skip ? (
+        mdx = (spl0 + spl1) * 0.5; sdx = (spl0 - spl1) * 0.5;
+        bandrun(mdx, STM, ACC);
+        bandrun(sdx, STS, ACC + 15);
+      );
+      dbg && t >= dw0 && t < dw1 ? (
+        xl = spl0; xr = spl1;
+        xy = abs(xl); xy > acPL ? acPL = xy;
+        xy = abs(xr); xy > acPR ? acPR = xy;
+        acLL += xl * xl; acRR += xr * xr; acLR += xl * xr;
+        xm = (xl + xr) * 0.5; xs = (xl - xr) * 0.5;
+        acMM += xm * xm; acSS += xs * xs;
+        kb = 0;
+        loop(9,
+          dp = FBASE + kb * 8;
+          xy = dp[0] * xm + dp[4];
+          dp[4] = dp[5] - dp[2] * xy;
+          dp[5] = dp[1] * xm - dp[3] * xy;
+          dp[6] += xy * xy;
+          kb += 1;
+        );
+        xsm = dlm.lp4(xm); xsd = dls.lp4(xs);
+        xsl = xsm + xsd; xsr = xsm - xsd;
+        bsLL += xsl * xsl; bsRR += xsr * xsr; bsLR += xsl * xsr;
+        acN += 1;
+      );
       n >= samplesblock - 1 ? put_master();
     ) : (
       sec = t | 0;
@@ -1982,11 +2158,18 @@ active ? (
         cur_sec >= 0 ? put_track();
         cur_sec = sec;
         pkl = 0; pkr = 0; sll = 0; srr = 0; slr = 0; ske = 0; scnt = 0;
+        memset(ACC, 0, 15); sub_ll = 0; sub_rr = 0; sub_lr = 0;
       );
       a = abs(spl0); a > pkl ? pkl = a;
       a = abs(spl1); a > pkr ? pkr = a;
       sll += spl0 * spl0; srr += spl1 * spl1; slr += spl0 * spl1;
       ske += ke; scnt += 1;
+      !skip ? (
+        mdx = (spl0 + spl1) * 0.5;
+        bandrun(mdx, STM, ACC);
+        ylp = lpl.lp4(spl0); yrp = lpr.lp4(spl1);
+        sub_ll += ylp * ylp; sub_rr += yrp * yrp; sub_lr += ylp * yrp;
+      );
       n >= samplesblock - 1 ? put_track();
     );
   );
@@ -2072,7 +2255,7 @@ local function should_analyze(track, has_children, memo)
 end
 
 --- Adds one analyzer to every qualifying track (+ master). Returns list, skipped count | nil, error.
-local function inject_analyzers()
+local function inject_analyzers(debug_on)
     local num_tracks = reaper.CountTracks(0)
     local has_children = {}
     for i = 0, num_tracks - 1 do
@@ -2105,6 +2288,7 @@ local function inject_analyzers()
         else
             reaper.TrackFX_SetParam(master, fx, 0, 0)
             reaper.TrackFX_SetParam(master, fx, 1, 1)
+            reaper.TrackFX_SetParam(master, fx, 2, debug_on and 1 or 0)
         end
     end
     reaper.PreventUIRefresh(-1)
@@ -2118,7 +2302,9 @@ local function lufs(mean_square) return mean_square > 1e-12 and (-0.691 + 10 * m
 
 --- Reads every valid per-second record of one track and sums them up.
 local function summarize_track(idx, max_sec, run_id)
-    local s = { secs = 0, first = -1, last = -1, samples = 0, ll = 0, rr = 0, lr = 0, ke = 0, peak = 0 }
+    local s = { secs = 0, first = -1, last = -1, samples = 0, ll = 0, rr = 0, lr = 0, ke = 0, peak = 0,
+        bands = {}, sub_ll = 0, sub_rr = 0, sub_lr = 0 } -- bands[1..15]: summed mid band energies
+    for k = 1, 15 do s.bands[k] = 0 end
     for sec = 0, max_sec - 1 do
         local b = MA_HDR + (idx * MA_MAXSEC + sec) * MA_STRIDE
         if reaper.gmem_read(b + 7) == run_id then
@@ -2131,6 +2317,10 @@ local function summarize_track(idx, max_sec, run_id)
             s.lr = s.lr + reaper.gmem_read(b + 4)
             s.ke = s.ke + reaper.gmem_read(b + 5)
             s.samples = s.samples + reaper.gmem_read(b + 6)
+            for k = 1, 15 do s.bands[k] = s.bands[k] + reaper.gmem_read(b + 7 + k) end
+            s.sub_ll = s.sub_ll + reaper.gmem_read(b + 23)
+            s.sub_rr = s.sub_rr + reaper.gmem_read(b + 24)
+            s.sub_lr = s.sub_lr + reaper.gmem_read(b + 25)
         end
     end
     return s
@@ -2140,9 +2330,17 @@ end
 local function summarize_master(max_sec, run_id)
     local nblk = math.min(18000, max_sec * 10)
     local pe, pc, pv = { [0] = 0 }, { [0] = 0 }, { [0] = 0 }
+    local mid_e, side_e = {}, {} -- summed band energies of the valid blocks
+    for i = 1, 15 do mid_e[i], side_e[i] = 0, 0 end
     for k = 0, nblk - 1 do
         local b = MA_MBASE + k * MA_MSTRIDE
         local ok = reaper.gmem_read(b + 2) == run_id
+        if ok then
+            for i = 1, 15 do
+                mid_e[i] = mid_e[i] + reaper.gmem_read(b + 2 + i)
+                side_e[i] = side_e[i] + reaper.gmem_read(b + 17 + i)
+            end
+        end
         pe[k + 1] = pe[k] + (ok and reaper.gmem_read(b) or 0)
         pc[k + 1] = pc[k] + (ok and reaper.gmem_read(b + 1) or 0)
         pv[k + 1] = pv[k] + (ok and 1 or 0)
@@ -2178,11 +2376,82 @@ local function summarize_master(max_sec, run_id)
         end
         if n2 > 0 then integrated = lufs(sum2 / n2) end
     end
-    return { valid_blocks = pv[nblk], integrated = integrated, max_m = max_m, max_s = max_s }
+    return { valid_blocks = pv[nblk], integrated = integrated, max_m = max_m, max_s = max_s,
+        samples = pc[nblk], mid = mid_e, side = side_e }
+end
+
+local DEBUG_DURATION = 20 -- seconds of the region compared against the Lua DSP
+
+--- Region under the edit cursor (else first region, else the whole project) plus the analysis window the Lua DSP will use.
+local function pick_debug_region()
+    local region, first
+    local cursor = reaper.GetCursorPosition()
+    for _, r in ipairs(get_arrangement_markers() or {}) do
+        if r.end_s then
+            first = first or r
+            if cursor >= r.start_s and cursor < r.end_s then
+                region = r
+                break
+            end
+        end
+    end
+    region = region or first
+    if not region then region = { name = "Entire project", start_s = 0, end_s = reaper.GetProjectLength(0) } end
+    local win0 = region.start_s + math.min(1.0, (region.end_s - region.start_s) * 0.1)
+    local win1 = math.min(region.end_s, win0 + DEBUG_DURATION)
+    return region, win0, win1
+end
+
+local function find_new_tracks(old_guids)
+    local list = {}
+    for i = 0, reaper.CountTracks(0) - 1 do
+        local trk = reaper.GetTrack(0, i)
+        if not old_guids[reaper.GetTrackGUID(trk)] and reaper.CountTrackMediaItems(trk) > 0 then
+            list[#list + 1] = trk
+        end
+    end
+    return list
+end
+
+local function print_dsp_comparison(out, region, run_id, lua_m, win0, win1, fader_db)
+    local function g(i) return reaper.gmem_read(i) end
+    local n = g(192)
+    if g(203) ~= run_id or n < 1 then
+        out[#out + 1] = "\nJSFX debug data missing (master analyzer accumulated nothing)."
+        return
+    end
+    local ll, rr, lr, mm, ss = g(195), g(196), g(197), g(198), g(199)
+    local sll, srr, slr = g(200), g(201), g(202)
+    local rms_m, rms_s = math.sqrt(mm / n), math.sqrt(ss / n)
+    local peak_db = level_db(math.max(g(193), g(194))) + fader_db
+    local rms_db = level_db(math.sqrt((mm + ss) / n)) + fader_db
+    local sub_corr = (sll * srr > 0) and slr / math.sqrt(sll * srr) or 1
+
+    local rows = {
+        { "peak dB",    lua_m.dyn.peak_db,       peak_db },
+        { "rms dB",     lua_m.dyn.rms_db,        rms_db },
+        { "crest dB",   lua_m.dyn.crest_db,      peak_db - rms_db },
+        { "width %",    lua_m.stereo.width_pct,  (rms_m + rms_s) > 0 and rms_s / (rms_m + rms_s) * 100 or 0 },
+        { "phase corr", lua_m.stereo.phase_corr, (ll * rr > 0) and lr / math.sqrt(ll * rr) or 1 },
+        { "sub corr",   dsp_debug.sub_corr,      sub_corr },
+    }
+    for b, key in ipairs(BAND_KEYS) do
+        rows[#rows + 1] = { key, lua_m.tonal_db[key], convert_energy_to_db(g(203 + b), n, BAND_OFFSET_DB[b]) + fader_db }
+    end
+
+    out[#out + 1] = string.format("\nLua DSP vs JSFX | '%s' window %.2f-%.2f s | JSFX samples %d | master fader %.1f dB",
+        region.name, win0, win1, n, fader_db)
+    out[#out + 1] = "metric            Lua      JSFX     delta"
+    for _, r in ipairs(rows) do
+        out[#out + 1] = string.format("%-12s %9.2f %9.2f %9.2f", r[1], r[2] or 0, r[3], r[3] - (r[2] or 0))
+    end
+    local jsfx_status = (convert_energy_to_db((sll + srr) / 2, n) > -50.0 and sub_corr < 0.0) and "Phase_Risk" or "Safe"
+    out[#out + 1] = "sub-mono status: Lua " .. tostring(lua_m.stereo.sub_mono) .. " | JSFX " .. jsfx_status
 end
 
 --- Stage 1 test: inject -> render (nothing added to the project) -> read gmem -> print numbers -> clean up.
-local function run_collection_test()
+-- compare = true: also render into the project and compare the Lua DSP with the JSFX master values.
+local function run_collection_test(compare)
     reaper.ClearConsole()
     remove_all_analyzers() -- leftovers from an earlier crash
 
@@ -2192,6 +2461,8 @@ local function run_collection_test()
 	reaper.Undo_BeginBlock2(0)
     local render_opts = math.floor(reaper.GetSetProjectInfo(0, "RENDER_ADDTOPROJ", 0, false))
     local out = {}
+    local old_guids = {}
+    for i = 0, reaper.CountTracks(0) - 1 do old_guids[reaper.GetTrackGUID(reaper.GetTrack(0, i))] = true end
 
     local ok, err = pcall(function()
         reaper.gmem_attach(GMEM_NAME)
@@ -2205,17 +2476,33 @@ local function run_collection_test()
         reaper.gmem_write(6, 0)
         local run_id = math.floor(reaper.time_precise() * 1000) % 2000000000 + 1
 
-        local tracks, skipped, inject_err = inject_analyzers()
+        reaper.gmem_write(162, SUB_MONO_CUTOFF_HZ)
+        reaper.gmem_write(185, B15_C)
+        local tracks, skipped, inject_err = inject_analyzers(compare)
         if not tracks then error(inject_err, 0) end
         out[#out + 1] = string.format("Analyzers: %d tracks + master (%d tracks skipped)", #tracks, skipped)
         out[#out + 1] = "JSFX handshake after injection: " .. (reaper.gmem_read(0) == MA_MAGIC and "yes" or "no (advisory only)")
 
-        -- Render without adding the result to the project (nothing to undo or delete afterwards)
-        reaper.GetSetProjectInfo(0, "RENDER_ADDTOPROJ", render_opts & ~1, true)
+        local region, win0, win1
+        if compare then
+            region, win0, win1 = pick_debug_region()
+            reaper.gmem_write(160, win0)
+            reaper.gmem_write(161, win1)
+            reaper.gmem_write(162, SUB_MONO_CUTOFF_HZ)
+            for b = 1, #BAND_FREQS do
+                reaper.gmem_write(163 + b, BAND_FREQS[b])
+                reaper.gmem_write(175 + b, BAND_Q[b])
+            end
+        end
+
+        -- Comparison needs the rendered file in the project; the normal test renders without adding it
+        reaper.GetSetProjectInfo(0, "RENDER_ADDTOPROJ", compare and (render_opts | 1) or (render_opts & ~1), true)
 		reaper.gmem_write(9, run_id)
         reaper.gmem_write(7, 0)
         reaper.gmem_write(6, 1)
+        local render_t0 = reaper.time_precise()
         reaper.Main_OnCommand(42230, 0)
+        local render_s = reaper.time_precise() - render_t0
         reaper.gmem_write(6, 0)
 
         local proj_len = reaper.GetProjectLength(0)
@@ -2223,10 +2510,30 @@ local function run_collection_test()
         local project_sr = reaper.GetSetProjectInfo(0, "PROJECT_SRATE", 0, false)
         out[#out + 1] = string.format("Project length %.1f s | project SR %d | JSFX reported SR %d | master seen: %s",
             proj_len, project_sr, reaper.gmem_read(2), reaper.gmem_read(10) == run_id and "yes" or "NO")
+        out[#out + 1] = string.format("Render time %.1f s (%.1fx realtime)", render_s, proj_len / math.max(render_s, 0.001))
+
+        local jsfx_sr = reaper.gmem_read(2)
+        if jsfx_sr < 8000 then jsfx_sr = project_sr end
+        local offsets, edge_lo, edge_hi = band15_calibration(jsfx_sr)
+        local edge_min, edge_max = 0, -99
+        for b = 1, 15 do
+            edge_min = math.min(edge_min, edge_lo[b], edge_hi[b])
+            edge_max = math.max(edge_max, edge_lo[b], edge_hi[b])
+        end
+        out[#out + 1] = string.format("Band filter pair response at the band edges (target -3.0 dB): %.2f .. %.2f dB | edge const %.4f | SR %d",
+            edge_min, edge_max, B15_C, jsfx_sr)
+        for b = 1, 15 do
+            if math.abs(edge_lo[b] + 3) > 0.3 or math.abs(edge_hi[b] + 3) > 0.3 then
+                out[#out + 1] = string.format("  band %d (%s): lower edge %.2f dB, upper edge %.2f dB, calibration %+.2f dB",
+                    b, B15_NAMES[b], edge_lo[b], edge_hi[b], offsets[b])
+            end
+        end
 
         out[#out + 1] = "\n idx name                      secs  first-last   samples   peak   Kdb   corr"
+        local sums = {}
 		for _, t in ipairs(tracks) do
             local s = summarize_track(t.idx, max_sec, run_id)
+            if s.secs > 0 then sums[#sums + 1] = { t = t, s = s } end
             if s.secs == 0 then
                 out[#out + 1] = string.format("%4d %-24s  NO DATA", t.idx, t.name:sub(1, 24))
             else
@@ -2237,10 +2544,48 @@ local function run_collection_test()
             end
         end
 
+        -- 15 band levels (mid signal, dB, calibrated to the energy between the band edges) + sum-of-bands vs broadband check
+        local names, hdr = {}, " idx "
+        for b = 1, 15 do
+            local fc = math.sqrt(B15_EDGES[b] * B15_EDGES[b + 1])
+            local label = fc >= 1000 and (string.format("%.3g", fc / 1000) .. "k") or string.format("%.3g", fc)
+            hdr = hdr .. string.format("%6s", label)
+            names[#names + 1] = string.format("%s %g-%g Hz", B15_NAMES[b], B15_EDGES[b], B15_EDGES[b + 1])
+        end
+        out[#out + 1] = "\nBands: " .. table.concat(names, " | ")
+        out[#out + 1] = hdr .. "  sum-bb  subC"
+        for _, e in ipairs(sums) do
+            local s, line = e.s, string.format("%4d ", e.t.idx)
+            local lin = 0
+            for b = 1, 15 do
+                line = line .. string.format("%6.1f", convert_energy_to_db(s.bands[b], s.samples, offsets[b]))
+                lin = lin + s.bands[b] * 10 ^ (offsets[b] / 10)
+            end
+            local bb = (s.ll + s.rr + 2 * s.lr) / 4 -- broadband mid energy
+            local delta = (lin > 0 and bb > 0) and 10 * math.log(lin / bb, 10) or 0
+            local subc = (s.sub_ll * s.sub_rr > 0) and s.sub_lr / math.sqrt(s.sub_ll * s.sub_rr) or 1
+            out[#out + 1] = line .. string.format("  %6.2f %5.2f", delta, subc)
+        end
+
         local m = summarize_master(max_sec, run_id)
         local master_fader = level_db(reaper.GetMediaTrackInfo_Value(reaper.GetMasterTrack(0), "D_VOL"))
         out[#out + 1] = string.format("\nMASTER (pre-fader, fader = %.1f dB): valid 100 ms blocks %d | integrated %.1f LUFS | max momentary %.1f | max short-term %.1f",
             master_fader, m.valid_blocks, m.integrated, m.max_m, m.max_s)
+        if m.samples > 0 then
+            local mline, sline = "  mid ", " side "
+            for b = 1, 15 do
+                mline = mline .. string.format("%6.1f", convert_energy_to_db(m.mid[b], m.samples, offsets[b]))
+                sline = sline .. string.format("%6.1f", convert_energy_to_db(m.side[b], m.samples, offsets[b]))
+            end
+            out[#out + 1] = hdr .. "\n" .. mline .. "\n" .. sline
+        end
+
+        if compare then
+            local lua_m = analyze_region(find_new_tracks(old_guids), region, DEBUG_DURATION)
+            if not lua_m then error("Lua DSP found no rendered item for the region", 0) end
+            local fader_db = level_db(reaper.GetMediaTrackInfo_Value(reaper.GetMasterTrack(0), "D_VOL"))
+            print_dsp_comparison(out, region, run_id, lua_m, win0, win1, fader_db)
+        end
     end)
 
     -- Cleanup ALWAYS runs (success, error or cancelled render)
@@ -2248,6 +2593,9 @@ local function run_collection_test()
     remove_all_analyzers()
     remove_analyzer_file()
     reaper.GetSetProjectInfo(0, "RENDER_ADDTOPROJ", render_opts, true)
+    if compare then
+        for _, trk in ipairs(find_new_tracks(old_guids)) do reaper.DeleteTrack(trk) end
+    end
     reaper.UpdateArrange()
 
 	local block_name = "Mix Assistant temp collection"
@@ -2644,6 +2992,10 @@ local function main()
 
 			if reaper.ImGui_SmallButton(ctx, "JSFX Collection Test (Stage 1)") and not is_busy then
                 run_collection_test()
+            end
+            reaper.ImGui_SameLine(ctx)
+            if reaper.ImGui_SmallButton(ctx, "JSFX vs Lua DSP check") and not is_busy then
+                run_collection_test(true)
             end
 
 			-- 2. Strict Frame Delay & Click-Absorption Cooldown
