@@ -1,5 +1,5 @@
 -- ==============================================================================
--- REAPER AI MIX ASSISTANT & SCANNER (v5.4)
+-- REAPER AI MIX ASSISTANT & SCANNER (v5.5)
 -- ==============================================================================
 -- Features:
 -- 1. Token-Optimized YAML Architecture Scanner (Reduces LLM cost, retains data)
@@ -28,6 +28,10 @@
 -- ==============================================================================
 
 local reaper = reaper
+
+-- Environment lookups that never change while the script runs (resolved once)
+local IS_WINDOWS = reaper.GetOS():match("Win") ~= nil
+local PATH_SEPARATOR = package.config:sub(1, 1) or "/"
 
 -- ==============================================================================
 -- 1. GLOBAL CONFIGURATION & TUNING
@@ -74,37 +78,48 @@ local function round(num, decimal_places)
     return math.floor(num * multiplier + 0.5) / multiplier
 end
 
+-- Audio Parameter Abbreviations for the YAML output. They are applied in THIS order
+-- (a plain Lua dictionary has no stable order, so overlapping words such as
+-- "bandwidth"/"width" and "saturation"/"ratio" could be abbreviated differently on every run).
+local PARAM_ABBREVIATIONS = {
+    { "saturation", "sat" }, { "bandwidth", "bw" }, { "frequency", "freq" }, { "threshold", "thr" },
+    { "resonance", "res" }, { "lookahead", "la" }, { "sidechain", "sc" }, { "feedback", "fb" },
+    { "highpass", "hp" }, { "lowpass", "lp" }, { "cutoff", "cut" }, { "release", "rel" },
+    { "attack", "att" }, { "ratio", "rat" }, { "volume", "vol" }, { "output", "out" },
+    { "input", "inp" }, { "level", "lvl" }, { "gain", "gn" }, { "time", "tm" },
+    { "mix", "mx" }, { "width", "wdth" }, { "drive", "drv" }, { "slope", "slp" }
+}
+
+-- Plugins repeat the same parameter names over and over, so each cleaned key is computed only once
+local clean_key_cache = {}
+
 -- This function abbreviates parameter names for the AI payload to save tokens,
 -- but the Lua function name and variables remain human-readable.
 local function clean_param_key(param_name)
     if not param_name then return "param" end
-    param_name = trim_string(param_name):lower()
+    local cached = clean_key_cache[param_name]
+    if cached then return cached end
 
-    -- Audio Parameter Abbreviations for the YAML output
-    local abbreviations = {
-        frequency = "freq", threshold = "thr", release = "rel", attack = "att", ratio = "rat",
-        volume = "vol", gain = "gn", level = "lvl", output = "out", input = "inp", feedback = "fb",
-        time = "tm", mix = "mx", width = "wdth", drive = "drv", resonance = "res", bandwidth = "bw",
-        cutoff = "cut", highpass = "hp", lowpass = "lp", slope = "slp", sidechain = "sc",
-        lookahead = "la", saturation = "sat"
-    }
+    local key = trim_string(param_name):lower()
 
-    for full_word, abbreviation in pairs(abbreviations) do
-        param_name = param_name:gsub(full_word, abbreviation)
+    for _, pair in ipairs(PARAM_ABBREVIATIONS) do
+        key = key:gsub(pair[1], pair[2])
     end
 
     -- Preserve unit context cleanly
-    param_name = param_name:gsub("%%", "_pct")
-    param_name = param_name:gsub("%s*%(%s*hz%s*%)", "_hz"):gsub("%s*%[%s*hz%s*%]", "_hz")
-    param_name = param_name:gsub("%s*%(%s*db%s*%)", "_db"):gsub("%s*%[%s*db%s*%]", "_db")
-    param_name = param_name:gsub("%s*%(%s*ms%s*%)", "_ms"):gsub("%s*%[%s*ms%s*%]", "_ms")
+    key = key:gsub("%%", "_pct")
+    key = key:gsub("%s*%(%s*hz%s*%)", "_hz"):gsub("%s*%[%s*hz%s*%]", "_hz")
+    key = key:gsub("%s*%(%s*db%s*%)", "_db"):gsub("%s*%[%s*db%s*%]", "_db")
+    key = key:gsub("%s*%(%s*ms%s*%)", "_ms"):gsub("%s*%[%s*ms%s*%]", "_ms")
 
     -- Strip special characters
-    param_name = param_name:gsub("[%[%]%(%)]", "")
-    param_name = param_name:gsub("[%s%-%/]+", "_")
-    param_name = param_name:gsub("^_+", ""):gsub("_+$", "")
+    key = key:gsub("[%[%]%(%)]", "")
+    key = key:gsub("[%s%-%/]+", "_")
+    key = key:gsub("^_+", ""):gsub("_+$", "")
 
-    return param_name ~= "" and param_name or "param"
+    if key == "" then key = "param" end
+    clean_key_cache[param_name] = key
+    return key
 end
 
 local function escape_yaml_string(str)
@@ -152,7 +167,7 @@ end
 
 local function linear_to_db(vol)
     if vol <= 1e-7 then return -144.0 end
-    return math.floor((20 * math.log(vol, 10)) * 10 + 0.5) / 10
+    return round(20 * math.log(vol, 10), 1)
 end
 
 local function format_pan_value(pan_val)
@@ -179,32 +194,36 @@ end
 -- 3. ORIGINAL SERIALIZER ENGINE (COMPACT & RANKED YAML)
 -- ==============================================================================
 
+--- Returns (is_array, max_key): a table is an "array" when every key is a number.
+local function analyze_table_keys(tbl)
+    local max_key = 0
+    for k in pairs(tbl) do
+        if type(k) ~= "number" then return false, 0 end
+        max_key = math.max(max_key, k)
+    end
+    return true, max_key
+end
+
 local function to_inline_yaml(tbl)
     if type(tbl) ~= "table" then
         return type(tbl) == "string" and escape_yaml_string(tbl) or tostring(tbl)
     end
-    local is_array, max_key = true, 0
-    for k, _ in pairs(tbl) do
-        if type(k) ~= "number" then is_array = false; break end
-        max_key = math.max(max_key, k)
-    end
+
     local parts = {}
+    local is_array, max_key = analyze_table_keys(tbl)
     if is_array then
         if max_key == 0 then return "[]" end
-        for i = 1, max_key do table.insert(parts, to_inline_yaml(tbl[i])) end
+        for i = 1, max_key do parts[i] = to_inline_yaml(tbl[i]) end
         return "[" .. table.concat(parts, ", ") .. "]"
-    else
-        local keys = {}
-        for k in pairs(tbl) do table.insert(keys, k) end
-        table.sort(keys, function(a, b) return tostring(a) < tostring(b) end)
-        if #keys == 0 then return "{}" end
-        for _, k in ipairs(keys) do
-            local v = tbl[k]
-            local v_str = (type(v) == "table") and to_inline_yaml(v) or (type(v) == "string" and escape_yaml_string(v) or tostring(v))
-            table.insert(parts, tostring(k) .. ": " .. v_str)
-        end
-        return "{" .. table.concat(parts, ", ") .. "}"
     end
+
+    local keys = {}
+    for k in pairs(tbl) do keys[#keys + 1] = k end
+    table.sort(keys, function(a, b) return tostring(a) < tostring(b) end)
+    for _, k in ipairs(keys) do
+        parts[#parts + 1] = tostring(k) .. ": " .. to_inline_yaml(tbl[k])
+    end
+    return "{" .. table.concat(parts, ", ") .. "}"
 end
 
 local INLINE_KEYS = { meta = true, params = true, media = true, flags = true, active_trks = true }
@@ -220,34 +239,27 @@ local KEY_RANK = {}
 for idx, key_name in ipairs(KEY_ORDER) do KEY_RANK[key_name] = idx end
 
 local function to_yaml(tbl, indent, parent_key)
+    if type(tbl) ~= "table" then return "" end
     indent = indent or 0
     local pad = string.rep("  ", indent)
-    local yaml_output = ""
+    local out = {} -- collected pieces are joined once at the end (no repeated string re-allocation)
 
-    if type(tbl) ~= "table" then return "" end
-
-    local is_array, max_key = true, 0
-    for k, _ in pairs(tbl) do
-        if type(k) ~= "number" then is_array = false; break end
-        max_key = math.max(max_key, k)
-    end
-
+    local is_array, max_key = analyze_table_keys(tbl)
     if is_array then
-        if max_key == 0 then return "" end
         for i = 1, max_key do
             local v = tbl[i]
             if INLINE_ARRAY_PARENTS[parent_key] and type(v) == "table" then
-                yaml_output = yaml_output .. pad .. "- " .. to_inline_yaml(v) .. "\n"
+                out[#out + 1] = pad .. "- " .. to_inline_yaml(v) .. "\n"
             elseif type(v) == "table" then
                 local child = to_yaml(v, indent + 1, parent_key)
-                yaml_output = yaml_output .. pad .. "- " .. child:gsub("^%s+", "")
+                out[#out + 1] = pad .. "- " .. (child:gsub("^%s+", ""))
             else
-                yaml_output = yaml_output .. pad .. "- " .. (type(v) == "string" and escape_yaml_string(v) or tostring(v)) .. "\n"
+                out[#out + 1] = pad .. "- " .. (type(v) == "string" and escape_yaml_string(v) or tostring(v)) .. "\n"
             end
         end
     else
         local keys = {}
-        for k in pairs(tbl) do table.insert(keys, k) end
+        for k in pairs(tbl) do keys[#keys + 1] = k end
         table.sort(keys, function(a, b)
             local rank_a = KEY_RANK[a] or 999
             local rank_b = KEY_RANK[b] or 999
@@ -257,24 +269,22 @@ local function to_yaml(tbl, indent, parent_key)
 
         for _, k in ipairs(keys) do
             local v = tbl[k]
-            if v ~= nil then
-                if INLINE_KEYS[k] and type(v) == "table" then
-                    yaml_output = yaml_output .. pad .. tostring(k) .. ": " .. to_inline_yaml(v) .. "\n"
-                elseif type(v) == "table" then
-                    if next(v) ~= nil then
-                        yaml_output = yaml_output .. pad .. tostring(k) .. ":\n" .. to_yaml(v, indent + 1, k)
-                    end
-                elseif k == "notes" then
-                    local block = v:gsub("\r", ""):gsub("\n", "\n" .. pad .. "  ")
-                    yaml_output = yaml_output .. pad .. "additional_information:\n" .. pad .. "  " .. block .. "\n"
-                else
-                    local val_str = type(v) == "string" and escape_yaml_string(v) or tostring(v)
-                    yaml_output = yaml_output .. pad .. tostring(k) .. ": " .. val_str .. "\n"
+            if INLINE_KEYS[k] and type(v) == "table" then
+                out[#out + 1] = pad .. tostring(k) .. ": " .. to_inline_yaml(v) .. "\n"
+            elseif type(v) == "table" then
+                if next(v) ~= nil then
+                    out[#out + 1] = pad .. tostring(k) .. ":\n" .. to_yaml(v, indent + 1, k)
                 end
+            elseif k == "notes" then
+                local block = v:gsub("\r", ""):gsub("\n", "\n" .. pad .. "  ")
+                out[#out + 1] = pad .. "additional_information:\n" .. pad .. "  " .. block .. "\n"
+            else
+                local val_str = type(v) == "string" and escape_yaml_string(v) or tostring(v)
+                out[#out + 1] = pad .. tostring(k) .. ": " .. val_str .. "\n"
             end
         end
     end
-    return yaml_output
+    return table.concat(out)
 end
 
 -- ==============================================================================
@@ -291,11 +301,9 @@ local function get_arrangement_markers()
             local element = {
                 type = is_region and "region" or "marker",
                 name = name ~= "" and name or ((is_region and "Region " or "Marker ") .. marker_idx),
-                start_s = math.floor(pos * 100 + 0.5) / 100
+                start_s = round(pos, 2)
             }
-            if is_region then
-                element.end_s = math.floor(region_end * 100 + 0.5) / 100
-            end
+            if is_region then element.end_s = round(region_end, 2) end
             table.insert(arrangement, element)
         end
     end
@@ -314,26 +322,23 @@ local function get_all_connections()
 
     for i = 0, num_tracks - 1 do
         local src_track = reaper.GetTrack(0, i)
-        local num_sends = reaper.GetTrackNumSends(src_track, 0)
+        local main_send = reaper.GetMediaTrackInfo_Value(src_track, "B_MAINSEND")
 
-        for s = 0, num_sends - 1 do
+        for s = 0, reaper.GetTrackNumSends(src_track, 0) - 1 do
             local dest_track = reaper.GetTrackSendInfo_Value(src_track, 0, s, "P_DESTTRACK")
             if dest_track and dest_track ~= 0 then
-                local src_name = track_lookup[src_track] or get_track_identity(src_track)
-                local dest_name = track_lookup[dest_track] or "Unknown Track"
-                local conn = { src = src_name, dst = dest_name }
+                local conn = { src = track_lookup[src_track], dst = track_lookup[dest_track] or "Unknown Track" }
 
-                local main_send = reaper.GetMediaTrackInfo_Value(src_track, "B_MAINSEND")
                 local dst_chan = math.floor(reaper.GetTrackSendInfo_Value(src_track, 0, s, "I_DSTCHAN"))
-                local base_chan = (dst_chan & 1023) + 1
-                local dst_ch_str = string.format("%d/%d", base_chan, base_chan + 1)
-                local item_count = type(dest_track) == "userdata" and reaper.CountTrackMediaItems(dest_track) or 0
+                local chan_index = dst_chan & 1023
+                local dst_ch_str = string.format("%d/%d", chan_index + 1, chan_index + 2)
 
-                if (dst_chan & 1023) >= 2 then
+                if chan_index >= 2 then
                     conn.purpose = "sidechain"
-                elseif main_send == 0 and (dst_chan & 1023) < 2 then
+                elseif main_send == 0 then
                     conn.purpose = "bus_summing"
-                elseif main_send == 1 and (dst_chan & 1023) < 2 and item_count == 0 then
+                elseif main_send == 1 and (type(dest_track) ~= "userdata" or reaper.CountTrackMediaItems(dest_track) == 0) then
+                    -- Main send still active and the destination holds no media: a parallel split
                     conn.purpose = "parallel_split"
                 end
 
@@ -354,16 +359,100 @@ local function get_all_connections()
     return #connections > 0 and connections or nil
 end
 
+-- Hierarchical module prefixes used to drop the parameters of switched-off EQ bands / modules
+local MODULE_PREFIX_PATTERNS = { "^(band_%d+_)", "^(eq_b%d+_)", "^(c%d+_b%d+_)", "^(h%d+_)", "^(b%d+_)" }
+
+--- Extracts the meaningful, non-default parameters of one effect (nil when there are none).
+local function extract_fx_params(track, fx_idx)
+    local num_params = reaper.TrackFX_GetNumParams(track, fx_idx)
+    local max_inspect = 256
+
+    -- Every parameter name is fetched from REAPER ONCE and reused by both passes
+    -- (the API round-trip is the expensive part of scanning a big plugin).
+    local param_names = {}
+    for k = 0, math.min(num_params - 1, max_inspect) do
+        local _, param_name = reaper.TrackFX_GetParamName(track, fx_idx, k)
+        param_names[k] = param_name
+    end
+
+    -- -------------------------------------------------------------
+    -- PASS 1: Detect disabled modules using standardized keys
+    -- -------------------------------------------------------------
+    local disabled_prefixes = {}
+    for k = 0, math.min(num_params - 1, max_inspect) do
+        local param_name = param_names[k]
+        if param_name and param_name ~= "" then
+            -- Sanitize first so spaces/colons become underscores (e.g. "band_3_active")
+            local clean_k = clean_param_key(param_name)
+
+            if clean_k:find("active") or clean_k:find("enable") or clean_k:find("bypass") then
+                local _, param_val = reaper.TrackFX_GetFormattedParamValue(track, fx_idx, k)
+                local v_clean = trim_string(param_val):lower():gsub("%s+", "")
+
+                local is_off = (v_clean == "off" or v_clean == "0" or v_clean == "false" or v_clean == "disabled")
+                local is_bypassed = (clean_k:find("bypass") and (v_clean == "on" or v_clean == "1" or v_clean == "true"))
+
+                if is_off or is_bypassed then
+                    -- Extract hierarchical prefixes reliably:
+                    for _, pattern in ipairs(MODULE_PREFIX_PATTERNS) do
+                        local prefix = clean_k:match(pattern)
+                        if prefix then
+                            disabled_prefixes[prefix] = true
+                            break
+                        end
+                    end
+                end
+            end
+        end
+    end
+
+    -- -------------------------------------------------------------
+    -- PASS 2: Extract active parameters, dropping disabled prefixes
+    -- -------------------------------------------------------------
+    local params_table = {}
+    local count = 0
+    for k = 0, math.min(num_params - 1, max_inspect - 1) do
+        local param_name = trim_string(param_names[k])
+
+        if is_valid_parameter_name(param_name) then
+            local clean_key = clean_param_key(param_name)
+            local is_in_disabled_band = false
+
+            -- Check if clean parameter key starts with any disabled prefix
+            for prefix in pairs(disabled_prefixes) do
+                if clean_key:sub(1, #prefix) == prefix then
+                    is_in_disabled_band = true
+                    break
+                end
+            end
+
+            -- Only keep parameters from active bands/modules
+            if not is_in_disabled_band then
+                local _, param_value = reaper.TrackFX_GetFormattedParamValue(track, fx_idx, k)
+                param_value = trim_string(param_value)
+
+                if not is_boilerplate(param_name, param_value) then
+                    if count >= MAX_PLUGIN_PARAMS then break end
+                    params_table[clean_key] = tonumber(param_value) or param_value
+                    count = count + 1
+                end
+            end
+        end
+    end
+    return next(params_table) ~= nil and params_table or nil
+end
+
 local function get_track_fx_chain(track)
     local num_fx = reaper.TrackFX_GetCount(track)
     if num_fx == 0 then return nil end
     local fx_chain = {}
+    local inst_idx = reaper.TrackFX_GetInstrument(track) -- the same for every FX slot on this track
 
     for i = 0, num_fx - 1 do
-		local _, fx_name = reaper.TrackFX_GetFXName(track, i)
-        fx_name = trim_string(fx_name) or "Unknown FX"
+        local _, raw_name = reaper.TrackFX_GetFXName(track, i)
+        local fx_name = trim_string(raw_name) or "Unknown FX"
         fx_name = fx_name:match(":%s*(.+)") or fx_name
-        fx_name = fx_name:gsub("%s*%(.*%)$", "")	-- Uses a greedy match %s*%(.*%)$ to safely catch nested parens like "(Universal Audio (UADx))"
+        fx_name = fx_name:gsub("%s*%(.*%)$", "")    -- Uses a greedy match %s*%(.*%)$ to safely catch nested parens like "(Universal Audio (UADx))"
         fx_name = trim_string(fx_name)
 
         local plugin = { name = fx_name }
@@ -377,88 +466,12 @@ local function get_track_fx_chain(track)
         end
         if current_wet ~= DEFAULT_SETTINGS.plugin.wet then plugin.wet = current_wet end
 
-        local _, raw_name = reaper.TrackFX_GetFXName(track, i)
         raw_name = trim_string(raw_name) or ""
-        local inst_idx = reaper.TrackFX_GetInstrument(track)
         local plugin_type = ((inst_idx == i) or raw_name:match("^%w+i:")) and "instrument" or "effect"
         if plugin_type ~= DEFAULT_SETTINGS.plugin.type then plugin.type = plugin_type end
 
         if plugin_type == "effect" and not plugin.bypassed then
-            local num_params = reaper.TrackFX_GetNumParams(track, i)
-            local params_table = {}
-            local disabled_prefixes = {}
-            local count = 0
-            local max_inspect = 256
-
-            -- -------------------------------------------------------------
-            -- PASS 1: Detect disabled modules using standardized keys
-            -- -------------------------------------------------------------
-            for k = 0, math.min(num_params - 1, max_inspect) do
-                local _, param_name = reaper.TrackFX_GetParamName(track, i, k)
-                if param_name and param_name ~= "" then
-                    -- Sanitize first so spaces/colons become underscores (e.g. "band_3_active")
-                    local clean_k = clean_param_key(param_name)
-
-                    if clean_k:find("active") or clean_k:find("enable") or clean_k:find("bypass") then
-                        local _, param_val = reaper.TrackFX_GetFormattedParamValue(track, i, k)
-                        local v_clean = trim_string(param_val):lower():gsub("%s+", "")
-
-                        local is_off = (v_clean == "off" or v_clean == "0" or v_clean == "false" or v_clean == "disabled")
-                        local is_bypassed = (clean_k:find("bypass") and (v_clean == "on" or v_clean == "1" or v_clean == "true"))
-
-                        if is_off or is_bypassed then
-                            -- Extract hierarchical prefixes reliably:
-                            local prefix = clean_k:match("^(band_%d+_)")
-                                        or clean_k:match("^(eq_b%d+_)")
-                                        or clean_k:match("^(c%d+_b%d+_)")
-                                        or clean_k:match("^(h%d+_)")
-                                        or clean_k:match("^(b%d+_)")
-
-                            if prefix then
-                                disabled_prefixes[prefix] = true
-                            end
-                        end
-                    end
-                end
-            end
-
-            -- -------------------------------------------------------------
-            -- PASS 2: Extract active parameters, dropping disabled prefixes
-            -- -------------------------------------------------------------
-            for k = 0, num_params - 1 do
-                if k >= max_inspect then break end
-                local _, param_name = reaper.TrackFX_GetParamName(track, i, k)
-                param_name = trim_string(param_name)
-
-                if is_valid_parameter_name(param_name) then
-                    local clean_key = clean_param_key(param_name)
-                    local is_in_disabled_band = false
-
-                    -- Check if clean parameter key starts with any disabled prefix
-                    for prefix, _ in pairs(disabled_prefixes) do
-                        if clean_key:sub(1, #prefix) == prefix then
-                            is_in_disabled_band = true
-                            break
-                        end
-                    end
-
-                    -- Only keep parameters from active bands/modules
-                    if not is_in_disabled_band then
-                        local _, param_value = reaper.TrackFX_GetFormattedParamValue(track, i, k)
-                        param_value = trim_string(param_value)
-
-                        if not is_boilerplate(param_name, param_value) then
-                            if count < MAX_PLUGIN_PARAMS then
-                                params_table[clean_key] = tonumber(param_value) or param_value
-                                count = count + 1
-                            else
-                                break
-                            end
-                        end
-                    end
-                end
-            end
-            if next(params_table) ~= nil then plugin.params = params_table end
+            plugin.params = extract_fx_params(track, i)
         end
         table.insert(fx_chain, plugin)
     end
@@ -518,19 +531,16 @@ local function process_track_data(track, is_master, current_depth, any_soloed, h
     local pan = format_pan_value(reaper.GetMediaTrackInfo_Value(track, "D_PAN"))
     if pan ~= "Center" then track_data.pan = pan end
 
-    local num_envelopes = reaper.CountTrackEnvelopes(track)
-    if num_envelopes > 0 then
-        local active_envelopes = {}
-        for env_idx = 0, num_envelopes - 1 do
-            local env = reaper.GetTrackEnvelope(track, env_idx)
-            if env then
-                local _, env_name = reaper.GetEnvelopeName(env, "")
-                env_name = trim_string(env_name)
-                if env_name and env_name ~= "" then table.insert(active_envelopes, env_name) end
-            end
+    local active_envelopes = {}
+    for env_idx = 0, reaper.CountTrackEnvelopes(track) - 1 do
+        local env = reaper.GetTrackEnvelope(track, env_idx)
+        if env then
+            local _, env_name = reaper.GetEnvelopeName(env, "")
+            env_name = trim_string(env_name)
+            if env_name and env_name ~= "" then table.insert(active_envelopes, env_name) end
         end
-        if #active_envelopes > 0 then track_data.auto = table.concat(active_envelopes, ", ") end
     end
+    if #active_envelopes > 0 then track_data.auto = table.concat(active_envelopes, ", ") end
 
     if not mute_state then track_data.fx = get_track_fx_chain(track) end
     return track_data
@@ -561,8 +571,7 @@ local function extract_full_project_yaml()
     -- Pre-calculate parent folders that actually have children
     local has_children = {}
     for i = 0, num_tracks - 1 do
-        local tr = reaper.GetTrack(0, i)
-        local p = reaper.GetParentTrack(tr)
+        local p = reaper.GetParentTrack(reaper.GetTrack(0, i))
         if p then has_children[p] = true end
     end
 
@@ -591,6 +600,25 @@ end
 
 local saved_mix_state = { tracks = {}, master_fx = {} }
 
+-- Track names repeat constantly (every child of a folder is classified through its parents),
+-- so each name is pattern-matched only once.
+local track_category_cache = {}
+
+-- Keyword lists for the track-name classifier (plain substring match, checked in this order)
+-- 99 = Parallel / Rear / NYC Busses
+local PARALLEL_WORDS = { "nyc", "rear", "parallel" }
+-- 1 = Drums & Bass (Drums, Percussion, Kicks, Snares, 808s, Basses - excluding Brass, see below)
+local DRUM_BASS_WORDS = { "drum", "kick", "snare", "hat", "perc", "cymbal", "808", "sub" }
+-- 3 = Vocals (Lead Vox, Harmonies, BGV, Choirs, Acapellas - plurals and "lead/backing vocal" are covered by the short forms)
+local VOCAL_WORDS = { "vox", "vocal", "choir", "bgv", "bv", "acap", "harmony", "harmonies" }
+
+local function name_has_any(name, words)
+    for _, word in ipairs(words) do
+        if name:find(word, 1, true) then return true end
+    end
+    return false
+end
+
 local function get_track_category(name)
     if type(name) ~= "string" then
         name = ""
@@ -598,31 +626,22 @@ local function get_track_category(name)
         name = trim_string(name):lower()
     end
 
-    -- 99 = Parallel / Rear / NYC Busses
-    if name:match("nyc") or name:match("rear") or name:match("parallel") then
-        return 99
+    local category = track_category_cache[name]
+    if category then return category end
 
-    -- 1 = Drums & Bass (Drums, Percussion, Kicks, Snares, 808s, Basses - excluding Brass)
-    elseif name:match("drum") or name:match("kick") or name:match("snare") or
-           name:match("hat") or name:match("perc") or name:match("cymbal") or
-           name:match("808") or name:match("sub") or
-           (name:match("bass") and not name:match("brass")) then
-        return 1
-
-    -- 3 = Vocals (Lead Vox, Harmonies, BGV, Choirs, Acapellas)
-    elseif name:match("vox") or name:match("vocal") or name:match("vocals") or
-           name:match("choir") or name:match("choirs") or
-           name:match("bgv") or name:match("bgvs") or name:match("bv") or name:match("bvs") or
-           name:match("acap") or name:match("acapella") or
-           name:match("harmony") or name:match("harmonies") or
-           name:match("lead vocal") or name:match("lead vox") or
-           name:match("backing vocal") or name:match("backing vox") then
-        return 3
-
-    -- 2 = Instruments (Everything else: Guitars, Keys, Synths, Strings, Horns, FX, Pads)
+    if name_has_any(name, PARALLEL_WORDS) then
+        category = 99
+    elseif name_has_any(name, DRUM_BASS_WORDS) or (name:find("bass", 1, true) and not name:find("brass", 1, true)) then
+        category = 1
+    elseif name_has_any(name, VOCAL_WORDS) then
+        category = 3
     else
-        return 2
+        -- 2 = Instruments (Everything else: Guitars, Keys, Synths, Strings, Horns, FX, Pads)
+        category = 2
     end
+
+    track_category_cache[name] = category
+    return category
 end
 
 --- Determines track category by inspecting parent folder hierarchy first.
@@ -697,28 +716,19 @@ local function save_and_apply_mix_state(target_mode, mute_parallels, bypass_mast
 
             saved_mix_state.tracks[track_guid] = { solo = orig_solo, mute = orig_mute }
 
-            local is_target = false
             -- FIX: Check that the track is NOT muted (or inside a muted folder hierarchy) before targeting/soloing it
             local is_muted = is_track_hierarchy_muted(track)
 
+            -- Mode 4 (Full Mix) targets nothing: every solo is cleared and the whole project renders
+            local is_target = false
             if target_mode == 5 then
                 is_target = (orig_solo > 0) and not is_muted
             elseif target_mode ~= 4 then
                 is_target = (category == target_mode) and not is_muted
             end
 
-            if target_mode ~= 4 then
-                if is_target then
-    				set_track_info_delta(track, "I_SOLO", 1)
-                    if not is_muted then
-                        table.insert(target_track_names, display_name)
-                    end
-                else
-                    set_track_info_delta(track, "I_SOLO", 0)
-                end
-            else
-                set_track_info_delta(track, "I_SOLO", 0)
-            end
+            set_track_info_delta(track, "I_SOLO", is_target and 1 or 0)
+            if is_target then table.insert(target_track_names, display_name) end
 
             if mute_parallels and category == 99 then
                 set_track_info_delta(track, "B_MUTE", 1)
@@ -747,8 +757,7 @@ local function restore_mix_state()
         for i = 0, reaper.CountTracks(0) - 1 do
             local track = reaper.GetTrack(0, i)
             if track then
-                local track_guid = reaper.GetTrackGUID(track)
-                local state = saved_mix_state.tracks[track_guid]
+                local state = saved_mix_state.tracks[reaper.GetTrackGUID(track)]
                 if state then
                     set_track_info_delta(track, "I_SOLO", state.solo)
                     set_track_info_delta(track, "B_MUTE", state.mute)
@@ -768,7 +777,8 @@ end
 -- ==============================================================================
 
 --- Traverses up folder hierarchy to verify track is audible (checks both Mutes and Solos).
-local function is_track_audible(track)
+-- `any_solo` may be passed in so the project is only queried once per scan.
+local function is_track_audible(track, any_solo)
     local current = track
     while current do
         if reaper.GetMediaTrackInfo_Value(current, "B_MUTE") == 1 then
@@ -778,62 +788,63 @@ local function is_track_audible(track)
     end
 
     -- If any track is soloed in REAPER, this track must be soloed (or under a soloed folder) to be audible
-    if reaper.AnyTrackSolo(0) then
-        local is_soloed = false
+    if any_solo == nil then any_solo = reaper.AnyTrackSolo(0) end
+    if any_solo then
         current = track
         while current do
-            if reaper.GetMediaTrackInfo_Value(current, "I_SOLO") > 0 then
-                is_soloed = true
-                break
-            end
+            if reaper.GetMediaTrackInfo_Value(current, "I_SOLO") > 0 then return true end
             current = reaper.GetParentTrack(current)
         end
-        if not is_soloed then
-            return false
-        end
+        return false
     end
 
     return true
 end
 
-local function get_active_tracks(start_time, end_time, max_tracks)
-    local active_tracks = {}
-    -- Only loop through tracks that existed BEFORE the render occurred
-    local limit = (max_tracks or reaper.CountTracks(0)) - 1
+--- Reads every audible track and its un-muted item time ranges from REAPER ONCE per scan.
+-- Each region query afterwards is a cheap in-memory overlap test instead of walking
+-- every track, folder and item through the REAPER API again for every region.
+-- Only tracks that existed BEFORE the render are indexed (max_tracks).
+local function build_active_track_index(max_tracks)
+    local index = {}
+    local any_solo = reaper.AnyTrackSolo(0)
 
-    -- Threshold: Must play for at least 10% of the section (minimum 2.0 seconds)
-	local region_dur = end_time - start_time
-	local MIN_OVERLAP_SECONDS = math.max(2.0, region_dur * 0.10)
-
-    for i = 0, limit do
+    for i = 0, (max_tracks or reaper.CountTracks(0)) - 1 do
         local track = reaper.GetTrack(0, i)
 
-        if is_track_audible(track) then
-            local is_active = false
-            local item_count = reaper.CountTrackMediaItems(track)
-
-            for j = 0, item_count - 1 do
+        if is_track_audible(track, any_solo) then
+            local items = {}
+            for j = 0, reaper.CountTrackMediaItems(track) - 1 do
                 local item = reaper.GetTrackMediaItem(track, j)
-                local item_muted = (reaper.GetMediaItemInfo_Value(item, "B_MUTE") == 1)
-
-                if not item_muted then
+                if reaper.GetMediaItemInfo_Value(item, "B_MUTE") ~= 1 then
                     local pos = reaper.GetMediaItemInfo_Value(item, "D_POSITION")
-                    local len = reaper.GetMediaItemInfo_Value(item, "D_LENGTH")
-                    local item_end = pos + len
-
-                    -- Calculate actual overlap duration between item and section
-                    local overlap = math.min(item_end, end_time) - math.max(pos, start_time)
-
-                    if overlap > MIN_OVERLAP_SECONDS then
-                        is_active = true
-                        break
-                    end
+                    table.insert(items, { pos, pos + reaper.GetMediaItemInfo_Value(item, "D_LENGTH") })
                 end
             end
 
-            if is_active then
+            if #items > 0 then
                 local _, name = reaper.GetSetMediaTrackInfo_String(track, "P_NAME", "", false)
-                table.insert(active_tracks, name ~= "" and name or ("Track_" .. (i + 1)))
+                table.insert(index, { name = name ~= "" and name or ("Track_" .. (i + 1)), items = items })
+            end
+        end
+    end
+
+    return index
+end
+
+local function get_active_tracks(track_index, start_time, end_time)
+    local active_tracks = {}
+
+    -- Threshold: Must play for at least 10% of the section (minimum 2.0 seconds)
+    local MIN_OVERLAP_SECONDS = math.max(2.0, (end_time - start_time) * 0.10)
+
+    for _, entry in ipairs(track_index) do
+        for _, item_range in ipairs(entry.items) do
+            -- Calculate actual overlap duration between item and section
+            local overlap = math.min(item_range[2], end_time) - math.max(item_range[1], start_time)
+            if overlap > MIN_OVERLAP_SECONDS then
+                table.insert(active_tracks, entry.name)
+                break
             end
         end
     end
@@ -845,139 +856,132 @@ end
 -- 7. 9-BAND MASTERING DSP ENGINE
 -- ==============================================================================
 
+-- Centre frequencies (Hz) and result keys of the 9 critical bands:
+-- sub (60), punch (120), mud (250), boxy (500), core (1k), presence (3k), harsh (6k), sibilance (8k), air (12k)
+local BAND_FREQS = { 60, 120, 250, 500, 1000, 3000, 6000, 8000, 12000 }
+local BAND_KEYS  = { "sub60", "punch120", "mud250", "boxy500", "mid1k", "pres3k", "harsh6k", "sib8k", "air12k" }
+
+-- Audio is streamed through the analyzer in 1-second blocks instead of one giant buffer,
+-- so memory stays flat even for "Full Region" scans (a 3-minute song used to need ~16 million Lua numbers at once).
+local DSP_BLOCK_FRAMES = SAMPLE_RATE
+
+--- Runs one Chamberlin state-variable filter over input[1..n].
+-- `state` (low, band, energy) is carried from block to block; the band-pass energy keeps accumulating.
+-- If `low_out` is given, the low-pass signal is stored there (needed for the sub-bass phase check).
+local function run_svf(input, n, coeff, state, low_out)
+    local q = FILTER_Q -- local copy: faster than reading the upvalue on every sample
+    local low, band, energy = state.low, state.band, state.energy
+    if low_out then
+        for i = 1, n do
+            low = low + coeff * band
+            band = band + coeff * (input[i] - low - q * band)
+            energy = energy + band * band
+            low_out[i] = low
+        end
+    else
+        for i = 1, n do
+            low = low + coeff * band
+            band = band + coeff * (input[i] - low - q * band)
+            energy = energy + band * band
+        end
+    end
+    state.low, state.band, state.energy = low, band, energy
+end
+
+-- Helper to convert any raw band energy accumulation into absolute dBFS
+local function convert_energy_to_db(energy_sum, num_samples)
+    local band_rms = math.sqrt(energy_sum / num_samples)
+    if band_rms <= 1e-7 then return -144.0 end
+    return round(20 * math.log(band_rms, 10), 1)
+end
+
 local function process_audio_chunk(take, item_pos, analyze_start, analyze_dur)
     local num_samples = math.floor(analyze_dur * SAMPLE_RATE)
     if num_samples < 1 then return nil end
 
-    local buffer = reaper.new_array(num_samples * 2)
+    local block_frames = math.min(num_samples, DSP_BLOCK_FRAMES)
+    local buffer = reaper.new_array(block_frames * 2)
     if not buffer then return nil end
 
     local accessor = reaper.CreateTakeAudioAccessor(take)
     if not accessor then return nil end
 
-    local ok = reaper.GetAudioAccessorSamples(accessor, SAMPLE_RATE, 2, analyze_start - item_pos, num_samples, buffer)
-    reaper.DestroyAudioAccessor(accessor)
-
-    if not ok then return nil end
-
-	-- Convert C++ buffer to a native 1-based Lua table
-    local audio_samples = buffer
-    if type(buffer) == "userdata" and buffer.table then
-        audio_samples = buffer.table()
-    end
-
-    if type(audio_samples) ~= "table" then return nil end
-    local total_sample_count = #audio_samples
-    if total_sample_count < 2 then return nil end
-
     local peak_left, peak_right = 0, 0
     local sum_squared_mid, sum_squared_side = 0, 0
 
-    -- Human-readable energy accumulators for the 9 frequency bands
-    local energy_sub_60hz = 0
-    local energy_punch_120hz = 0
-    local energy_mud_250hz = 0
-    local energy_boxy_500hz = 0
-    local energy_core_1khz = 0
-    local energy_presence_3khz = 0
-    local energy_harsh_6khz = 0
-    local energy_sibilance_8khz = 0
-    local energy_air_12khz = 0
-	local sum_sub_LR, sum_sub_LL, sum_sub_RR = 0, 0, 0
-
     -- Full-Spectrum Phase Correlation Accumulators: sum(L*R), sum(L^2), sum(R^2)
     local sum_full_LR, sum_full_LL, sum_full_RR = 0, 0, 0
+    -- Same accumulators for the sub-bass (60Hz) region
+    local sum_sub_LR, sum_sub_LL, sum_sub_RR = 0, 0, 0
 
-    -- Filter Coefficients for the 9 critical bands
-    local filter_coeff_sub   = 2 * math.sin(math.pi * 60 / SAMPLE_RATE)
-    local filter_coeff_punch = 2 * math.sin(math.pi * 120 / SAMPLE_RATE)
-    local filter_coeff_mud   = 2 * math.sin(math.pi * 250 / SAMPLE_RATE)
-    local filter_coeff_boxy  = 2 * math.sin(math.pi * 500 / SAMPLE_RATE)
-    local filter_coeff_core  = 2 * math.sin(math.pi * 1000 / SAMPLE_RATE)
-    local filter_coeff_pres  = 2 * math.sin(math.pi * 3000 / SAMPLE_RATE)
-    local filter_coeff_harsh = 2 * math.sin(math.pi * 6000 / SAMPLE_RATE)
-    local filter_coeff_sib   = 2 * math.sin(math.pi * 8000 / SAMPLE_RATE)
-    local filter_coeff_air   = 2 * math.sin(math.pi * 12000 / SAMPLE_RATE)
+    -- Filter state for each of the 9 bands (Chamberlin SVF on the Mid channel) plus the Side-channel sub filter
+    local bands = {}
+    for b, freq in ipairs(BAND_FREQS) do
+        bands[b] = { coeff = 2 * math.sin(math.pi * freq / SAMPLE_RATE), low = 0, band = 0, energy = 0 }
+    end
+    local sub_side = { low = 0, band = 0, energy = 0 }
 
-    -- Filter state registers (Low-pass and Band-pass nodes for Chamberlin SVF)
-    local low_sub, band_sub       = 0, 0
-    local low_punch, band_punch   = 0, 0
-    local low_mud, band_mud       = 0, 0
-    local low_boxy, band_boxy     = 0, 0
-    local low_core, band_core     = 0, 0
-    local low_pres, band_pres     = 0, 0
-    local low_harsh, band_harsh   = 0, 0
-    local low_sib, band_sib       = 0, 0
-    local low_air, band_air       = 0, 0
-    local low_sub_side, band_sub_side = 0, 0
+    -- Per-block work arrays (allocated once, reused for every block)
+    local mid, side, sub_mid_low, sub_side_low = {}, {}, {}, {}
 
-    -- Fast native table loop (audio_samples[1] = L0, audio_samples[2] = R0, ...)
-    for i = 1, total_sample_count, 2 do
-        local sample_left = audio_samples[i]
-        local sample_right = audio_samples[i+1]
+    local frames_done = 0
+    while frames_done < num_samples do
+        local n = math.min(block_frames, num_samples - frames_done)
 
-        if math.abs(sample_left) > peak_left then peak_left = math.abs(sample_left) end
-        if math.abs(sample_right) > peak_right then peak_right = math.abs(sample_right) end
+        buffer.clear() -- a block without audio must read as silence, never as the previous block's samples
+        local ok = reaper.GetAudioAccessorSamples(accessor, SAMPLE_RATE, 2, analyze_start - item_pos + frames_done / SAMPLE_RATE, n, buffer)
+        if not ok then break end
 
-        -- Accumulate full-spectrum stereo cross-correlation metrics
-        sum_full_LR = sum_full_LR + (sample_left * sample_right)
-        sum_full_LL = sum_full_LL + (sample_left * sample_left)
-        sum_full_RR = sum_full_RR + (sample_right * sample_right)
+        -- Convert C++ buffer to a native 1-based Lua table
+        local audio_samples = buffer
+        if type(buffer) == "userdata" and buffer.table then
+            audio_samples = buffer.table()
+        end
+        if type(audio_samples) ~= "table" then break end
 
-        local mid = (sample_left + sample_right) * 0.5
-        local side = (sample_left - sample_right) * 0.5
+        -- Fast native table loop (audio_samples[1] = L0, audio_samples[2] = R0, ...)
+        for i = 1, n do
+            local sample_left = audio_samples[2 * i - 1]
+            local sample_right = audio_samples[2 * i]
 
-        sum_squared_mid = sum_squared_mid + (mid * mid)
-        sum_squared_side = sum_squared_side + (side * side)
+            if sample_left > peak_left then peak_left = sample_left elseif -sample_left > peak_left then peak_left = -sample_left end
+            if sample_right > peak_right then peak_right = sample_right elseif -sample_right > peak_right then peak_right = -sample_right end
 
-        -- State-Variable Filter executions on Mid channel
-        low_sub = low_sub + filter_coeff_sub * band_sub
-        band_sub = band_sub + filter_coeff_sub * (mid - low_sub - FILTER_Q * band_sub)
-        energy_sub_60hz = energy_sub_60hz + (band_sub * band_sub)
+            -- Accumulate full-spectrum stereo cross-correlation metrics
+            sum_full_LR = sum_full_LR + (sample_left * sample_right)
+            sum_full_LL = sum_full_LL + (sample_left * sample_left)
+            sum_full_RR = sum_full_RR + (sample_right * sample_right)
 
-        low_punch = low_punch + filter_coeff_punch * band_punch
-        band_punch = band_punch + filter_coeff_punch * (mid - low_punch - FILTER_Q * band_punch)
-        energy_punch_120hz = energy_punch_120hz + (band_punch * band_punch)
+            local m = (sample_left + sample_right) * 0.5
+            local s = (sample_left - sample_right) * 0.5
+            mid[i], side[i] = m, s
 
-        low_mud = low_mud + filter_coeff_mud * band_mud
-        band_mud = band_mud + filter_coeff_mud * (mid - low_mud - FILTER_Q * band_mud)
-        energy_mud_250hz = energy_mud_250hz + (band_mud * band_mud)
+            sum_squared_mid = sum_squared_mid + (m * m)
+            sum_squared_side = sum_squared_side + (s * s)
+        end
 
-        low_boxy = low_boxy + filter_coeff_boxy * band_boxy
-        band_boxy = band_boxy + filter_coeff_boxy * (mid - low_boxy - FILTER_Q * band_boxy)
-        energy_boxy_500hz = energy_boxy_500hz + (band_boxy * band_boxy)
-
-        low_core = low_core + filter_coeff_core * band_core
-        band_core = band_core + filter_coeff_core * (mid - low_core - FILTER_Q * band_core)
-        energy_core_1khz = energy_core_1khz + (band_core * band_core)
-
-        low_pres = low_pres + filter_coeff_pres * band_pres
-        band_pres = band_pres + filter_coeff_pres * (mid - low_pres - FILTER_Q * band_pres)
-        energy_presence_3khz = energy_presence_3khz + (band_pres * band_pres)
-
-        low_harsh = low_harsh + filter_coeff_harsh * band_harsh
-        band_harsh = band_harsh + filter_coeff_harsh * (mid - low_harsh - FILTER_Q * band_harsh)
-        energy_harsh_6khz = energy_harsh_6khz + (band_harsh * band_harsh)
-
-        low_sib = low_sib + filter_coeff_sib * band_sib
-        band_sib = band_sib + filter_coeff_sib * (mid - low_sib - FILTER_Q * band_sib)
-        energy_sibilance_8khz = energy_sibilance_8khz + (band_sib * band_sib)
-
-        low_air = low_air + filter_coeff_air * band_air
-        band_air = band_air + filter_coeff_air * (mid - low_air - FILTER_Q * band_air)
-        energy_air_12khz = energy_air_12khz + (band_air * band_air)
+        -- State-Variable Filter executions on Mid channel (one tight loop per band keeps the filter state in registers)
+        for b = 1, #bands do
+            run_svf(mid, n, bands[b].coeff, bands[b], b == 1 and sub_mid_low or nil)
+        end
 
         -- Sub-bass side channel tracking for mono compatibility
-        low_sub_side = low_sub_side + filter_coeff_sub * band_sub_side
-        band_sub_side = band_sub_side + filter_coeff_sub * (side - low_sub_side - FILTER_Q * band_sub_side)
+        run_svf(side, n, bands[1].coeff, sub_side, sub_side_low)
 
-		-- Accumulate cross-channel correlation at 60Hz
-		local sub_L = low_sub + low_sub_side
-		local sub_R = low_sub - low_sub_side
-		sum_sub_LR = sum_sub_LR + (sub_L * sub_R)
-		sum_sub_LL = sum_sub_LL + (sub_L * sub_L)
-		sum_sub_RR = sum_sub_RR + (sub_R * sub_R)
+        -- Accumulate cross-channel correlation at 60Hz
+        for i = 1, n do
+            local sub_L = sub_mid_low[i] + sub_side_low[i]
+            local sub_R = sub_mid_low[i] - sub_side_low[i]
+            sum_sub_LR = sum_sub_LR + (sub_L * sub_R)
+            sum_sub_LL = sum_sub_LL + (sub_L * sub_L)
+            sum_sub_RR = sum_sub_RR + (sub_R * sub_R)
+        end
+
+        frames_done = frames_done + n
     end
+    reaper.DestroyAudioAccessor(accessor)
+
+    if frames_done < num_samples then return nil end -- the accessor failed part-way through
 
     local true_peak = math.max(peak_left, peak_right)
     local peak_db = (true_peak > 0) and (20 * math.log(true_peak, 10)) or -144
@@ -995,36 +999,24 @@ local function process_audio_chunk(take, item_pos, analyze_start, analyze_dur)
     local full_denom = math.sqrt(sum_full_LL * sum_full_RR)
     local phase_corr = full_denom > 0 and (sum_full_LR / full_denom) or 1.0
 
-    -- Helper to convert any raw band energy accumulation into absolute dBFS
-    local function convert_energy_to_db(energy_sum)
-        local band_rms = math.sqrt(energy_sum / num_samples)
-        if band_rms <= 1e-7 then return -144.0 end
-        return round(20 * math.log(band_rms, 10), 1)
+    local denom = math.sqrt(sum_sub_LL * sum_sub_RR)
+    local correlation = denom > 0 and (sum_sub_LR / denom) or 1.0
+
+    -- Only flag if there is actual bass AND phase correlation drops below 0 (canceling out)
+    local sub_mono_status = "Safe"
+    if convert_energy_to_db(bands[1].energy, num_samples) > -50.0 and correlation < 0.0 then
+        sub_mono_status = "Phase_Risk"
     end
 
-	local denom = math.sqrt(sum_sub_LL * sum_sub_RR)
-	local correlation = denom > 0 and (sum_sub_LR / denom) or 1.0
-
-	-- Only flag if there is actual bass AND phase correlation drops below 0 (canceling out)
-	local sub_mono_status = "Safe"
-	if convert_energy_to_db(energy_sub_60hz) > -50.0 and correlation < 0.0 then
-		sub_mono_status = "Phase_Risk"
-	end
+    local tonal_db = {}
+    for b, key in ipairs(BAND_KEYS) do
+        tonal_db[key] = convert_energy_to_db(bands[b].energy, num_samples)
+    end
 
     return {
         dyn = { peak_db = round(peak_db, 1), rms_db = round(rms_db, 1), crest_db = round(crest_factor, 1) },
         stereo = { width_pct = round(width_pct, 1), sub_mono = sub_mono_status, phase_corr = round(phase_corr, 2) },
-        tonal_db = {
-            sub60 = convert_energy_to_db(energy_sub_60hz),
-            punch120 = convert_energy_to_db(energy_punch_120hz),
-            mud250 = convert_energy_to_db(energy_mud_250hz),
-            boxy500 = convert_energy_to_db(energy_boxy_500hz),
-            mid1k = convert_energy_to_db(energy_core_1khz),
-            pres3k = convert_energy_to_db(energy_presence_3khz),
-            harsh6k = convert_energy_to_db(energy_harsh_6khz),
-            sib8k = convert_energy_to_db(energy_sibilance_8khz),
-            air12k = convert_energy_to_db(energy_air_12khz)
-        }
+        tonal_db = tonal_db
     }
 end
 
@@ -1038,9 +1030,40 @@ local function has_rendered_media_item(media_item)
     return item_len ~= nil and item_len > 0
 end
 
+--- Analyzes the first rendered item that overlaps the region.
+-- Returns the metrics plus the overlap window, or nil when nothing could be analyzed.
+local function analyze_region(render_tracks, region, duration_pref)
+    for _, trk in ipairs(render_tracks) do
+        for item_idx = 0, reaper.CountTrackMediaItems(trk) - 1 do
+            local media_item = reaper.GetTrackMediaItem(trk, item_idx)
+            local take = media_item and reaper.GetActiveTake(media_item)
+
+            if take then
+                local item_start = reaper.GetMediaItemInfo_Value(media_item, "D_POSITION")
+                local item_end = item_start + reaper.GetMediaItemInfo_Value(media_item, "D_LENGTH")
+
+                local overlap_start = math.max(item_start, region.start_s)
+                local overlap_end = math.min(item_end, region.end_s)
+                local overlap_duration = overlap_end - overlap_start
+
+                if overlap_duration > 0 then
+                    local safe_start = overlap_start + math.min(1.0, overlap_duration * 0.1)
+                    local analysis_duration = overlap_end - safe_start
+                    if duration_pref > 0 then
+                        analysis_duration = math.min(duration_pref, analysis_duration)
+                    end
+
+                    local metrics = process_audio_chunk(take, item_start, safe_start, analysis_duration)
+                    if metrics then return metrics, overlap_start, overlap_end end
+                end
+            end
+        end
+    end
+    return nil
+end
+
 local function analyze_ghost_render(regions, duration_pref, tracks_before, pre_render_guids)
     local tracks_after = reaper.CountTracks(0)
-    local num_new_tracks = tracks_after - tracks_before
 
     -- Build a real identity set of tracks created by the render by comparing GUIDs before
     -- and after. This is more reliable than assuming track count/index range alone.
@@ -1060,67 +1083,36 @@ local function analyze_ghost_render(regions, duration_pref, tracks_before, pre_r
             local guid = reaper.GetTrackGUID(trk)
             if not existing_guids[guid] and not seen_render_guids[guid] then
                 seen_render_guids[guid] = true
-                local item_count = reaper.CountTrackMediaItems(trk)
-                local found_audio = false
-                for item_idx = 0, item_count - 1 do
-                    local media_item = reaper.GetTrackMediaItem(trk, item_idx)
-                    if has_rendered_media_item(media_item) then
-                        found_audio = true
+                for item_idx = 0, reaper.CountTrackMediaItems(trk) - 1 do
+                    if has_rendered_media_item(reaper.GetTrackMediaItem(trk, item_idx)) then
+                        table.insert(render_tracks, trk)
                         break
                     end
-                end
-                if found_audio then
-                    table.insert(render_tracks, trk)
                 end
             end
         end
     end
 
-	if #render_tracks == 0 then
+    if #render_tracks == 0 then
         return nil, nil, "CANCELLED"
     end
+
+    -- One pass over the original tracks answers "who is playing?" for every region below
+    local track_index = build_active_track_index(tracks_before)
 
     local regional_metrics = {}
     local region_counter = 1
 
-    if regions and #regions > 0 then
-        for _, region in ipairs(regions) do
-            local analyzed = false
-
-            -- Search across all newly rendered tracks and items for this region.
-            for _, trk in ipairs(render_tracks) do
-                for item_idx = 0, reaper.CountTrackMediaItems(trk) - 1 do
-                    local media_item = reaper.GetTrackMediaItem(trk, item_idx)
-                    local take = media_item and reaper.GetActiveTake(media_item)
-
-                    if take then
-                        local item_start = reaper.GetMediaItemInfo_Value(media_item, "D_POSITION")
-                        local item_end = item_start + reaper.GetMediaItemInfo_Value(media_item, "D_LENGTH")
-
-                        local overlap_start = math.max(item_start, region.start_s)
-                        local overlap_end = math.min(item_end, region.end_s)
-                        local overlap_duration = overlap_end - overlap_start
-
-                        if overlap_duration > 0 and not analyzed then
-                            local safe_start = overlap_start + math.min(1.0, overlap_duration * 0.1)
-                            local analysis_duration = overlap_end - safe_start
-                            if duration_pref > 0 then
-                                analysis_duration = math.min(duration_pref, analysis_duration)
-                            end
-
-                            local clean_name = region.name:gsub("[%s%p]+", "_")
-                            local seq_key = string.format("%02d_%s", region_counter, clean_name)
-
-                            local metrics = process_audio_chunk(take, item_start, safe_start, analysis_duration)
-                            if metrics then
-                                metrics.active_trks = get_active_tracks(overlap_start, overlap_end, tracks_before)
-                                regional_metrics[seq_key] = metrics
-                                analyzed = true
-                                region_counter = region_counter + 1
-                            end
-                        end
-                    end
-                end
+    for _, region in ipairs(regions or {}) do
+        -- Markers have no end time, only regions can be analyzed as a section
+        if region.end_s then
+            local metrics, overlap_start, overlap_end = analyze_region(render_tracks, region, duration_pref)
+            if metrics then
+                local clean_name = region.name:gsub("[%s%p]+", "_")
+                local seq_key = string.format("%02d_%s", region_counter, clean_name)
+                metrics.active_trks = get_active_tracks(track_index, overlap_start, overlap_end)
+                regional_metrics[seq_key] = metrics
+                region_counter = region_counter + 1
             end
         end
     end
@@ -1138,7 +1130,7 @@ local function analyze_ghost_render(regions, duration_pref, tracks_before, pre_r
 
                 local m = process_audio_chunk(take, pos, pos, dur)
                 if m then
-                    m.active_trks = get_active_tracks(pos, pos + dur, tracks_before)
+                    m.active_trks = get_active_tracks(track_index, pos, pos + dur)
                     regional_metrics["01_Entire_Song"] = m
                     break
                 end
@@ -1153,43 +1145,52 @@ local function analyze_ghost_render(regions, duration_pref, tracks_before, pre_r
     return regional_metrics, render_tracks, nil
 end
 
-
 -- ==============================================================================
 -- 9. UNIFIED PROMPT BUILDER & MANDATORY FILE EXPORTER
 -- ==============================================================================
 
 local function build_full_prompt(project_yaml, audio_metrics, target_str, target_tracks)
-    local prompt = "=== MIXING & MASTERING DIRECTIVES ===\nYou are an elite, multi-platinum audio mixing and mastering engineer.\n"
-    prompt = prompt .. "Focus Target: " .. target_str .. "\n\n"
+    local prompt = { "=== MIXING & MASTERING DIRECTIVES ===\nYou are an elite, multi-platinum audio mixing and mastering engineer.\n" }
+    prompt[#prompt + 1] = "Focus Target: " .. target_str .. "\n\n"
 
-    prompt = prompt .. "=== TARGET TRACKS ===\n"
+    prompt[#prompt + 1] = "=== TARGET TRACKS ===\n"
     if target_tracks and #target_tracks > 0 then
-        prompt = prompt .. "The following tracks are currently active for this specific analysis:\n"
-        prompt = prompt .. table.concat(target_tracks, ", ") .. "\n\n"
-        prompt = prompt .. "CRITICAL RESTRICTION: Focus YOUR ENTIRE ANALYSIS and plugin recommendations SOLELY on these specific tracks, plus the Master Bus if relevant. Do not critique or suggest parameter changes for any tracks outside this list.\n\n"
+        prompt[#prompt + 1] = "The following tracks are currently active for this specific analysis:\n"
+        prompt[#prompt + 1] = table.concat(target_tracks, ", ") .. "\n\n"
+        prompt[#prompt + 1] = "CRITICAL RESTRICTION: Focus YOUR ENTIRE ANALYSIS and plugin recommendations SOLELY on these specific tracks, plus the Master Bus if relevant. Do not critique or suggest parameter changes for any tracks outside this list.\n\n"
     else
-        prompt = prompt .. "All active tracks are included in this full mix analysis.\n\n"
+        prompt[#prompt + 1] = "All active tracks are included in this full mix analysis.\n\n"
     end
 
     -- UNIFIED INSTRUCTIONS BLOCK
-    prompt = prompt .. "=== INSTRUCTIONS FOR ANALYSIS ===\n"
-    prompt = prompt .. "1. MACRO-DYNAMICS: Compare Crest Factor and RMS across regions. If dynamic contrast is lacking, pinpoint over-compression in the YAML and specify threshold/ratio adjustments.\n"
-    prompt = prompt .. "2. LOW/MID FREQUENCY BALANCE: Scrutinize Sub (60Hz), Punch (120Hz), Mud (250Hz), and Boxy (500Hz). Locate masking in the project tracks and suggest surgical EQ cuts.\n"
-    prompt = prompt .. "3. HIGH FREQUENCY INTEGRITY: Differentiate Harshness (6kHz) from Sibilance (8kHz). Look for abrasive saturation or identify tracks requiring a De-Esser.\n"
-    prompt = prompt .. "4. STEREO & SUB-MONO INTEGRITY: Check 'width_pct', 'phase_corr', and 'sub_mono'. 'phase_corr' is full-spectrum phase correlation (-1.0 to +1.0). If 'phase_corr' is low (< 0.5) or 'Phase_Risk' is flagged on sub-bass, identify phase issues across wide stereo elements or plugins and advise how to fix them.\n"
-    prompt = prompt .. "Be precise: Quote exact track names, plugin names, and parameter settings as formatted in the project YAML.\n"
-    prompt = prompt .. "Look closely at 'active_trks' for each region. ONLY critique or suggest changes to tracks that are actively playing in that specific region.\n"
-    prompt = prompt .. "When suggesting dynamic EQ or compressor settings do not suggest threshold, always suggest gain reduction that we should achieve.\n"
-    prompt = prompt .. "Be totally honest and give as much information as possible to educate me but also be short.\n\n"
+    prompt[#prompt + 1] = "=== INSTRUCTIONS FOR ANALYSIS ===\n"
+    prompt[#prompt + 1] = "1. MACRO-DYNAMICS: Compare Crest Factor and RMS across regions. If dynamic contrast is lacking, pinpoint over-compression in the YAML and specify threshold/ratio adjustments.\n"
+    prompt[#prompt + 1] = "2. LOW/MID FREQUENCY BALANCE: Scrutinize Sub (60Hz), Punch (120Hz), Mud (250Hz), and Boxy (500Hz). Locate masking in the project tracks and suggest surgical EQ cuts.\n"
+    prompt[#prompt + 1] = "3. HIGH FREQUENCY INTEGRITY: Differentiate Harshness (6kHz) from Sibilance (8kHz). Look for abrasive saturation or identify tracks requiring a De-Esser.\n"
+    prompt[#prompt + 1] = "4. STEREO & SUB-MONO INTEGRITY: Check 'width_pct', 'phase_corr', and 'sub_mono'. 'phase_corr' is full-spectrum phase correlation (-1.0 to +1.0). If 'phase_corr' is low (< 0.5) or 'Phase_Risk' is flagged on sub-bass, identify phase issues across wide stereo elements or plugins and advise how to fix them.\n"
+    prompt[#prompt + 1] = "Be precise: Quote exact track names, plugin names, and parameter settings as formatted in the project YAML.\n"
+    prompt[#prompt + 1] = "Look closely at 'active_trks' for each region. ONLY critique or suggest changes to tracks that are actively playing in that specific region.\n"
+    prompt[#prompt + 1] = "When suggesting dynamic EQ or compressor settings do not suggest threshold, always suggest gain reduction that we should achieve.\n"
+    prompt[#prompt + 1] = "Be totally honest and give as much information as possible to educate me but also be short.\n\n"
 
-    prompt = prompt .. "=== REGIONAL AUDIO ANALYSIS METRICS ===\n" .. to_yaml(audio_metrics) .. "\n\n"
-    prompt = prompt .. "=== REAPER PROJECT CONFIGURATION & FX CHAINS ===\n" .. project_yaml .. "\n"
+    prompt[#prompt + 1] = "=== REGIONAL AUDIO ANALYSIS METRICS ===\n" .. to_yaml(audio_metrics) .. "\n\n"
+    prompt[#prompt + 1] = "=== REAPER PROJECT CONFIGURATION & FX CHAINS ===\n" .. project_yaml .. "\n"
 
-    return prompt
+    return table.concat(prompt)
+end
+
+--- Returns the first "<dir><base>.txt" / "<dir><base>_01.txt" ... that does not exist yet (never overwrites).
+local function find_free_filename(dir, base_filename)
+    local path = dir .. base_filename .. ".txt"
+    local counter = 1
+    while reaper.file_exists(path) do
+        path = dir .. base_filename .. string.format("_%02d", counter) .. ".txt"
+        counter = counter + 1
+    end
+    return path
 end
 
 local function save_prompt_to_txt(full_prompt, target_str)
-    local path_separator = package.config:sub(1,1) or "/"
     local sanitized_target = target_str:gsub("[%s%p]+", "_")
     local base_filename = "AI_Mix_Prompt_" .. sanitized_target
 
@@ -1216,31 +1217,16 @@ local function save_prompt_to_txt(full_prompt, target_str)
 
     -- Ensure proper trailing slash
     if not target_dir:match("[\\/]$") then
-        target_dir = target_dir .. path_separator
+        target_dir = target_dir .. PATH_SEPARATOR
     end
 
     -- 4. Auto-Numbering Logic (Prevents overwriting existing files)
-    local output_filename = target_dir .. base_filename .. ".txt"
-    local counter = 1
-
-    while reaper.file_exists(output_filename) do
-        output_filename = target_dir .. base_filename .. string.format("_%02d", counter) .. ".txt"
-        counter = counter + 1
-    end
-
+    local output_filename = find_free_filename(target_dir, base_filename)
     local file, err = io.open(output_filename, "w")
 
     -- Emergency Fallback: If project folder is write-protected, redirect to REAPER's resource folder
     if not file then
-        local fallback_dir = reaper.GetResourcePath() .. path_separator
-        output_filename = fallback_dir .. base_filename .. ".txt"
-        counter = 1
-
-        while reaper.file_exists(output_filename) do
-            output_filename = fallback_dir .. base_filename .. string.format("_%02d", counter) .. ".txt"
-            counter = counter + 1
-        end
-
+        output_filename = find_free_filename(reaper.GetResourcePath() .. PATH_SEPARATOR, base_filename)
         file, err = io.open(output_filename, "w")
     end
 
@@ -1257,6 +1243,86 @@ local function save_prompt_to_txt(full_prompt, target_str)
         )
         return nil
     end
+end
+
+-- ------------------------------------------------------------------------------
+-- RESULT TABLES: one column definition drives BOTH the chat (Markdown) table and the HTML report
+-- ------------------------------------------------------------------------------
+
+local TABLE_TITLES = { "1. Macro-Dynamics & Stereo Summary", "2. Tonal Balance Summary (dBFS)" }
+
+-- label = chat header, html = report header, fmt = number format, get(m, html) = cell value
+local DYNAMICS_COLUMNS = {
+    { label = "Peak",       html = "Peak (dB)",   fmt = "%.1f",  get = function(m) return m.dyn.peak_db end },
+    { label = "RMS",        html = "RMS (dB)",    fmt = "%.1f",  get = function(m) return m.dyn.rms_db end },
+    { label = "Crest",      html = "Crest (dB)",  fmt = "%.1f",  get = function(m) return m.dyn.crest_db end },
+    { label = "Width",      html = "Width (%)",   fmt = "%.0f%%", get = function(m) return m.stereo.width_pct end },
+    { label = "Phase Corr", html = "Phase Corr",  fmt = "%.2f",  get = function(m) return m.stereo.phase_corr or 1.0 end },
+    { label = "Sub-Mono",   html = "Sub-Mono",    fmt = "%s",    get = function(m, html)
+        if m.stereo.sub_mono == "Phase_Risk" then
+            return html and "<span class='risk'>Risk</span>" or "Risk"
+        end
+        return html and "<span class='safe'>Safe</span>" or "Safe"
+    end },
+}
+
+local TONAL_COLUMNS = {}
+do
+    local tonal_labels = { "Sub", "Punch", "Mud", "Boxy", "Core", "Pres", "Harsh", "Sib", "Air" }
+    local tonal_html   = { "Sub (60Hz)", "Punch (120Hz)", "Mud (250Hz)", "Boxy (500Hz)", "Core (1kHz)", "Pres (3kHz)", "Harsh (6kHz)", "Sib (8kHz)", "Air (12kHz)" }
+    for b, key in ipairs(BAND_KEYS) do
+        TONAL_COLUMNS[b] = { label = tonal_labels[b], html = tonal_html[b], fmt = "%.1f", get = function(m) return m.tonal_db[key] end }
+    end
+end
+
+--- Region keys ("01_Verse_1", "02_Chorus", ...) in playing order.
+local function get_sorted_regions(audio_metrics)
+    local sorted_regions = {}
+    for r_key in pairs(audio_metrics) do table.insert(sorted_regions, r_key) end
+    table.sort(sorted_regions)
+    return sorted_regions
+end
+
+--- "01_Verse_1" -> "Verse 1"
+local function get_region_display_name(r_key)
+    return (r_key:gsub("^%d+_", ""):gsub("_", " "))
+end
+
+--- Builds one Markdown table (header + one row per region) for the chat window.
+local function build_markdown_table(columns, audio_metrics)
+    local labels = {}
+    for i, col in ipairs(columns) do labels[i] = col.label end
+    local lines = {
+        "| Region | " .. table.concat(labels, " | ") .. " |\n",
+        "|---|" .. string.rep("---|", #columns) .. "\n"
+    }
+
+    for _, r_key in ipairs(get_sorted_regions(audio_metrics)) do
+        local m = audio_metrics[r_key]
+        local cells = {}
+        for i, col in ipairs(columns) do cells[i] = string.format(col.fmt, col.get(m, false)) end
+        lines[#lines + 1] = "| " .. get_region_display_name(r_key) .. " | " .. table.concat(cells, " | ") .. " |\n"
+    end
+    return table.concat(lines)
+end
+
+--- Builds one HTML <table> (header + one row per region) for the report file.
+local function build_html_table(columns, audio_metrics)
+    local headers = {}
+    for i, col in ipairs(columns) do headers[i] = "<th>" .. col.html .. "</th>" end
+    local lines = {
+        "    <table>\n",
+        "        <tr><th>Region</th>" .. table.concat(headers) .. "</tr>\n"
+    }
+
+    for _, r_key in ipairs(get_sorted_regions(audio_metrics)) do
+        local m = audio_metrics[r_key]
+        local cells = {}
+        for i, col in ipairs(columns) do cells[i] = "<td>" .. string.format(col.fmt, col.get(m, true)) .. "</td>" end
+        lines[#lines + 1] = "<tr><td>" .. get_region_display_name(r_key) .. "</td>" .. table.concat(cells) .. "</tr>\n"
+    end
+    lines[#lines + 1] = "    </table>\n"
+    return table.concat(lines)
 end
 
 local function save_tables_to_html(audio_metrics, txt_file_path, target_str)
@@ -1286,43 +1352,11 @@ local function save_tables_to_html(audio_metrics, txt_file_path, target_str)
 <body>
     <h2>Mix & Master Analysis: <b>]] .. target_str .. [[</b></h2>
 
-    <h3>1. Macro-Dynamics & Stereo Summary</h3>
-    <table>
-        <tr><th>Region</th><th>Peak (dB)</th><th>RMS (dB)</th><th>Crest (dB)</th><th>Width (%)</th><th>Phase Corr</th><th>Sub-Mono</th></tr>
-]]
+    <h3>]] .. TABLE_TITLES[1] .. [[</h3>
+]] .. build_html_table(DYNAMICS_COLUMNS, audio_metrics) .. [[
 
-    local sorted_regions = {}
-    for r_key in pairs(audio_metrics) do table.insert(sorted_regions, r_key) end
-    table.sort(sorted_regions)
-
-    for _, r_key in ipairs(sorted_regions) do
-        local m = audio_metrics[r_key]
-        local clean_name = r_key:gsub("^%d+_", ""):gsub("_", " ")
-        local phase_status = m.stereo.sub_mono == "Phase_Risk" and "<span class='risk'>Risk</span>" or "<span class='safe'>Safe</span>"
-        local phase_corr_val = m.stereo.phase_corr or 1.0
-
-        html = html .. string.format("<tr><td>%s</td><td>%.1f</td><td>%.1f</td><td>%.1f</td><td>%.0f%%</td><td>%.2f</td><td>%s</td></tr>\n",
-            clean_name, m.dyn.peak_db, m.dyn.rms_db, m.dyn.crest_db, m.stereo.width_pct, phase_corr_val, phase_status)
-    end
-
-    html = html .. [[
-    </table>
-
-    <h3>2. Tonal Balance Summary (dBFS)</h3>
-    <table>
-        <tr><th>Region</th><th>Sub (60Hz)</th><th>Punch (120Hz)</th><th>Mud (250Hz)</th><th>Boxy (500Hz)</th><th>Core (1kHz)</th><th>Pres (3kHz)</th><th>Harsh (6kHz)</th><th>Sib (8kHz)</th><th>Air (12kHz)</th></tr>
-]]
-
-    for _, r_key in ipairs(sorted_regions) do
-        local m = audio_metrics[r_key]
-        local clean_name = r_key:gsub("^%d+_", ""):gsub("_", " ")
-
-        html = html .. string.format("<tr><td>%s</td><td>%.1f</td><td>%.1f</td><td>%.1f</td><td>%.1f</td><td>%.1f</td><td>%.1f</td><td>%.1f</td><td>%.1f</td><td>%.1f</td></tr>\n",
-            clean_name, m.tonal_db.sub60, m.tonal_db.punch120, m.tonal_db.mud250, m.tonal_db.boxy500, m.tonal_db.mid1k, m.tonal_db.pres3k, m.tonal_db.harsh6k, m.tonal_db.sib8k, m.tonal_db.air12k)
-    end
-
-    html = html .. [[
-    </table>
+    <h3>]] .. TABLE_TITLES[2] .. [[</h3>
+]] .. build_html_table(TONAL_COLUMNS, audio_metrics) .. [[
 </body>
 </html>
 ]]
@@ -1348,6 +1382,24 @@ local function build_json_messages(messages)
     return "[" .. table.concat(json_msgs, ",") .. "]"
 end
 
+--- Reads a whole file; nil when it cannot be opened.
+local function read_file(path)
+    local f = io.open(path, "r")
+    if not f then return nil end
+    local content = f:read("*a")
+    f:close()
+    return content
+end
+
+--- Writes the lines to a file (one per line); false when it cannot be created.
+local function write_lines(path, lines)
+    local f = io.open(path, "w")
+    if not f then return false end
+    f:write(table.concat(lines, "\n"), "\n")
+    f:close()
+    return true
+end
+
 -- ==============================================================================
 -- LIGHTWEIGHT PURE-LUA JSON DECODER
 -- ==============================================================================
@@ -1364,45 +1416,40 @@ local function parse_json(str)
 
     local parse_value
 
+    local JSON_ESCAPES = { b = "\b", f = "\f", n = "\n", r = "\r", t = "\t" }
+
     local function parse_string()
         pos = pos + 1 -- Skip opening quote
         local chars = {}
         while pos <= len do
+            -- Copy the whole run of ordinary characters at once; only quotes and backslashes need attention
+            local special = str:find('["\\]', pos) or (len + 1)
+            table.insert(chars, str:sub(pos, special - 1))
+            pos = special
+
             local c = str:sub(pos, pos)
             if c == '"' then
                 pos = pos + 1
                 return table.concat(chars)
             elseif c == '\\' then
-                pos = pos + 1
-                local esc = str:sub(pos, pos)
-                if esc == '"' or esc == '\\' or esc == '/' then
-                    table.insert(chars, esc)
-                elseif esc == 'b' then table.insert(chars, '\b')
-                elseif esc == 'f' then table.insert(chars, '\f')
-                elseif esc == 'n' then table.insert(chars, '\n')
-                elseif esc == 'r' then table.insert(chars, '\r')
-                elseif esc == 't' then table.insert(chars, '\t')
-                elseif esc == 'u' then
-                    local hex = str:sub(pos + 1, pos + 4)
-                    local cp = tonumber(hex, 16)
+                local esc = str:sub(pos + 1, pos + 1)
+                pos = pos + 2
+                if esc == 'u' then
+                    local cp = tonumber(str:sub(pos, pos + 3), 16)
                     if cp then
                         pos = pos + 4
-                        -- Convert Unicode code point to UTF-8
-                        if cp < 0x80 then
-                            table.insert(chars, string.char(cp))
-                        elseif cp < 0x800 then
-                            table.insert(chars, string.char(0xC0 + math.floor(cp / 64), 0x80 + (cp % 64)))
-                        else
-                            table.insert(chars, string.char(0xE0 + math.floor(cp / 4096), 0x80 + (math.floor(cp / 64) % 64), 0x80 + (cp % 64)))
+                        -- Combine UTF-16 surrogate pairs (emoji etc.) into one code point
+                        local low = (cp >= 0xD800 and cp <= 0xDBFF) and tonumber(str:match("^\\u(%x%x%x%x)", pos) or "", 16)
+                        if low and low >= 0xDC00 and low <= 0xDFFF then
+                            cp = 0x10000 + (cp - 0xD800) * 0x400 + (low - 0xDC00)
+                            pos = pos + 6
                         end
+                        table.insert(chars, utf8.char(cp)) -- code point -> UTF-8 bytes
                     end
                 else
-                    table.insert(chars, esc)
+                    -- \" \\ \/ map to themselves; \b \f \n \r \t map to control characters
+                    table.insert(chars, JSON_ESCAPES[esc] or esc)
                 end
-                pos = pos + 1
-            else
-                table.insert(chars, c)
-                pos = pos + 1
             end
         end
         error("Unterminated string in JSON")
@@ -1411,37 +1458,21 @@ local function parse_json(str)
     local function parse_number()
         local start_pos = pos
 
-        -- Optional leading sign
-        if str:sub(pos, pos) == '-' or str:sub(pos, pos) == '+' then
-            pos = pos + 1
-        end
-
-        -- Integer part
-        while pos <= len and str:sub(pos, pos):match('%d') do
-            pos = pos + 1
-        end
+        -- Optional sign + integer part
+        local _, int_end = str:find("^[%+%-]?%d*", pos)
+        pos = int_end + 1
 
         -- Fractional part
         if str:sub(pos, pos) == '.' then
-            pos = pos + 1
-            while pos <= len and str:sub(pos, pos):match('%d') do
-                pos = pos + 1
-            end
+            local _, frac_end = str:find("^%d*", pos + 1)
+            pos = frac_end + 1
         end
 
         -- Exponent part
-        if str:sub(pos, pos) == 'e' or str:sub(pos, pos) == 'E' then
-            local exp_pos = pos
-            pos = pos + 1
-            if str:sub(pos, pos) == '-' or str:sub(pos, pos) == '+' then
-                pos = pos + 1
-            end
-            while pos <= len and str:sub(pos, pos):match('%d') do
-                pos = pos + 1
-            end
-            if pos == exp_pos + 1 then
-                error("Invalid exponent in JSON number at pos " .. exp_pos)
-            end
+        if str:sub(pos, pos):match("[eE]") then
+            local exponent = str:match("^[eE][%+%-]?%d+", pos)
+            if not exponent then error("Invalid exponent in JSON number at pos " .. pos) end
+            pos = pos + #exponent
         end
 
         return tonumber(str:sub(start_pos, pos - 1))
@@ -1534,9 +1565,8 @@ end
 
 local function shell_quote_for_curl(value)
     local text = tostring(value or "")
-    local os_name = reaper.GetOS()
 
-    if os_name:match("Win") then
+    if IS_WINDOWS then
         text = text:gsub('"', '""')
         return '"' .. text .. '"'
     end
@@ -1549,49 +1579,35 @@ end
 local function resolve_curl_binary()
     if cached_curl_cmd then return cached_curl_cmd end
 
-    local os_name = reaper.GetOS()
-
-    -- 1. Windows Path Resolution
-    if os_name:match("Win") then
+    local candidates
+    if IS_WINDOWS then
+        -- 1. Windows Path Resolution
         local windir = os.getenv("WINDIR") or "C:\\Windows"
-        local candidates = {
+        candidates = {
             windir .. "\\System32\\curl.exe",
             windir .. "\\Sysnative\\curl.exe",
             "C:\\Program Files\\Git\\mingw64\\bin\\curl.exe",
             "C:\\Program Files\\Git\\usr\\bin\\curl.exe",
         }
-
-        for _, filepath in ipairs(candidates) do
-            if reaper.file_exists(filepath) then
-                cached_curl_cmd = '"' .. filepath .. '"'
-                return cached_curl_cmd
-            end
-        end
-
-    -- 2. macOS / Linux Path Resolution
     else
-        local unix_candidates = {
-            "/usr/bin/curl",
-            "/usr/local/bin/curl",
-            "/opt/homebrew/bin/curl",
-        }
+        -- 2. macOS / Linux Path Resolution
+        candidates = { "/usr/bin/curl", "/usr/local/bin/curl", "/opt/homebrew/bin/curl" }
+    end
 
-        for _, filepath in ipairs(unix_candidates) do
-            if reaper.file_exists(filepath) then
-                cached_curl_cmd = filepath
-                return cached_curl_cmd
-            end
+    for _, filepath in ipairs(candidates) do
+        if reaper.file_exists(filepath) then
+            cached_curl_cmd = IS_WINDOWS and ('"' .. filepath .. '"') or filepath
+            return cached_curl_cmd
         end
     end
 
     -- 3. Final safe probe: if curl is not in the known locations, check PATH.
-    local probe_cmd = os_name:match("Win") and 'curl.exe --version >nul 2>&1' or 'curl --version >/dev/null 2>&1'
+    local probe_cmd = IS_WINDOWS and 'curl.exe --version >nul 2>&1' or 'curl --version >/dev/null 2>&1'
     if command_succeeded(probe_cmd) then
         cached_curl_cmd = "curl"
         return cached_curl_cmd
     end
 
-    cached_curl_cmd = nil
     return nil
 end
 
@@ -1626,30 +1642,21 @@ local function ask_deep_seek(chat_history, model_name)
                          '-d ' .. shell_quote_for_curl('@' .. temp_json_path)
 
     -- Windows cmd.exe quote-stripping protection
-    local os_name = reaper.GetOS()
-    if os_name:match("Win") then
+    if IS_WINDOWS then
         -- REAPER's ExecProcess runs completely hidden. Timeout 0 means "wait until finished".
         reaper.ExecProcess('cmd.exe /c "' .. curl_command .. '"', 0)
     else
         os.execute(curl_command)
     end
 
-    local response_file = io.open(temp_response_path, "r")
-    if not response_file then
+    local raw_response = read_file(temp_response_path)
+    if not raw_response then
         return "Network Error: API request failed or timed out.\n\n" ..
                "Troubleshooting:\n" ..
                "1. Verify internet connection.\n" ..
                "2. Ensure cURL is installed. If on an older Windows version, install cURL or place curl.exe in C:\\Windows\\System32."
     end
-    local raw_response = response_file:read("*a")
-    response_file:close()
-
-    local header_file = io.open(temp_response_path .. ".headers", "r")
-    local headers = ""
-    if header_file then
-        headers = header_file:read("*a")
-        header_file:close()
-    end
+    local headers = read_file(temp_response_path .. ".headers") or ""
 
     os.remove(temp_json_path)
     os.remove(temp_response_path)
@@ -1694,6 +1701,15 @@ local balance_is_fetching = false
 local balance_temp_file = reaper.GetResourcePath() .. "/temp_balance.txt"
 local balance_done_file = reaper.GetResourcePath() .. "/temp_balance.done"
 local balance_script_file = reaper.GetResourcePath() .. "/temp_balance_script"
+local next_balance_poll_time = 0 -- the "done" flag file is only checked a few times per second, not every frame
+
+--- Deletes the balance result, the completion flag and every helper script.
+local function cleanup_balance_files()
+    for _, path in ipairs({ balance_temp_file, balance_done_file,
+                            balance_script_file .. ".bat", balance_script_file .. ".vbs", balance_script_file .. ".sh" }) do
+        os.remove(path)
+    end
+end
 
 local function fetch_deep_seek_balance()
     if balance_is_fetching then return end
@@ -1713,49 +1729,38 @@ local function fetch_deep_seek_balance()
     balance_is_fetching = true
 
     -- Clean up previous async files
-    os.remove(balance_temp_file)
-    os.remove(balance_done_file)
-    os.remove(balance_script_file .. ".bat")
-    os.remove(balance_script_file .. ".vbs")
-    os.remove(balance_script_file .. ".sh")
+    cleanup_balance_files()
 
-    local os_name = reaper.GetOS()
     local curl_cmd = curl_bin .. ' -sS -H ' .. shell_quote_for_curl('Authorization: Bearer ' .. API_KEY) ..
                      ' https://api.deepseek.com/user/balance'
 
-    if os_name:match("Win") then
+    -- Both helper scripts run curl, store its answer, then raise the "done" flag file that the UI polls for
+    local run_curl_lines = { curl_cmd .. ' > "' .. balance_temp_file .. '" 2>&1', 'echo DONE > "' .. balance_done_file .. '"' }
+    local launched
+
+    if IS_WINDOWS then
         local bat_path = balance_script_file .. ".bat"
         local vbs_path = balance_script_file .. ".vbs"
 
-        -- 1. Create the Batch script
-        local bat = io.open(bat_path, "w")
-        if not bat then balance_is_fetching = false; user_balance_str = "I/O Error"; return end
-        bat:write("@echo off\n")
-        bat:write(curl_cmd .. ' > "' .. balance_temp_file .. '" 2>&1\n')
-        bat:write('echo DONE > "' .. balance_done_file .. '"\n')
-        bat:close()
-
-        -- 2. Create the VBScript wrapper using safe quotes to prevent any syntax hanging
-        local vbs = io.open(vbs_path, "w")
-        if not vbs then balance_is_fetching = false; user_balance_str = "I/O Error"; return end
-        vbs:write('Set objShell = CreateObject("WScript.Shell")\n')
-        vbs:write('objShell.Run "cmd.exe /c " & Chr(34) & "' .. bat_path .. '" & Chr(34), 0, False\n')
-        vbs:close()
+        -- 1. Batch script  2. VBScript wrapper (safe quotes prevent any syntax hanging)
+        launched = write_lines(bat_path, { "@echo off", run_curl_lines[1], run_curl_lines[2] })
+            and write_lines(vbs_path, {
+                'Set objShell = CreateObject("WScript.Shell")',
+                'objShell.Run "cmd.exe /c " & Chr(34) & "' .. bat_path .. '" & Chr(34), 0, False' })
 
         -- 3. Launch via native REAPER ExecProcess using -1 (Launch detached and immediately return)
         -- This guarantees the UI thread will not block waiting for curl to finish.
-        reaper.ExecProcess('wscript.exe "' .. vbs_path .. '"', -1)
+        if launched then reaper.ExecProcess('wscript.exe "' .. vbs_path .. '"', -1) end
     else
         -- Mac/Linux invisible background execution (stream redirect to fully detach handles)
         local sh_path = balance_script_file .. ".sh"
-        local sh = io.open(sh_path, "w")
-        if not sh then balance_is_fetching = false; user_balance_str = "I/O Error"; return end
-        sh:write("#!/bin/sh\n")
-        sh:write(curl_cmd .. ' > "' .. balance_temp_file .. '" 2>&1\n')
-        sh:write('echo DONE > "' .. balance_done_file .. '"\n')
-        sh:close()
+        launched = write_lines(sh_path, { "#!/bin/sh", run_curl_lines[1], run_curl_lines[2] })
+        if launched then os.execute('sh "' .. sh_path .. '" >/dev/null 2>&1 &') end
+    end
 
-        os.execute('sh "' .. sh_path .. '" >/dev/null 2>&1 &')
+    if not launched then
+        balance_is_fetching = false
+        user_balance_str = "I/O Error"
     end
 end
 
@@ -1763,57 +1768,52 @@ end
 local function poll_deep_seek_balance()
     if not balance_is_fetching then return end
 
+    local now = reaper.time_precise()
+    if now < next_balance_poll_time then return end
+    next_balance_poll_time = now + 0.25
+
     -- Check if background script created the completion flag
-    local f = io.open(balance_done_file, "r")
-    if f then
-        f:close()
-        balance_is_fetching = false
+    if not read_file(balance_done_file) then return end
+    balance_is_fetching = false
 
-        -- Safely read the result
-        local res_f = io.open(balance_temp_file, "r")
-        local raw = res_f and res_f:read("*a") or ""
-        if res_f then res_f:close() end
+    -- Safely read the result
+    local raw = read_file(balance_temp_file) or ""
 
-        -- Complete cleanup of all temporary scripts and files
-        os.remove(balance_temp_file)
-        os.remove(balance_done_file)
-        os.remove(balance_script_file .. ".bat")
-        os.remove(balance_script_file .. ".vbs")
-        os.remove(balance_script_file .. ".sh")
+    -- Complete cleanup of all temporary scripts and files
+    cleanup_balance_files()
 
-        if raw == "" then
-            user_balance_str = "Check Failed"
+    if raw == "" then
+        user_balance_str = "Check Failed"
+        return
+    end
+
+    local total_balance = nil
+    local currency = "USD"
+
+    -- 1. Parse via JSON decoder
+    local ok_json, data = parse_json(raw)
+    if ok_json and type(data) == "table" then
+        if data.error then
+            user_balance_str = data.error.message or "API Error"
             return
         end
+        local info = (data.balance_infos and data.balance_infos[1]) or data
+        total_balance = info.total_balance or info.total or info.balance
+        currency = info.currency or currency
+    end
 
-        local total_balance = nil
-        local currency = "USD"
+    -- 2. Direct regex fallback
+    if not total_balance then
+        total_balance = raw:match('"total_balance"%s*:%s*"(.-)"')
+        currency = raw:match('"currency"%s*:%s*"(.-)"') or currency
+    end
 
-        -- 1. Parse via JSON decoder
-        local ok_json, data = parse_json(raw)
-        if ok_json and type(data) == "table" then
-            if data.error then
-                user_balance_str = data.error.message or "API Error"
-                return
-            end
-            local info = (data.balance_infos and data.balance_infos[1]) or data
-            total_balance = info.total_balance or info.total or info.balance
-            currency = info.currency or currency
-        end
-
-        -- 2. Direct regex fallback
-        if not total_balance then
-            total_balance = raw:match('"total_balance"%s*:%s*"(.-)"')
-            currency = raw:match('"currency"%s*:%s*"(.-)"') or currency
-        end
-
-        if total_balance then
-            local symbol = (currency == "USD") and "$" or "¥"
-            user_balance_str = symbol .. tostring(total_balance)
-        else
-            user_balance_str = "Check Failed"
-            reaper.ShowConsoleMsg("\n[DeepSeek Balance Error]\nRaw Server Output:\n" .. tostring(raw) .. "\n")
-        end
+    if total_balance then
+        local symbol = (currency == "USD") and "$" or "¥"
+        user_balance_str = symbol .. tostring(total_balance)
+    else
+        user_balance_str = "Check Failed"
+        reaper.ShowConsoleMsg("\n[DeepSeek Balance Error]\nRaw Server Output:\n" .. tostring(raw) .. "\n")
     end
 end
 
@@ -1843,98 +1843,143 @@ local function render_role_badge(ctx, label, bg_color, text_color, id)
     reaper.ImGui_Dummy(ctx, 0, 3) -- Healthy spacing below badge
 end
 
-local function render_markdown_text(ctx, text, msg_id)
-    if not text or text == "" then return end
+--- Dark, full-width section banner (e.g. "SCAN CONFIGURATION & CONTROLS")
+local function render_section_header(ctx, label)
+    reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Button(), 0x333333FF)
+    reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), 0xFFFF33FF)
+    reaper.ImGui_PushStyleVar(ctx, reaper.ImGui_StyleVar_FramePadding(), 8, 8)
+    reaper.ImGui_PushStyleVar(ctx, reaper.ImGui_StyleVar_ButtonTextAlign(), 0.0, 0.5)
 
-    local in_table = false
-    local table_counter = 0
-    local total_cols = 0
+    reaper.ImGui_BeginDisabled(ctx, true)
+    reaper.ImGui_Button(ctx, label, -1, 0)
+    reaper.ImGui_EndDisabled(ctx)
+
+    reaper.ImGui_PopStyleVar(ctx, 2)
+    reaper.ImGui_PopStyleColor(ctx, 2)
+    reaper.ImGui_Dummy(ctx, 0, 4)
+end
+
+--- Strips Markdown bold markers (**text**)
+local function strip_bold(text)
+    return (text:gsub("%*%*(.-)%*%*", "%1"))
+end
+
+--- Converts Markdown text into a list of drawing blocks (header / bullet / number / para / table).
+-- ImGui redraws the whole chat every frame, so the text is parsed ONCE per message and the
+-- cached blocks are reused, instead of re-running every pattern match on every message 60 times a second.
+local function parse_markdown(text)
+    local blocks = {}
+    if not text or text == "" then return blocks end
+
+    local current_table = nil
 
     for line in text:gmatch("([^\r\n]*)[\r\n]?") do
         if line ~= "" then
             -- Detect Markdown Table Rows
             if line:match("^%s*|.*|%s*$") then
                 -- Skip markdown separator row (e.g., |---|---|)
-                if line:match("^%s*[|%-%s:]+$") then
-                    -- separator row
-                else
-                    if not in_table then
-                        table_counter = table_counter + 1
+                if not line:match("^%s*[|%-%s:]+$") then
+                    if not current_table then
                         local cols = 0
                         for _ in line:gmatch("|") do cols = cols + 1 end
-                        total_cols = math.max(1, cols - 1)
-
-                        local flags = reaper.ImGui_TableFlags_Borders()
-                                    | reaper.ImGui_TableFlags_RowBg()
-                                    | reaper.ImGui_TableFlags_SizingFixedFit()
-                                    | reaper.ImGui_TableFlags_NoSavedSettings()
-
-                        local table_id = "MDTable_" .. tostring(msg_id or 0) .. "_" .. table_counter
-                        if reaper.ImGui_BeginTable(ctx, table_id, total_cols, flags) then
-                            in_table = true
-                            for c = 0, total_cols - 1 do
-                                reaper.ImGui_TableSetupColumn(ctx, "Col" .. c)
-                            end
-                        end
+                        current_table = { kind = "table", cols = math.max(1, cols - 1), rows = {} }
+                        table.insert(blocks, current_table)
                     end
 
-                    if in_table then
-                        reaper.ImGui_TableNextRow(ctx)
-                        local col_idx = 0
-                        for cell_text in line:gmatch("|([^|]+)") do
-                            if col_idx < total_cols then
-                                reaper.ImGui_TableSetColumnIndex(ctx, col_idx)
-                                local clean_cell = trim_string(cell_text:gsub("%*%*(.-)%*%*", "%1"))
-                                reaper.ImGui_Text(ctx, clean_cell)
-                                col_idx = col_idx + 1
-                            end
+                    local cells = {}
+                    for cell_text in line:gmatch("|([^|]+)") do
+                        if #cells < current_table.cols then
+                            table.insert(cells, trim_string(cell_text:gsub("%*%*(.-)%*%*", "%1")))
                         end
                     end
+                    table.insert(current_table.rows, cells)
                 end
             else
-                -- If we were drawing a table and hit a normal line, close the table cleanly
-                if in_table then
-                    reaper.ImGui_EndTable(ctx)
-                    in_table = false
-                    reaper.ImGui_Dummy(ctx, 0, 8)
+                -- If we were collecting a table and hit a normal line, close the table cleanly
+                if current_table then
+                    current_table.gap_after = true
+                    current_table = nil
                 end
 
+                local header_text = line:match("^#+%s*(.+)")
+                local bullet_text = line:match("^[%*%-]%s+(.+)")
+                local num, item_text = line:match("^(%d+%.)%s+(.+)")
+
                 -- Headers (### Title)
-                if line:match("^#+%s*(.+)") then
-                    local header_text = line:match("^#+%s*(.+)")
-                    reaper.ImGui_Dummy(ctx, 0, 4)
-                    reaper.ImGui_TextColored(ctx, 0xFFD54FFF, "▶  " .. header_text)
-                    reaper.ImGui_Separator(ctx)
-                    reaper.ImGui_Dummy(ctx, 0, 2)
-
+                if header_text then
+                    table.insert(blocks, { kind = "header", text = header_text })
                 -- Bullet points (- item or * item)
-                elseif line:match("^[%*%-]%s+(.+)") then
-                    local bullet_text = line:match("^[%*%-]%s+(.+)")
-                    bullet_text = bullet_text:gsub("%*%*(.-)%*%*", "%1")
-                    reaper.ImGui_Bullet(ctx)
-                    reaper.ImGui_SameLine(ctx)
-                    reaper.ImGui_TextWrapped(ctx, bullet_text)
-
+                elseif bullet_text then
+                    table.insert(blocks, { kind = "bullet", text = strip_bold(bullet_text) })
                 -- Numbered lists (1. Directive)
-                elseif line:match("^%d+%.%s+(.+)") then
-                    local num, item_text = line:match("^(%d+%.)%s+(.+)")
-                    item_text = item_text:gsub("%*%*(.-)%*%*", "%1")
-                    reaper.ImGui_TextColored(ctx, 0x4FC3F7FF, num)
-                    reaper.ImGui_SameLine(ctx)
-                    reaper.ImGui_TextWrapped(ctx, item_text)
-
+                elseif num then
+                    table.insert(blocks, { kind = "number", num = num, text = strip_bold(item_text) })
                 -- Regular paragraph text
                 else
-                    local clean_line = line:gsub("%*%*(.-)%*%*", "%1")
-                    reaper.ImGui_TextWrapped(ctx, clean_line)
+                    table.insert(blocks, { kind = "para", text = strip_bold(line) })
                 end
             end
         end
     end
 
-    if in_table then
-        reaper.ImGui_EndTable(ctx)
+    return blocks
+end
+
+local function draw_markdown_blocks(ctx, blocks, msg_id)
+    local table_counter = 0
+
+    for _, block in ipairs(blocks) do
+        local kind = block.kind
+
+        if kind == "table" then
+            table_counter = table_counter + 1
+            local flags = reaper.ImGui_TableFlags_Borders()
+                        | reaper.ImGui_TableFlags_RowBg()
+                        | reaper.ImGui_TableFlags_SizingFixedFit()
+                        | reaper.ImGui_TableFlags_NoSavedSettings()
+
+            local table_id = "MDTable_" .. tostring(msg_id or 0) .. "_" .. table_counter
+            if reaper.ImGui_BeginTable(ctx, table_id, block.cols, flags) then
+                for c = 0, block.cols - 1 do
+                    reaper.ImGui_TableSetupColumn(ctx, "Col" .. c)
+                end
+                for _, cells in ipairs(block.rows) do
+                    reaper.ImGui_TableNextRow(ctx)
+                    for col_idx, cell in ipairs(cells) do
+                        reaper.ImGui_TableSetColumnIndex(ctx, col_idx - 1)
+                        reaper.ImGui_Text(ctx, cell)
+                    end
+                end
+                reaper.ImGui_EndTable(ctx)
+                if block.gap_after then reaper.ImGui_Dummy(ctx, 0, 8) end
+            end
+
+        elseif kind == "header" then
+            reaper.ImGui_Dummy(ctx, 0, 4)
+            reaper.ImGui_TextColored(ctx, 0xFFD54FFF, "▶  " .. block.text)
+            reaper.ImGui_Separator(ctx)
+            reaper.ImGui_Dummy(ctx, 0, 2)
+
+        elseif kind == "bullet" then
+            reaper.ImGui_Bullet(ctx)
+            reaper.ImGui_SameLine(ctx)
+            reaper.ImGui_TextWrapped(ctx, block.text)
+
+        elseif kind == "number" then
+            reaper.ImGui_TextColored(ctx, 0x4FC3F7FF, block.num)
+            reaper.ImGui_SameLine(ctx)
+            reaper.ImGui_TextWrapped(ctx, block.text)
+
+        else
+            reaper.ImGui_TextWrapped(ctx, block.text)
+        end
     end
+end
+
+--- Draws a chat message's Markdown (parsed lazily, then cached on the message itself).
+local function render_markdown_text(ctx, msg, text, msg_id)
+    msg.md_blocks = msg.md_blocks or parse_markdown(text)
+    draw_markdown_blocks(ctx, msg.md_blocks, msg_id)
 end
 
 local chat_history = {}
@@ -1942,15 +1987,16 @@ local chat_input_text = ""
 local report_saved_path = nil
 local scroll_to_bottom = false
 
+local TARGET_DESCRIPTIONS = {
+    [1] = "Drums & Bass",
+    [2] = "Instruments",
+    [3] = "Vocals",
+    [4] = "Full Mix",
+    [5] = "Soloed Tracks Only"
+}
+
 local function run_fresh_scan(target_mode, model_choice, mute_parallels, bypass_master_fx, duration_pref, output_api)
-    local target_descriptions = {
-        [1] = "Drums & Bass",
-        [2] = "Instruments",
-        [3] = "Vocals",
-        [4] = "Full Mix",
-        [5] = "Soloed Tracks Only"
-    }
-    local target_name = target_descriptions[target_mode] or "Full Mix"
+    local target_name = TARGET_DESCRIPTIONS[target_mode] or "Full Mix"
     local selected_model = get_model_name(model_choice)
 
     chat_history = {}
@@ -1966,13 +2012,13 @@ local function run_fresh_scan(target_mode, model_choice, mute_parallels, bypass_
         if trk then pre_render_guids[reaper.GetTrackGUID(trk)] = true end
     end
 
-	-- Automatically turn ON "Add rendered items to new tracks" in REAPER
+    -- Automatically turn ON "Add rendered items to new tracks" in REAPER
     local current_opts = math.floor(reaper.GetSetProjectInfo(0, "RENDER_ADDTOPROJ", 0, false))
     reaper.GetSetProjectInfo(0, "RENDER_ADDTOPROJ", current_opts | 1, true)
 
-	reaper.Main_OnCommand(42230, 0)
+    reaper.Main_OnCommand(42230, 0)
 
-	-- 1. Receive dsp_error as the 3rd return value
+    -- 1. Receive dsp_error as the 3rd return value
     local audio_metrics, rendered_tracks, dsp_error = analyze_ghost_render(song_regions, duration_pref, tracks_before, pre_render_guids)
 
     -- 2. If analysis failed, evaluate dsp_error to decide what to show the user
@@ -2003,7 +2049,7 @@ local function run_fresh_scan(target_mode, model_choice, mute_parallels, bypass_
         return false
     end
 
-	-- Render succeeded! Extract YAML now while target tracks are still isolated
+    -- Render succeeded! Extract YAML now while target tracks are still isolated
     local project_yaml = extract_full_project_yaml()
 
     -- Automatically undo the render to purge the track AND clear the undo stack
@@ -2034,31 +2080,8 @@ local function run_fresh_scan(target_mode, model_choice, mute_parallels, bypass_
     -- =====================================================================
     -- DYNAMIC METRICS TABLES FOR GUI (Splitting into 2 tables for neatness)
     -- =====================================================================
-    initial_ui_msg = initial_ui_msg .. "\n### 1. Macro-Dynamics & Stereo Summary\n"
-    initial_ui_msg = initial_ui_msg .. "| Region | Peak | RMS | Crest | Width | Phase Corr | Sub-Mono |\n|---|---|---|---|---|---|---|\n"
-
-    local tonal_msg = "\n### 2. Tonal Balance Summary (dBFS)\n"
-    tonal_msg = tonal_msg .. "| Region | Sub | Punch | Mud | Boxy | Core | Pres | Harsh | Sib | Air |\n|---|---|---|---|---|---|---|---|---|---|\n"
-
-    local sorted_regions = {}
-    for r_key in pairs(audio_metrics) do table.insert(sorted_regions, r_key) end
-    table.sort(sorted_regions)
-
-    for _, r_key in ipairs(sorted_regions) do
-        local m = audio_metrics[r_key]
-        local clean_name = r_key:gsub("^%d+_", ""):gsub("_", " ")
-        local phase_status = m.stereo.sub_mono == "Phase_Risk" and "Risk" or "Safe"
-        local phase_corr_val = m.stereo.phase_corr or 1.0
-
-        -- Populate Dynamics Table
-        initial_ui_msg = initial_ui_msg .. string.format("| %s | %.1f | %.1f | %.1f | %.0f%% | %.2f | %s |\n",
-            clean_name, m.dyn.peak_db, m.dyn.rms_db, m.dyn.crest_db, m.stereo.width_pct, phase_corr_val, phase_status)
-
-        -- Populate Tonal Balance Table
-        tonal_msg = tonal_msg .. string.format("| %s | %.1f | %.1f | %.1f | %.1f | %.1f | %.1f | %.1f | %.1f | %.1f |\n",
-            clean_name, m.tonal_db.sub60, m.tonal_db.punch120, m.tonal_db.mud250, m.tonal_db.boxy500, m.tonal_db.mid1k, m.tonal_db.pres3k, m.tonal_db.harsh6k, m.tonal_db.sib8k, m.tonal_db.air12k)
-    end
-    initial_ui_msg = initial_ui_msg .. tonal_msg
+    initial_ui_msg = initial_ui_msg .. "\n### " .. TABLE_TITLES[1] .. "\n" .. build_markdown_table(DYNAMICS_COLUMNS, audio_metrics)
+    initial_ui_msg = initial_ui_msg .. "\n### " .. TABLE_TITLES[2] .. "\n" .. build_markdown_table(TONAL_COLUMNS, audio_metrics)
 
     table.insert(chat_history, { role = "user", content = full_prompt, display_content = initial_ui_msg })
 
@@ -2087,6 +2110,12 @@ local function send_followup_message(user_text, model_choice)
     scroll_to_bottom = true
 end
 
+-- Combo-box item lists and the "Duration" -> seconds map (0 = analyze the full region)
+local TARGET_ITEMS = "Drums & Bass\0Instruments (No Drums/Bass/Vox)\0Vocals\0Full Mix\0Soloed Tracks Only\0\0"
+local MODEL_ITEMS = "DeepSeek V4 Pro (Flagship Reasoning)\0DeepSeek Flash (Fast / Low-Cost)\0\0"
+local DURATION_ITEMS = "10 Seconds\0" .. "20 Seconds\0" .. "Full Region\0\0"
+local DURATION_SECONDS = { [0] = 10, [1] = 20, [2] = 0 }
+
 local function main()
     -- Query live balance immediately upon launching the script
     fetch_deep_seek_balance()
@@ -2094,8 +2123,7 @@ local function main()
     local ctx = reaper.ImGui_CreateContext("AI_Mix_Assistant")
 
     -- Load fixed-width font for chat
-    local os_name = reaper.GetOS()
-    local font_name = os_name:match("Win") and "Consolas" or "Menlo"
+    local font_name = IS_WINDOWS and "Consolas" or "Menlo"
     local chat_font = nil
 
     if reaper.ImGui_CreateFont then
@@ -2123,18 +2151,14 @@ local function main()
 
     local target_idx = 3
     local model_idx = 0
-	local mute_parallels = false
-	local bypass_master_fx = false
+    local mute_parallels = false
+    local bypass_master_fx = false
     local duration_idx = 0
     local output_api = true
 
-    local target_items = "Drums & Bass\0Instruments (No Drums/Bass/Vox)\0Vocals\0Full Mix\0Soloed Tracks Only\0\0"
-    local model_items = "DeepSeek V4 Pro (Flagship Reasoning)\0DeepSeek Flash (Fast / Low-Cost)\0\0"
-    local duration_items = "10 Seconds\0" .. "20 Seconds\0" .. "Full Region\0\0"
+    local scan_state = 0
 
-	local scan_state = 0
-
-	local function loop()
+    local function loop()
         poll_deep_seek_balance()
 
         reaper.ImGui_SetNextWindowSize(ctx, 720, 680, reaper.ImGui_Cond_FirstUseEver())
@@ -2153,106 +2177,80 @@ local function main()
             reaper.ImGui_Separator(ctx)
             reaper.ImGui_Dummy(ctx, 0, 2)
 
-			-- SCAN SETTINGS PANEL
-			reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Button(), 0x333333FF)
-			reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), 0xFFFF33FF)
-			reaper.ImGui_PushStyleVar(ctx, reaper.ImGui_StyleVar_FramePadding(), 8, 8)
-			reaper.ImGui_PushStyleVar(ctx, reaper.ImGui_StyleVar_ButtonTextAlign(), 0.0, 0.5)
+            local _ -- throw-away for ImGui's 'changed' return values (keeps them out of the global scope)
 
-			reaper.ImGui_BeginDisabled(ctx, true)
-			reaper.ImGui_Button(ctx, "  SCAN CONFIGURATION & CONTROLS", -1, 0)
-			reaper.ImGui_EndDisabled(ctx)
+            -- SCAN SETTINGS PANEL
+            render_section_header(ctx, "  SCAN CONFIGURATION & CONTROLS")
 
-			reaper.ImGui_PopStyleVar(ctx, 2)
-			reaper.ImGui_PopStyleColor(ctx, 2)
-			reaper.ImGui_Dummy(ctx, 0, 4)
+            _, target_idx = reaper.ImGui_Combo(ctx, "Target", target_idx, TARGET_ITEMS)
+            _, mute_parallels = reaper.ImGui_Checkbox(ctx, "Mute Parallels", mute_parallels)
+            _, bypass_master_fx = reaper.ImGui_Checkbox(ctx, "Bypass Master FX", bypass_master_fx)
+            _, duration_idx = reaper.ImGui_Combo(ctx, "Duration", duration_idx, DURATION_ITEMS)
+            _, output_api = reaper.ImGui_Checkbox(ctx, "Query DeepSeek API (Uncheck for TXT only)", output_api)
+            _, model_idx = reaper.ImGui_Combo(ctx, "AI Model", model_idx, MODEL_ITEMS)
 
-			_, target_idx = reaper.ImGui_Combo(ctx, "Target", target_idx, target_items)
-			_, mute_parallels = reaper.ImGui_Checkbox(ctx, "Mute Parallels", mute_parallels)
-			_, bypass_master_fx = reaper.ImGui_Checkbox(ctx, "Bypass Master FX", bypass_master_fx)
-			_, duration_idx = reaper.ImGui_Combo(ctx, "Duration", duration_idx, duration_items)
-			_, output_api = reaper.ImGui_Checkbox(ctx, "Query DeepSeek API (Uncheck for TXT only)", output_api)
-			_, model_idx = reaper.ImGui_Combo(ctx, "AI Model", model_idx, model_items)
+            reaper.ImGui_Dummy(ctx, 0, 4)
 
-			reaper.ImGui_Dummy(ctx, 0, 4)
+            -- 1. Draw button state based on scan_state
+            local is_busy = (scan_state and scan_state > 0)
+            if is_busy then reaper.ImGui_BeginDisabled(ctx, true) end
 
-			-- 1. Draw button state based on scan_state
-			local is_busy = (scan_state and scan_state > 0)
-			if is_busy then reaper.ImGui_BeginDisabled(ctx, true) end
+            local btn_label = is_busy and "Scanning in progress..." or "Run Fresh Scan & Reset Chat"
+            local btn_clicked = reaper.ImGui_Button(ctx, btn_label, -1, 30)
 
-			local btn_label = is_busy and "Scanning in progress..." or "Run Fresh Scan & Reset Chat"
-			local btn_clicked = reaper.ImGui_Button(ctx, btn_label, -1, 30)
+            if is_busy then reaper.ImGui_EndDisabled(ctx) end
+            reaper.ImGui_Separator(ctx)
 
-			if is_busy then reaper.ImGui_EndDisabled(ctx) end
-			reaper.ImGui_Separator(ctx)
+            -- 2. Strict Frame Delay & Click-Absorption Cooldown
+            if btn_clicked and not is_busy then
+                table.insert(chat_history, {
+                    role = "assistant",
+                    content = "⏳ *Rendering mix and analyzing peaks & frequencies... please wait.*"
+                })
+                scroll_to_bottom = true
+                scan_state = 1
+            elseif scan_state == 1 then scan_state = 2
+            elseif scan_state == 2 then scan_state = 3
+            elseif scan_state == 3 then
+                run_fresh_scan(target_idx + 1, model_idx + 1, mute_parallels, bypass_master_fx, DURATION_SECONDS[duration_idx], output_api)
+                scan_state = 4 -- Enter click-absorption cooldown
+            elseif scan_state >= 4 and scan_state < 10 then
+                scan_state = scan_state + 1 -- Absorb queued OS clicks for 6 frames
+            elseif scan_state == 10 then
+                scan_state = 0 -- Reset to idle and re-enable button
+            end
 
-			-- 2. Strict Frame Delay & Click-Absorption Cooldown
-			if btn_clicked and not is_busy then
-				table.insert(chat_history, {
-					role = "assistant",
-					content = "⏳ *Rendering mix and analyzing peaks & frequencies... please wait.*"
-				})
-				scroll_to_bottom = true
-				scan_state = 1
-			elseif scan_state == 1 then scan_state = 2
-			elseif scan_state == 2 then scan_state = 3
-			elseif scan_state == 3 then
-				local dur_map = { [0] = 10, [1] = 20, [2] = 0 }
-				run_fresh_scan(target_idx + 1, model_idx + 1, mute_parallels, bypass_master_fx, dur_map[duration_idx], output_api)
-				scan_state = 4 -- Enter click-absorption cooldown
-			elseif scan_state >= 4 and scan_state < 10 then
-				scan_state = scan_state + 1 -- Absorb queued OS clicks for 6 frames
-			elseif scan_state == 10 then
-				scan_state = 0 -- Reset to idle and re-enable button
-			end
-
-			-- CHAT HISTORY LOG
-			reaper.ImGui_Dummy(ctx, 0, 8)
-			reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Button(), 0x333333FF)
-			reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), 0xFFFF33FF)
-			reaper.ImGui_PushStyleVar(ctx, reaper.ImGui_StyleVar_FramePadding(), 8, 8)
-			reaper.ImGui_PushStyleVar(ctx, reaper.ImGui_StyleVar_ButtonTextAlign(), 0.0, 0.5)
-
-			reaper.ImGui_BeginDisabled(ctx, true)
-			reaper.ImGui_Button(ctx, "  CONVERSATION LOG", -1, 0)
-			reaper.ImGui_EndDisabled(ctx)
-
-			reaper.ImGui_PopStyleVar(ctx, 2)
-			reaper.ImGui_PopStyleColor(ctx, 2)
-			reaper.ImGui_Dummy(ctx, 0, 4)
+            -- CHAT HISTORY LOG
+            reaper.ImGui_Dummy(ctx, 0, 8)
+            render_section_header(ctx, "  CONVERSATION LOG")
             local _, avail_h = reaper.ImGui_GetContentRegionAvail(ctx)
             local scroll_h = math.max(150, avail_h - 70)
 
             if reaper.ImGui_BeginChild(ctx, "ChatScroll", 0, scroll_h) then
                 push_chat_font(15)
 
-				for idx, msg in ipairs(chat_history) do
+                for idx, msg in ipairs(chat_history) do
                     if msg.role == "user" then
                         -- Light Blue background with dark text
                         render_role_badge(ctx, " YOU ", 0x4FC3F7FF, 0x111111FF, idx)
-                        local text_to_show = msg.display_content or msg.content
-						render_markdown_text(ctx, text_to_show, idx)
-                        reaper.ImGui_Dummy(ctx, 0, 4)
-                        reaper.ImGui_Separator(ctx)
-                        reaper.ImGui_Dummy(ctx, 0, 4)
+                        render_markdown_text(ctx, msg, msg.display_content or msg.content, idx)
 
                     elseif msg.role == "assistant" then
                         -- Light Green background with dark text
                         render_role_badge(ctx, " ASSISTANT ", 0x81C784FF, 0x111111FF, idx)
-                        render_markdown_text(ctx, msg.content, idx)
-                        reaper.ImGui_Dummy(ctx, 0, 4)
-                        reaper.ImGui_Separator(ctx)
-                        reaper.ImGui_Dummy(ctx, 0, 4)
+                        render_markdown_text(ctx, msg, msg.content, idx)
 
                     elseif msg.role == "alert" then
                         -- Red badge (0xEF5350FF) with dark text
                         render_role_badge(ctx, " CANCELLED ", 0xEF5350FF, 0x111111FF, idx)
                         -- Bright red warning text
                         reaper.ImGui_TextColored(ctx, 0xEF5350FF, msg.content)
-                        reaper.ImGui_Dummy(ctx, 0, 4)
-                        reaper.ImGui_Separator(ctx)
-                        reaper.ImGui_Dummy(ctx, 0, 4)
                     end
+
+                    -- Divider shared by every message type
+                    reaper.ImGui_Dummy(ctx, 0, 4)
+                    reaper.ImGui_Separator(ctx)
+                    reaper.ImGui_Dummy(ctx, 0, 4)
                 end
 
                 -- Auto-scroll down to the latest message
@@ -2268,7 +2266,7 @@ local function main()
             -- FOLLOW-UP INPUT AREA (MULTILINE + BUTTON ONLY)
             reaper.ImGui_Separator(ctx)
 
-			-- Multiline text box with fixed-width font
+            -- Multiline text box with fixed-width font
             -- (Note: ReaImGui does not natively support word-wrap inside input boxes)
             push_chat_font(15)
             local changed, new_text = reaper.ImGui_InputTextMultiline(ctx, "##chat_in", chat_input_text, -95, 52)
@@ -2279,36 +2277,35 @@ local function main()
 
             reaper.ImGui_SameLine(ctx)
 
-			-- Stacked action buttons
-			reaper.ImGui_BeginGroup(ctx)
-			if reaper.ImGui_Button(ctx, "Send", 85, 24) then
-				if trim_string(chat_input_text) ~= "" then
-					local user_msg = chat_input_text
-					chat_input_text = ""
-					send_followup_message(user_msg, model_idx + 1)
-				end
-			end
+            -- Stacked action buttons
+            reaper.ImGui_BeginGroup(ctx)
+            if reaper.ImGui_Button(ctx, "Send", 85, 24) then
+                if trim_string(chat_input_text) ~= "" then
+                    local user_msg = chat_input_text
+                    chat_input_text = ""
+                    send_followup_message(user_msg, model_idx + 1)
+                end
+            end
 
-			if reaper.ImGui_Button(ctx, "Copy Chat", 85, 24) then
-				if #chat_history > 0 then
-					local conversation_lines = {}
+            if reaper.ImGui_Button(ctx, "Copy Chat", 85, 24) then
+                if #chat_history > 0 then
+                    local conversation_lines = {}
 
-					for _, msg in ipairs(chat_history) do
-						if msg.role == "user" then
-							-- Uses display_content if available (so the track list summary is included)
-							local user_text = msg.display_content or msg.content
-							table.insert(conversation_lines, "### YOU:\n" .. user_text)
-						elseif msg.role == "assistant" then
-							table.insert(conversation_lines, "### DEEPSEEK:\n" .. msg.content)
-						end
-					end
+                    for _, msg in ipairs(chat_history) do
+                        if msg.role == "user" then
+                            -- Uses display_content if available (so the track list summary is included)
+                            table.insert(conversation_lines, "### YOU:\n" .. (msg.display_content or msg.content))
+                        elseif msg.role == "assistant" then
+                            table.insert(conversation_lines, "### DEEPSEEK:\n" .. msg.content)
+                        end
+                    end
 
-					-- Join the entire conversation separated by clean dividers
-					local full_chat_export = table.concat(conversation_lines, "\n\n" .. string.rep("-", 40) .. "\n\n")
-					reaper.ImGui_SetClipboardText(ctx, full_chat_export)
-				end
-			end
-			reaper.ImGui_EndGroup(ctx)
+                    -- Join the entire conversation separated by clean dividers
+                    local full_chat_export = table.concat(conversation_lines, "\n\n" .. string.rep("-", 40) .. "\n\n")
+                    reaper.ImGui_SetClipboardText(ctx, full_chat_export)
+                end
+            end
+            reaper.ImGui_EndGroup(ctx)
         end
 
         reaper.ImGui_End(ctx)
