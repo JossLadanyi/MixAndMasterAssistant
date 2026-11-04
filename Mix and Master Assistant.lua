@@ -170,6 +170,7 @@ local function is_boilerplate(param_name, param_value)
     -- Filter out default bypass/power states
     if name_lower == "bypass" and (val_clean == "normal" or val_clean == "off" or val_clean == "0") then return true end
     if name_lower == "power" and (val_clean == "on" or val_clean == "1") then return true end
+    if name_lower == "delta" and val_clean == DEFAULT_SETTINGS.plugin.delta then return true end -- REAPER's own delta solo switch, off
 
     -- Filter out default 100% wet / 0% dry states
     local num_val = val_clean:gsub("db$", ""):gsub("%%$", "")
@@ -324,7 +325,7 @@ local function get_arrangement_markers()
     return #arrangement > 0 and arrangement or nil
 end
 
-local function get_all_connections()
+local function get_all_connections(compact) -- compact (task 4e): keep only the "sidechain" label (the other purposes were guesses)
     local connections = {}
     local num_tracks = reaper.CountTracks(0)
     local track_lookup = {}
@@ -355,6 +356,7 @@ local function get_all_connections()
                     -- Main send still active and the destination holds no media: a parallel split
                     conn.purpose = "parallel_split"
                 end
+                if compact and conn.purpose ~= "sidechain" then conn.purpose = nil end
 
                 local mode_val = math.floor(reaper.GetTrackSendInfo_Value(src_track, 0, s, "I_SENDMODE"))
                 if mode_val == 1 then conn.type = "prefx" elseif mode_val == 3 or mode_val == 2 then conn.type = "pre" end
@@ -456,20 +458,62 @@ local function extract_fx_params(track, fx_idx)
     return next(params_table) ~= nil and params_table or nil
 end
 
-local function get_track_fx_chain(track)
+-- mode (task 4e compact YAML; nil = old full output): "names" = one string "Name (tags) > Name ...", no settings;
+-- "full" = settings with lossless regrouped names, and a renamed plugin shows its original name ("Ducking Comp (ReaComp)").
+local function get_track_fx_chain(track, mode)
     local num_fx = reaper.TrackFX_GetCount(track)
     if num_fx == 0 then return nil end
     local fx_chain = {}
     local inst_idx = reaper.TrackFX_GetInstrument(track) -- the same for every FX slot on this track
+    local names_only = (mode == "names")
+    local function clean(n)
+        n = trim_string(n) or "Unknown FX"
+        n = n:match(":%s*(.+)") or n
+        n = n:gsub("%s*%(.*%)$", "")    -- Uses a greedy match %s*%(.*%)$ to safely catch nested parens like "(Universal Audio (UADx))"
+        return trim_string(n)
+    end
+    -- Lossless regrouping (compact "full" mode). ReaEQ: freq/gn/bw of one band become one entry ("high_pass_1: {bw, freq, gn}").
+    -- Other plugins: 3+ names sharing the part before their last "_" become one entry ("band_1: {att, freq, ...}").
+    -- Never when the group name is itself a setting, or when all short names are numbers. Short names stay text keys.
+    local function regroup(params, reaeq)
+        local groups = {}
+        for k in pairs(params) do
+            local pre, short
+            if reaeq then
+                short, pre = k:match("^(%a+)_(.+)$")
+                if not (short == "freq" or short == "gn" or short == "bw") then pre = nil end
+            else
+                pre, short = k:match("^(.+)_([^_]+)$")
+            end
+            if pre then
+                local g = groups[pre] or { n = 0, num = true, keys = {} }
+                groups[pre] = g
+                g.n = g.n + 1
+                g.keys[short] = k
+                if not short:match("^%d+$") then g.num = false end
+            end
+        end
+        for pre, g in pairs(groups) do
+            if params[pre] == nil and not g.num and g.n >= (reaeq and 2 or 3) then
+                local sub = {}
+                for short, k in pairs(g.keys) do sub[short] = params[k]; params[k] = nil end
+                params[pre] = sub
+            end
+        end
+        return params
+    end
 
     for i = 0, num_fx - 1 do
         local _, raw_name = reaper.TrackFX_GetFXName(track, i)
-        local fx_name = trim_string(raw_name) or "Unknown FX"
-        fx_name = fx_name:match(":%s*(.+)") or fx_name
-        fx_name = fx_name:gsub("%s*%(.*%)$", "")    -- Uses a greedy match %s*%(.*%)$ to safely catch nested parens like "(Universal Audio (UADx))"
-        fx_name = trim_string(fx_name)
+        local fx_name = clean(raw_name)
+        local orig
+        if mode then
+            local ok_o, o = reaper.TrackFX_GetNamedConfigParm(track, i, "original_name")
+            orig = ok_o and o and o ~= "" and clean(o) or nil
+            if orig == fx_name then orig = nil end
+        end
 
-        local plugin = { name = fx_name }
+        local plugin = { name = fx_name .. (orig and (" (" .. orig .. ")") or "") }
         if not reaper.TrackFX_GetEnabled(track, i) then plugin.bypassed = true end
 
         local ok_wet, wet_val = reaper.TrackFX_GetNamedConfigParm(track, i, "wet")
@@ -484,15 +528,25 @@ local function get_track_fx_chain(track)
         local plugin_type = ((inst_idx == i) or raw_name:match("^%w+i:")) and "instrument" or "effect"
         if plugin_type ~= DEFAULT_SETTINGS.plugin.type then plugin.type = plugin_type end
 
-        if plugin_type == "effect" and not plugin.bypassed then
+        if plugin_type == "effect" and not plugin.bypassed and not names_only then
             plugin.params = extract_fx_params(track, i)
+            if mode == "full" and plugin.params then plugin.params = regroup(plugin.params, (orig or fx_name) == "ReaEQ") end
+        end
+        if names_only then
+            local tags = {}
+            if orig then tags[#tags + 1] = orig end
+            if plugin.type then tags[#tags + 1] = plugin.type end
+            if plugin.bypassed then tags[#tags + 1] = "bypassed" end
+            if plugin.wet then tags[#tags + 1] = "wet " .. plugin.wet end
+            plugin = fx_name .. (#tags > 0 and (" (" .. table.concat(tags, ", ") .. ")") or "")
         end
         table.insert(fx_chain, plugin)
     end
+    if names_only and #fx_chain > 0 then return table.concat(fx_chain, " > ") end
     return #fx_chain > 0 and fx_chain or nil
 end
 
-local function process_track_data(track, is_master, current_depth, any_soloed, has_children)
+local function process_track_data(track, is_master, current_depth, any_soloed, has_children, fx_mode) -- fx_mode: see get_track_fx_chain
     local track_name = get_track_identity(track)
     local parent = reaper.GetParentTrack(track)
     local parent_name = parent and get_track_identity(parent) or nil
@@ -556,11 +610,13 @@ local function process_track_data(track, is_master, current_depth, any_soloed, h
     end
     if #active_envelopes > 0 then track_data.auto = table.concat(active_envelopes, ", ") end
 
-    if not mute_state then track_data.fx = get_track_fx_chain(track) end
+    if not mute_state then track_data.fx = get_track_fx_chain(track, fx_mode) end
     return track_data
 end
 
-local function extract_full_project_yaml()
+-- opts (task 4e compact YAML, nil = old full output): full = { [track GUID] = true }: these tracks, their folders and the master keep
+-- their full plugin settings, every other track lists plugin names only; connections keep only the "sidechain" label.
+local function extract_full_project_yaml(opts)
     local num, den = reaper.TimeMap_GetTimeSigAtTime(0, 0)
     local sr = reaper.GetSetProjectInfo(0, "PROJECT_SRATE", 0, false)
     local proj_notes = trim_string(reaper.GetSetProjectNotes(0, false, ""))
@@ -572,7 +628,7 @@ local function extract_full_project_yaml()
             sample_rate = sr > 0 and math.floor(sr) or "Default"
         },
         arr = get_arrangement_markers(),
-        connections = get_all_connections(),
+        connections = get_all_connections(opts ~= nil),
         tracks = {}
     }
 
@@ -588,15 +644,24 @@ local function extract_full_project_yaml()
         local p = reaper.GetParentTrack(reaper.GetTrack(0, i))
         if p then has_children[p] = true end
     end
+    local keep = {} -- compact mode: tracks with full plugin settings (the named tracks and their folder chain)
+    if opts then
+        for i = 0, num_tracks - 1 do
+            local tr = reaper.GetTrack(0, i)
+            if opts.full[reaper.GetTrackGUID(tr)] then
+                while tr do keep[tr] = true; tr = reaper.GetParentTrack(tr) end
+            end
+        end
+    end
 
     -- 1. Master Track
-    table.insert(project_data.tracks, process_track_data(reaper.GetMasterTrack(0), true, 0, any_soloed, has_children))
+    table.insert(project_data.tracks, process_track_data(reaper.GetMasterTrack(0), true, 0, any_soloed, has_children, opts and "full" or nil))
 
     -- 2. Child Tracks & Folders
     local current_depth = 0
     for i = 0, num_tracks - 1 do
         local track = reaper.GetTrack(0, i)
-        table.insert(project_data.tracks, process_track_data(track, false, current_depth, any_soloed, has_children))
+        table.insert(project_data.tracks, process_track_data(track, false, current_depth, any_soloed, has_children, opts and (keep[track] and "full" or "names") or nil))
         local folder_delta = reaper.GetMediaTrackInfo_Value(track, "I_FOLDERDEPTH")
         if folder_delta == 1 then
             current_depth = current_depth + 1
@@ -1910,7 +1975,7 @@ local B15_C = 0.6423
 local MA_A = {
     MIBASE = MA_MBASE + 18000 * MA_MSTRIDE, MISTRIDE = 4, -- master input records (JSFX role 2): K energy, count, run id, max |sample|
     TOP_N = 6, NOTABLE_DB = 3, BAND_RANGE_DB = 30, REGION_DEV_DB = 3, MASK_SHARE = 0.25, MASK_PAN = 100,
-    ACTIVE_MIN_PCT = 5, TOKEN_CEILING = 8000,
+    ACTIVE_MIN_PCT = 5, TOKEN_CEILING = 8000, MIN_SHARE = 1, -- MIN_SHARE: region track lines below this share (%) are left out of the data block
     KEYS = { "rumble", "deepsub", "sub", "bass", "body", "mud", "boxy", "honk", "nasal", "bite", "presence", "harsh", "sibilance", "sizzle", "air" },
 }
 
@@ -3109,18 +3174,21 @@ local function print_region_summary(out, tracks, max_sec, run_id, offsets)
             i0(d.width), c2(d.corr), pan_label(d.pan100), d.sub_risk and " sub!" or "")
     end
     local draft, omitted = {}, 0
+    local named = {} -- task 4e: GUIDs of the tracks the region lines and masking hints name (they keep full plugin settings in the YAML)
     draft[1] = string.format("SONG I%s M%s S%s LRA%s pk%s clip%s | mid %s | side %s", f1(song.integrated), f1(song.max_m), f1(song.max_s),
         f1(song.lra), f1(m_peak), m_clips and tostring(m_clips) or "n/a", bandlist(song.mid_db), bandlist(song.side_db))
     if song_chain then draft[#draft + 1] = song_chain end
+    draft[#draft + 1] = "TRACKS (whole song)"
     for _, d in ipairs(D.over) do
         if d.act and d.act >= MA_A.ACTIVE_MIN_PCT then
             local nb = #d.notable > 0 and (" | " .. devs(d.notable, true)) or ""
-            draft[#draft + 1] = string.format("T %s%s%s %s%s%s", nm(d.t.name), "", d.share and (" s" .. i0(d.share)) or "", tok(d),
+            draft[#draft + 1] = string.format("%s%s %s%s%s", nm(d.t.name), d.share and (" s" .. i0(d.share)) or "", tok(d),
                 d.s.clips > 0 and (" clip" .. string.format("%.0f", d.s.clips)) or "", nb)
         else
             omitted = omitted + 1
         end
     end
+    draft[#draft + 1] = "REGIONS"
     for i, reg in ipairs(D.regions) do
         if reg.na or not reg.mr then
             draft[#draft + 1] = string.format("R%d %s %s-%s | n/a", i, nm(reg.name), f1(reg.start_s), f1(reg.end_s))
@@ -3131,9 +3199,23 @@ local function print_region_summary(out, tracks, max_sec, run_id, offsets)
                 #reg.dev > 0 and (" | " .. devs(reg.dev, true)) or "")
             local rc = chain(reg.mi, mr)
             if rc then draft[#draft + 1] = " " .. rc end
+            local shown = {}
             for _, d in ipairs(reg.sel) do
-                draft[#draft + 1] = string.format(" %s s%s %s%s", nm(d.t.name), i0(d.share), tok(d),
-                    #d.notable > 0 and (" | " .. devs(d.notable, true)) or "")
+                if d.share >= MA_A.MIN_SHARE then
+                    shown[d] = true
+                    named[reaper.GetTrackGUID(d.t.track)] = true
+                    draft[#draft + 1] = string.format(" %s s%s %s%s", nm(d.t.name), i0(d.share), tok(d),
+                        #d.notable > 0 and (" | " .. devs(d.notable, true)) or "")
+                end
+            end
+            -- Every other counted track that plays in the region (no folder buses), in track order, with its play time there
+            local also = {}
+            for _, d in ipairs(reg.all) do
+                if not shown[d] and d.r.role ~= "bus" and d.act and d.act >= MA_A.ACTIVE_MIN_PCT then also[#also + 1] = nm(d.t.name) .. " a" .. i0(d.act) end
+            end
+            if #also > 0 then draft[#draft + 1] = string.format(" R%d also %s", i, table.concat(also, ", ")) end
+            for _, m in ipairs(reg.mask) do
+                for _, e in ipairs(m.list) do named[reaper.GetTrackGUID(e.d.t.track)] = true end
             end
             local mk, ap = mask_ranges(reg, nm), {}
             for _, d in ipairs(reg.approx) do ap[#ap + 1] = nm(d.t.name) end
@@ -3144,16 +3226,61 @@ local function print_region_summary(out, tracks, max_sec, run_id, offsets)
         end
     end
     local text = table.concat(draft, "\n")
-    out[#out + 1] = "\nDRAFT DATA BLOCK (compact text the prompt would send; final format in task 4e):\n" .. text
+    out[#out + 1] = "\nDATA BLOCK (the measured part of the prompt; the whole prompt is saved to MixAssistant_prompt.txt):\n" .. text
 
     -- TOKENS and SELF-CHECK
     local est = math.floor(#text / 4 + 0.5)
-    out[#out + 1] = string.format("\nTOKENS (rough, characters / 4): draft block %d chars = about %d tokens = %.0f%% of the %d ceiling | %d tracks below %d%% active left out of the overview",
+    out[#out + 1] = string.format("\nTOKENS (rough, characters / 4): data block %d chars = about %d tokens = %.0f%% of the %d ceiling | %d tracks below %d%% active left out of the overview",
         #text, est, 100 * est / MA_A.TOKEN_CEILING, MA_A.TOKEN_CEILING, omitted, MA_A.ACTIVE_MIN_PCT)
     local chk = D.check
     out[#out + 1] = string.format("SELF-CHECK: region weights %.2f s + gap seconds %.2f s = %.2f s vs song %.2f s (%s) | regions n/a: %d | tracks counted with data: %d of %d (%d not counted: no direct path to the master)",
         chk.weights, chk.gaps, chk.weights + chk.gaps, D.proj_len, math.abs(chk.weights + chk.gaps - D.proj_len) < 0.05 and "OK" or "MISMATCH",
         chk.n_na, D.tracks_with_data, #tracks, D.dropped)
+    return text, named
+end
+
+--- Task 4e: the whole prompt of the JSFX path. Fixed text first (role, legend, instructions: the same for every project, so a
+-- cached prompt start can be reused), then the data block and the compact project YAML.
+local function build_jsfx_prompt(block, yaml)
+    local bands = {}
+    for b = 1, 15 do bands[b] = string.format("%s %g-%g", MA_A.KEYS[b], B15_EDGES[b], B15_EDGES[b + 1]) end
+    return table.concat({
+        "=== ROLE ===",
+        "You are an experienced mixing and mastering engineer. Analyse this REAPER mix from the measured data and the project YAML below and give concrete advice.",
+        "",
+        "=== LEGEND OF THE MEASURED DATA ===",
+        "Measured in REAPER during one render of the whole song. Each track is measured after its own fader, pan and automation, before its folder and before the master FX. In the data, \"_\" in a name stands for a space; match names to the YAML.",
+        "Bands (Hz): " .. table.concat(bands, ", ") .. ".",
+        "SONG: the master after its FX. I = integrated loudness (LUFS), M = max momentary, S = max short-term (LUFS), LRA = loudness range (LU), pk = sample peak (dBFS), clip = clipped samples. mid / side = master band levels (dB) of the mid and the side signal, song average.",
+        "chain in > out: master loudness before the master FX against after them; gain = loudness the master chain adds (dB).",
+        "TRACKS (whole song), one line per playing track:",
+        "- s = share of the mix (% of the loudness-weighted energy of all counted tracks; adds up to 100). Folder buses have no s: their children carry it. Tracks without a path to the master are not listed; what they send is measured on the receiving tracks.",
+        "- L = average loudness over the whole span including pauses (LUFS, ungated), pk = sample peak (dBFS), cr = crest factor (dB, median per second of peak minus RMS; low = dense or heavily compressed), a = % of the time the track plays.",
+        "- W = width (0 = mono, about 50 = wide and uncorrelated, above 50 = more side than mid), c = left/right correlation (1 = mono, 0 = unrelated, below 0 = out of phase), pC / pL n / pR n = measured left/right balance (0-100 towards that side), sub! = out of phase below 120 Hz (cancels in mono), clip n = clipped samples.",
+        "- after \"|\": bands that stand out against their neighbouring bands in the same track (dB, + = bump, - = dip).",
+        "REGIONS: R n name start-end (seconds), then the master numbers of the region; after \"|\": master bands against the song average, after levelling out the loudness difference (dB). Then the region's top tracks by share (same keys as above). \"R n also\" = every other track that plays in region n, with a = % of the region it plays; compare these lines between regions to see arrangement changes.",
+        "mask: Hz ranges where 2 or more of these tracks each hold at least 25% of the energy. The number is each track's share (%) of all energy inside the whole range, so a narrow overlap can look small in a wide range. approx: the shares of these tracks are approximate (their folder also receives sends).",
+        "Differences under 1 dB are measurement noise. Width, correlation and balance are measured after pan.",
+        "",
+        "=== PROJECT YAML ===",
+        "Routing and settings: folders (parent, flags: folder), sends (connections; sidechain = feeds a side-chain input; send volume 0 dB when omitted), faders (vol_db), pan, envelopes (auto), plugins in chain order. The master and the tracks named under REGIONS, with their folders, list full plugin settings. All other tracks list plugin names only (fx: \"A > B\"); when you need their settings, ask for \"DETAIL <track name>\" and I will send them. Settings with a common name start are grouped: band_1: {freq: 181} means the setting band_1_freq. A renamed plugin shows its original in brackets, e.g. Ducking Comp (ReaComp).",
+        "",
+        "=== INSTRUCTIONS ===",
+        "1. Dynamics: compare loudness, LRA and crest across the regions and tracks. Where contrast is missing, find the compressor or limiter in the YAML and give the gain reduction to aim for (dB), never a threshold.",
+        "2. Low and mid balance: use the track band bumps, the mask ranges and the master band deviations. Name the track, the plugin and the change (frequency, gain, Q).",
+        "3. Highs: tell \"harsh\" apart from \"sibilance\"; suggest a de-esser or a dynamic EQ where needed.",
+        "4. Stereo and mono: check W, c, the balance and sub!; name phase or width problems and how to fix them.",
+        "5. Master: judge the chain gain, the final loudness and the peak.",
+        "6. Arrangement: when two regions of the same kind differ (e.g. Verse 1 and Verse 2), compare their track lines and also lines and say what changed in the arrangement.",
+        "Only advise on tracks that play in that region. Quote exact track, plugin and parameter names from the YAML. When the data does not support a claim, say so. Be honest and short, and say briefly why, so I learn.",
+        "Write for a musician in plain studio words. The data keys above are for you only: never write s, L, pk, cr, a, W, c, pL/pR or sub! in your answer; say e.g. \"the kick plays 39% of the time\" or \"the bass makes up 21% of the mix\". Name bands with their Hz range, e.g. \"mud (200-315 Hz)\". Never compute values the data does not give (e.g. a share for a folder bus); say what is missing instead.",
+        "",
+        "=== MEASURED DATA ===",
+        block,
+        "",
+        "=== REAPER PROJECT (YAML) ===",
+        yaml,
+    }, "\n")
 end
 
 local DEBUG_DURATION = 20 -- seconds of the region compared against the Lua DSP
@@ -3240,6 +3367,7 @@ local function run_collection_test(compare)
     local out = {}
     local old_guids = {}
     for i = 0, reaper.CountTracks(0) - 1 do old_guids[reaper.GetTrackGUID(reaper.GetTrack(0, i))] = true end
+    local data_block, named, prompt_text -- task 4e: the data block, the GUIDs of the tracks it names, the whole prompt
 
     local ok, err = pcall(function()
         reaper.gmem_attach(GMEM_NAME)
@@ -3400,7 +3528,7 @@ local function run_collection_test(compare)
             out[#out + 1] = hdr .. "\n" .. mline .. "\n" .. sline
         end
 
-        if not compare then print_region_summary(out, tracks, max_sec, run_id, offsets) end
+        if not compare then data_block, named = print_region_summary(out, tracks, max_sec, run_id, offsets) end
 
         if compare then
             local lua_m = analyze_region(find_new_tracks(old_guids), region, DEBUG_DURATION)
@@ -3429,13 +3557,28 @@ local function run_collection_test(compare)
         -- Size of the project-structure YAML (read-only; measured after the cleanup so the analyzers are not in it)
         local yok, yaml = pcall(extract_full_project_yaml)
         if yok and type(yaml) == "string" then
-            out[#out + 1] = string.format("YAML (project structure, rough, characters / 4): %d chars = about %d tokens", #yaml, math.floor(#yaml / 4 + 0.5))
+            out[#out + 1] = string.format("YAML (old scan, full, rough, characters / 4): %d chars = about %d tokens", #yaml, math.floor(#yaml / 4 + 0.5))
         else
             out[#out + 1] = "YAML size estimate failed: " .. tostring(yaml)
+        end
+        -- Task 4e: compact YAML and the whole prompt (saved next to the report)
+        if data_block then
+            local cok, cyaml = pcall(extract_full_project_yaml, { full = named })
+            if cok and type(cyaml) == "string" then
+                prompt_text = build_jsfx_prompt(data_block, cyaml)
+                out[#out + 1] = string.format("PROMPT (task 4e, rough, characters / 4): compact YAML %d chars = about %d tokens | whole prompt %d chars = about %d tokens",
+                    #cyaml, math.floor(#cyaml / 4 + 0.5), #prompt_text, math.floor(#prompt_text / 4 + 0.5))
+            else
+                out[#out + 1] = "PROMPT build failed: " .. tostring(cyaml)
+            end
         end
     end
     -- The console window drops the oldest lines when the text is long, so the full report is also saved to a file next to the script
     local script_dir = (debug.getinfo(1, "S").source or ""):match("^@(.*[\\/])") or (reaper.GetResourcePath() .. PATH_SEPARATOR)
+    if prompt_text then
+        local pf = io.open(script_dir .. "MixAssistant_prompt.txt", "w")
+        if pf then pf:write(prompt_text, "\n") pf:close() else out[#out + 1] = "Could not save MixAssistant_prompt.txt" end
+    end
     local report_path = script_dir .. "MixAssistant_report.txt"
     local rf = io.open(report_path, "w")
     if rf then
