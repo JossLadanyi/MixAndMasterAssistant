@@ -1911,7 +1911,7 @@ local MA_A = {
     MIBASE = MA_MBASE + 18000 * MA_MSTRIDE, MISTRIDE = 4, -- master input records (JSFX role 2): K energy, count, run id, max |sample|
     TOP_N = 6, NOTABLE_DB = 3, BAND_RANGE_DB = 30, REGION_DEV_DB = 3, MASK_SHARE = 0.25, MASK_PAN = 100,
     ACTIVE_MIN_PCT = 5, TOKEN_CEILING = 8000,
-    KEYS = { "rmb", "dsub", "sub", "bass", "body", "mud", "boxy", "honk", "nasal", "bite", "pres", "harsh", "sib", "sizz", "air" },
+    KEYS = { "rumble", "deepsub", "sub", "bass", "body", "mud", "boxy", "honk", "nasal", "bite", "presence", "harsh", "sibilance", "sizzle", "air" },
 }
 
 --- Biquad of one band stage (b1 = 0, b2 = -b0); the JSFX uses the same maths.
@@ -1968,6 +1968,7 @@ out_pin:left output
 out_pin:right output
 
 @init
+ext_noinit = 1; // keep the state when REAPER restarts the FX after a render (else the idle blocks look like a fresh run)
 MAGIC = 20261103; VERSION = 4;
 HDR = 256; MAXTR = 128; MAXSEC = 1800; STRIDE = 32;
 MBASE = HDR + MAXTR * MAXSEC * STRIDE; MSTRIDE = 36;
@@ -2087,7 +2088,7 @@ run = gmem[9];
 ok = (role || ismin) ? 1 : (idx >= 0 && idx < MAXTR);
 t0 = play_position;
 run != last_run ? (
-  last_run = run; cur_sec = -1; cur_mb = -1; exp_t = -1;
+  last_run = run; cur_sec = -1; cur_mb = -1; exp_t = -1; reach = -1;
   cur_sb = -1; sbcnt = 0; sb_fe = 0; sb_ke = 0;
   sb_maxf = 0; sb_maxk = 0; sb_act = 0; sb_elig = 0; clipc = 0; mclipc = 0; mpeak = 0;
   act_thr = gmem[16]; clip_thr = gmem[17] > 0 ? gmem[17] : 1; mclip_thr = gmem[18] > 0 ? gmem[18] : 1;
@@ -2139,9 +2140,12 @@ run != last_run ? (
     dls.z1 = dls.z2 = dls.z3 = dls.z4 = 0;
   );
 );
-synced = (exp_t >= 0 && abs(t0 - exp_t) < 0.004) || abs(t0 - gmem[7]) < 0.05;
+// a block starting at the render start (gmem[7]) is accepted only before this run got 1 s past it: after the render, a stopped
+// project with the edit cursor at the start must not count as a new start (it overwrote the master peak with idle noise)
+synced = (exp_t >= 0 && abs(t0 - exp_t) < 0.004) || (abs(t0 - gmem[7]) < 0.05 && reach < gmem[7] + 1);
 exp_t = t0 + samplesblock * invsr;
 active = (gmem[6] == 1) && (run > 0) && ok && synced;
+active && t0 > reach ? reach = t0;
 n = 0;
 active ? (
   role ? ( gmem[10] = run; ) : ( !ismin ? gmem[32 + idx] = run; );
@@ -2360,45 +2364,121 @@ local function inject_analyzers(debug_on)
     end
     -- 2. one phantom per chosen track, appended at the end of the project (the original track numbers do not change)
     local clock = reaper.time_precise
-    local tm = { ins = 0, send = 0, fx = 0, master = 0, total = clock() } -- seconds spent per phase (printed in the report)
+    local tm = { ins = 0, set = 0, hide = 0, send = 0, check = 0, fixed = 0, fx = 0, master = 0, total = clock() } -- seconds spent per phase (printed in the report)
     -- Post-fader send from src to dst on channels 1/2, 0 dB, centre, MIDI off. REAPER creates sends with the user's own defaults, so every
     -- value is checked and only values that differ are written. Returns false when the send could not be created.
-    local function make_send(src, dst)
-        local s = reaper.CreateTrackSend(src, dst)
-        if s < 0 then return false end
+    -- Writes every send value (only the differing ones); returns how many it had to change.
+    local function fix_send(src, s)
+        local w = 0
         local function set(k, v)
-            if reaper.GetTrackSendInfo_Value(src, 0, s, k) ~= v then reaper.SetTrackSendInfo_Value(src, 0, s, k, v) end
+            if reaper.GetTrackSendInfo_Value(src, 0, s, k) ~= v then reaper.SetTrackSendInfo_Value(src, 0, s, k, v); w = w + 1 end
         end
         set("I_SENDMODE", 0) -- post-fader (and post-pan)
         set("D_VOL", 1); set("D_PAN", 0); set("D_PANLAW", 1)
         set("B_MUTE", 0); set("B_PHASE", 0); set("B_MONO", 0)
         set("I_SRCCHAN", 0); set("I_DSTCHAN", 0) -- channels 1/2 to channels 1/2
         set("I_MIDIFLAGS", 1023) -- MIDI off (source and destination channel 31 = disabled)
+        return w
+    end
+    local function make_send(src, dst)
+        local s = reaper.CreateTrackSend(src, dst)
+        if s < 0 then return false end
+        fix_send(src, s)
         return true
     end
+    -- The first phantom is built call by call; its chunk text (REAPER's own format) becomes the template, and every other phantom is a copy
+    -- of it (2 calls instead of about 14, because each routing change makes REAPER rebuild its processing graph). The check after the loop
+    -- repairs whatever differs, so a copy that came out wrong cannot give wrong data.
+    local template
     for _, t in ipairs(list) do
         local c0 = clock()
         local n = reaper.CountTracks(0)
         reaper.InsertTrackAtIndex(n, false) -- false: no default FX or envelopes
         local ph = reaper.GetTrack(0, n)
-        reaper.GetSetMediaTrackInfo_String(ph, "P_NAME", "__MA_PHANTOM " .. t.slot, true)
-        reaper.SetMediaTrackInfo_Value(ph, "B_MAINSEND", 0) -- a phantom never reaches the master
+        t.phantom = ph
         tm.ins = tm.ins + (clock() - c0)
         c0 = clock()
-        if not make_send(t.track, ph) then
-            err = "Could not create the send to the phantom track of '" .. t.name .. "'."
-            break
+        local copied = false
+        if template then
+            local map = {}
+            local chunk = template:gsub("{%x+%-%x+%-%x+%-%x+%-%x+}", function(g) -- new GUIDs (track and FX)
+                map[g] = map[g] or reaper.genGuid("")
+                return map[g]
+            end)
+            chunk = chunk:gsub("\n(%s*)NAME [^\n]*", "\n%1NAME \"__MA_PHANTOM " .. t.slot .. "\"", 1)
+            chunk = chunk:gsub("\n(%s*)AUXRECV %d+ ", "\n%1AUXRECV " .. t.idx .. " ", 1) -- receive from this track
+            copied = reaper.SetTrackStateChunk(ph, chunk, false)
+            tm.set = tm.set + (clock() - c0)
         end
-        tm.send = tm.send + (clock() - c0)
-        c0 = clock()
-        local fx = reaper.TrackFX_AddByName(ph, ANALYZER_FX_PATH, false, -1)
-        if fx < 0 then
-            err = "TrackFX_AddByName could not find the analyzer JSFX (returned -1)."
-            break
+        if copied then
+            c0 = clock()
+            if reaper.TrackFX_GetCount(ph) > 0 and math.abs(reaper.TrackFX_GetParam(ph, 0, 0) - t.slot) > 0.5 then
+                reaper.TrackFX_SetParam(ph, 0, 0, t.slot)
+            end
+            tm.fx = tm.fx + (clock() - c0)
+        else
+            reaper.GetSetMediaTrackInfo_String(ph, "P_NAME", "__MA_PHANTOM " .. t.slot, true)
+            reaper.SetMediaTrackInfo_Value(ph, "B_MAINSEND", 0) -- a phantom never reaches the master
+            tm.set = tm.set + (clock() - c0)
+            c0 = clock()
+            reaper.SetMediaTrackInfo_Value(ph, "B_SHOWINTCP", 0) -- hidden from the track list and mixer (no flicker)
+            reaper.SetMediaTrackInfo_Value(ph, "B_SHOWINMIXER", 0)
+            tm.hide = tm.hide + (clock() - c0)
+            c0 = clock()
+            if not make_send(t.track, ph) then
+                err = "Could not create the send to the phantom track of '" .. t.name .. "'."
+                break
+            end
+            tm.send = tm.send + (clock() - c0)
+            c0 = clock()
+            local fx = reaper.TrackFX_AddByName(ph, ANALYZER_FX_PATH, false, -1)
+            if fx < 0 then
+                err = "TrackFX_AddByName could not find the analyzer JSFX (returned -1)."
+                break
+            end
+            reaper.TrackFX_SetParam(ph, fx, 0, t.slot)
+            reaper.TrackFX_SetParam(ph, fx, 1, 0)
+            tm.fx = tm.fx + (clock() - c0)
+            if not template then
+                local okc, ch = reaper.GetTrackStateChunk(ph, "", false)
+                if okc and ch:find("AUXRECV", 1, true) and ch:find("<JS", 1, true) then template = ch end
+            end
         end
-        reaper.TrackFX_SetParam(ph, fx, 0, t.slot)
-        reaper.TrackFX_SetParam(ph, fx, 1, 0)
-        tm.fx = tm.fx + (clock() - c0)
+    end
+    -- Check every phantom (all of them, copied or not): name, main send off, exactly the one send with the right values, the analyzer with its slot
+    if not err then
+        local c0 = clock()
+        for _, t in ipairs(list) do
+            local ph, want, s = t.phantom, "__MA_PHANTOM " .. t.slot, nil
+            local fixed = false
+            for i = 0, reaper.GetTrackNumSends(t.track, 0) - 1 do
+                local dest = reaper.GetTrackSendInfo_Value(t.track, 0, i, "P_DESTTRACK")
+                if dest and dest ~= 0 and select(2, reaper.GetSetMediaTrackInfo_String(dest, "P_NAME", "", false)) == want then s = i; break end
+            end
+            if s then
+                if fix_send(t.track, s) > 0 then fixed = true end
+            elseif make_send(t.track, ph) then
+                fixed = true
+            else
+                err = "Could not create the send to the phantom track of '" .. t.name .. "'."
+                break
+            end
+            if select(2, reaper.GetSetMediaTrackInfo_String(ph, "P_NAME", "", false)) ~= want then
+                reaper.GetSetMediaTrackInfo_String(ph, "P_NAME", want, true); fixed = true
+            end
+            if reaper.GetMediaTrackInfo_Value(ph, "B_MAINSEND") ~= 0 then reaper.SetMediaTrackInfo_Value(ph, "B_MAINSEND", 0); fixed = true end
+            if reaper.TrackFX_GetCount(ph) == 0 then
+                local fx = reaper.TrackFX_AddByName(ph, ANALYZER_FX_PATH, false, -1)
+                if fx < 0 then err = "TrackFX_AddByName could not find the analyzer JSFX (returned -1)." break end
+                reaper.TrackFX_SetParam(ph, fx, 0, t.slot)
+                reaper.TrackFX_SetParam(ph, fx, 1, 0)
+                fixed = true
+            elseif math.abs(reaper.TrackFX_GetParam(ph, 0, 0) - t.slot) > 0.5 or math.abs(reaper.TrackFX_GetParam(ph, 0, 1)) > 0.5 then
+                reaper.TrackFX_SetParam(ph, 0, 0, t.slot); reaper.TrackFX_SetParam(ph, 0, 1, 0); fixed = true
+            end
+            if fixed then tm.fixed = tm.fixed + 1 end
+        end
+        tm.check = clock() - c0
     end
     local c_master = clock()
     if not err then
@@ -2874,7 +2954,7 @@ local function collect_region_data(tracks, route, max_sec, run_id, offsets)
                         for i = 1, #c do if inc[i] then list[#list + 1] = c[i] end end
                         if #list >= 2 then
                             table.sort(list, function(x, y) return x.sh > y.sh end)
-                            reg.mask[#reg.mask + 1] = { band = b, list = list }
+                            reg.mask[#reg.mask + 1] = { band = b, list = list, cen = den * 10 ^ (offsets[b] / 10) } -- cen: calibrated band energy of all non-bus tracks (weight when a merged range's shares are combined)
                         end
                     end
                 end
@@ -2913,6 +2993,40 @@ local function print_region_summary(out, tracks, max_sec, run_id, offsets)
             l[#l + 1] = e.key .. (int and string.format("%+d", math.floor(e.dev + 0.5)) or string.format("%+.1f", e.dev))
         end
         return table.concat(l, " ")
+    end
+    -- Masking entries of a region: neighbouring bands with the same set of tracks become one Hz range ("20-200Hz: Pad 56, Intro_Pad 40");
+    -- the numbers are each track's share of the total energy of the whole range (band shares weighted by the band energy `cen`).
+    local function mask_ranges(reg, name)
+        local res, g = {}, nil
+        local function flush()
+            if not g then return end
+            local sum, tot, order, who = {}, 0, {}, {}
+            for _, m in ipairs(g.ms) do
+                tot = tot + m.cen
+                for _, e in ipairs(m.list) do
+                    if not sum[e.d] then sum[e.d] = 0; order[#order + 1] = e.d end
+                    sum[e.d] = sum[e.d] + e.sh * m.cen
+                end
+            end
+            table.sort(order, function(x, y) return sum[x] > sum[y] end)
+            for _, d in ipairs(order) do who[#who + 1] = name(d.t.name) .. " " .. i0(100 * sum[d] / tot) end
+            res[#res + 1] = string.format("%g-%gHz: %s", B15_EDGES[g.lo], B15_EDGES[g.hi + 1], table.concat(who, ", "))
+        end
+        for _, m in ipairs(reg.mask) do
+            local ids = {}
+            for _, e in ipairs(m.list) do ids[#ids + 1] = e.d.t.idx end
+            table.sort(ids)
+            local key = table.concat(ids, ",")
+            if g and g.key == key and m.band == g.hi + 1 then
+                g.hi = m.band
+                g.ms[#g.ms + 1] = m
+            else
+                flush()
+                g = { lo = m.band, hi = m.band, key = key, ms = { m } }
+            end
+        end
+        flush()
+        return res
     end
 
     -- ROUTING
@@ -2955,7 +3069,7 @@ local function print_region_summary(out, tracks, max_sec, run_id, offsets)
     local function track_line(d, indent, with_clips)
         local tail = devs(d.notable)
         return string.format("%s%-22s %-4s %s  L%7.1f  pk%7.1f  cr%6s  a%6s  W%4.0f  c%6.2f  %-6s %s%s%s", indent,
-            d.t.name:sub(1, 22), d.r.role, d.share and string.format("s%5.1f%%", d.share) or "s  bus ", d.L, d.pk, n1(d.crest), n1(d.act), d.width, d.corr, pan_label(d.pan100),
+            d.t.name:sub(1, 22), d.r.role == "bus" and "bus" or "", d.share and string.format("s%5.1f%%", d.share) or "s  bus ", d.L, d.pk, n1(d.crest), n1(d.act), d.width, d.corr, pan_label(d.pan100),
             d.sub_risk and "sub! " or "", with_clips and string.format("clips %.0f prepk%.1f ", d.s.clips, d.pk - d.r.fader_db) or "",
             tail ~= "" and ("| " .. tail) or "")
     end
@@ -2971,12 +3085,7 @@ local function print_region_summary(out, tracks, max_sec, run_id, offsets)
                 #reg.dev > 0 and devs(reg.dev) or "-")
             out[#out + 1] = "  " .. (chain(reg.mi, mr) or "chain: n/a")
             for _, d in ipairs(reg.sel) do out[#out + 1] = track_line(d, "  ", false) end
-            local mk = {}
-            for _, m in ipairs(reg.mask) do
-                local who = {}
-                for _, e in ipairs(m.list) do who[#who + 1] = e.d.t.name .. " " .. i0(e.sh * 100) end
-                mk[#mk + 1] = KEYS[m.band] .. ": " .. table.concat(who, " ")
-            end
+            local mk = mask_ranges(reg, function(s) return s end)
             out[#out + 1] = "  masking: " .. (#mk > 0 and table.concat(mk, " | ") or "none")
             local ap = {}
             for _, d in ipairs(reg.approx) do ap[#ap + 1] = d.t.name .. " (" .. table.concat(d.reasons, ", ") .. ")" end
@@ -2986,7 +3095,7 @@ local function print_region_summary(out, tracks, max_sec, run_id, offsets)
     end
 
     -- OVERVIEW (whole song, every track with data)
-    out[#out + 1] = "\nOVERVIEW (whole song, every counted track with data; s = share of the K energy of all counted tracks except folder buses, adds up to 100; trk = plain track, bus = folder bus (its children carry the share); L, pk, pan = after the track's own fader and pan; prepk = pk minus the track's static fader)"
+    out[#out + 1] = "\nOVERVIEW (whole song, every counted track with data; s = share of the K energy of all counted tracks except folder buses, adds up to 100; bus = folder bus (no share, its children carry it); L, pk, pan = after the track's own fader and pan; prepk = pk minus the track's static fader)"
     for _, d in ipairs(D.over) do out[#out + 1] = track_line(d, string.format("%3d ", d.t.idx), true) end
 
     -- DRAFT DATA BLOCK (what the prompt would send; final format in task 4e), mixed rounding
@@ -3006,7 +3115,7 @@ local function print_region_summary(out, tracks, max_sec, run_id, offsets)
     for _, d in ipairs(D.over) do
         if d.act and d.act >= MA_A.ACTIVE_MIN_PCT then
             local nb = #d.notable > 0 and (" | " .. devs(d.notable, true)) or ""
-            draft[#draft + 1] = string.format("T %s%s%s %s%s%s", nm(d.t.name), d.r.role ~= "trk" and (" " .. d.r.role) or "", d.share and (" s" .. i0(d.share)) or "", tok(d),
+            draft[#draft + 1] = string.format("T %s%s%s %s%s%s", nm(d.t.name), "", d.share and (" s" .. i0(d.share)) or "", tok(d),
                 d.s.clips > 0 and (" clip" .. string.format("%.0f", d.s.clips)) or "", nb)
         else
             omitted = omitted + 1
@@ -3026,12 +3135,7 @@ local function print_region_summary(out, tracks, max_sec, run_id, offsets)
                 draft[#draft + 1] = string.format(" %s s%s %s%s", nm(d.t.name), i0(d.share), tok(d),
                     #d.notable > 0 and (" | " .. devs(d.notable, true)) or "")
             end
-            local mk, ap = {}, {}
-            for _, m in ipairs(reg.mask) do
-                local who = {}
-                for _, e in ipairs(m.list) do who[#who + 1] = nm(e.d.t.name) .. " " .. i0(e.sh * 100) end
-                mk[#mk + 1] = KEYS[m.band] .. " " .. table.concat(who, " ")
-            end
+            local mk, ap = mask_ranges(reg, nm), {}
             for _, d in ipairs(reg.approx) do ap[#ap + 1] = nm(d.t.name) end
             if #mk > 0 or #ap > 0 then
                 draft[#draft + 1] = " " .. (#mk > 0 and ("mask " .. table.concat(mk, "; ")) or "") ..
@@ -3124,6 +3228,7 @@ end
 --- JSFX collection test: inject -> render (nothing added to the project) -> read gmem -> print numbers -> clean up.
 -- compare = true: also render into the project and compare the Lua DSP with the JSFX master values.
 local function run_collection_test(compare)
+    local run_t0 = reaper.time_precise()
     reaper.ClearConsole()
     remove_all_analyzers() -- leftovers from an earlier crash
 
@@ -3154,8 +3259,8 @@ local function run_collection_test(compare)
         if not tracks then error(inject_err, 0) end
         out[#out + 1] = string.format("Analyzers: %d phantom tracks + master (%d tracks skipped)", #tracks, skipped)
         local tm = tracks.timing
-        out[#out + 1] = string.format("Setup time %.1f s (adding the phantom tracks %.1f s, creating the sends %.1f s, adding the analyzers %.1f s, master %.1f s)",
-            tm.total, tm.ins, tm.send, tm.fx, tm.master)
+        out[#out + 1] = string.format("Setup time %.1f s (inserting the phantom tracks %.1f s, copying the first phantom's chunk / naming + main send off %.1f s, hiding %.1f s, creating the sends %.1f s, analyzers %.1f s, master %.1f s, final check %.1f s; phantoms the check had to repair: %d of %d)",
+            tm.total, tm.ins, tm.set, tm.hide, tm.send, tm.fx, tm.master, tm.check, tm.fixed, #tracks)
         out[#out + 1] = "JSFX handshake after injection: " .. (reaper.gmem_read(0) == MA_MAGIC and "yes" or "no (advisory only)")
 
         local region, win0, win1
@@ -3185,6 +3290,7 @@ local function run_collection_test(compare)
         reaper.gmem_write(7, 0)
         reaper.gmem_write(6, 1)
         local render_t0 = reaper.time_precise()
+        out[#out + 1] = string.format("Script work before the render command: %.1f s (the wait before the render window beyond this is REAPER's own)", render_t0 - run_t0)
         -- 43349 = dry run render (no file written); the Lua DSP comparison needs the rendered file, so it keeps 42230
         reaper.Main_OnCommand(compare and 42230 or 43349, 0)
         local render_s = reaper.time_precise() - render_t0
@@ -3335,11 +3441,11 @@ local function run_collection_test(compare)
     if rf then
         rf:write(table.concat(out, "\n"), "\n")
         rf:close()
-        out[#out + 1] = "Full report saved to: " .. report_path
     else
         out[#out + 1] = "Could not save the report file: " .. report_path
     end
-    reaper.ShowConsoleMsg(table.concat(out, "\n") .. "\n")
+    -- The console opens only when something went wrong (error or no file); otherwise the report file is the only output
+    if not (rf and ok) then reaper.ShowConsoleMsg(table.concat(out, "\n") .. "\n") end
 end
 
 -- ==============================================================================
