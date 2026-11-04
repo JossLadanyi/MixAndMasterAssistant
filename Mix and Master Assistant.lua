@@ -37,8 +37,15 @@ local PATH_SEPARATOR = package.config:sub(1, 1) or "/"
 -- 1. GLOBAL CONFIGURATION & TUNING
 -- ==============================================================================
 
--- DeepSeek API Key (Only needed if sending analysis to DeepSeek)
-local API_KEY = "YOUR_DEEPSEEK_API_KEY"
+-- DeepSeek API Key (Only needed if sending analysis to DeepSeek): first line of "apikey.txt" next to this script
+local API_KEY = (function()
+    local dir = debug.getinfo(1, "S").source:match("^@?(.*[\\/])") or ""
+    local f = io.open(dir .. "apikey.txt", "r")
+    if not f then return "" end
+    local key = (f:read("l") or ""):match("^%s*(.-)%s*$")
+    f:close()
+    return key
+end)()
 
 -- Maximum plugin parameters to capture per effect (Balances precision vs tokens)
 local MAX_PLUGIN_PARAMS = 128
