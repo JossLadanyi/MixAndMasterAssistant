@@ -3049,13 +3049,8 @@ local function collect_region_data(tracks, route, max_sec, run_id, offsets)
     return D
 end
 
---- Stage 4 console output (append to the collection test): ROUTING, SONG, regions, OVERVIEW, DRAFT DATA BLOCK, TOKENS, SELF-CHECK.
-local function print_region_summary(out, tracks, max_sec, run_id, offsets)
-    local route = track_routing(tracks)
-    local D, err = collect_region_data(tracks, route, max_sec, run_id, offsets)
-    if not D then out[#out + 1] = "\nREGION SUMMARY skipped: " .. tostring(err) return end
-    local song, KEYS = D.song, MA_A.KEYS
-
+--- Task 4f.6: number and text helpers shared by the report (print_region_summary) and the data block (build_data_block)
+function MA_A.fmt()
     local function f1(v) return (v and math.abs(v) < 1e6) and string.format("%.1f", v) or "n/a" end
     local function n1(v) return (v and v > -143) and string.format("%.1f", v) or "n/a" end
     local function i0(v) return (v and math.abs(v) < 1e9) and string.format("%d", math.floor(v + 0.5)) or "n/a" end
@@ -3109,6 +3104,91 @@ local function print_region_summary(out, tracks, max_sec, run_id, offsets)
         flush()
         return res
     end
+    return f1, n1, i0, c2, nm, chain, pan_label, devs, mask_ranges
+end
+
+--- Task 4f.6: the data block of the prompt from the stored measurements (D = the collect_region_data result plus m_peak, m_clips;
+-- t.guid on every track), so it can be rebuilt at send time without reading gmem. focus = an AI.FOCUS entry; nil or Whole Song gives
+-- the 4e text. Returns the text, the GUIDs of the tracks it names (they keep full plugin settings in the YAML) and the number of
+-- tracks left out of TRACKS.
+local function build_data_block(D, focus)
+    local f1, _, i0, c2, nm, chain, pan_label, devs, mask_ranges = MA_A.fmt()
+    local song, KEYS, m_peak, m_clips = D.song, MA_A.KEYS, D.m_peak, D.m_clips
+    local song_chain = chain(song.mi, song)
+    -- DRAFT DATA BLOCK (what the prompt would send; final format in task 4e), mixed rounding
+    local function bandlist(db)
+        local l = {}
+        for b = 1, 15 do l[b] = KEYS[b] .. f1(db[b]) end
+        return table.concat(l, " ")
+    end
+    local function tok(d)
+        return string.format("L%s pk%s%s a%s W%s c%s %s%s", f1(d.L), f1(d.pk), d.crest and (" cr" .. i0(d.crest)) or "", i0(d.act),
+            i0(d.width), c2(d.corr), pan_label(d.pan100), d.sub_risk and " sub!" or "")
+    end
+    local draft, omitted = {}, 0
+    local named = {} -- task 4e: GUIDs of the tracks the region lines and masking hints name (they keep full plugin settings in the YAML)
+    draft[1] = string.format("SONG I%s M%s S%s LRA%s pk%s clip%s | mid %s | side %s", f1(song.integrated), f1(song.max_m), f1(song.max_s),
+        f1(song.lra), f1(m_peak), m_clips and tostring(m_clips) or "n/a", bandlist(song.mid_db), bandlist(song.side_db))
+    if song_chain then draft[#draft + 1] = song_chain end
+    draft[#draft + 1] = "TRACKS (whole song)"
+    for _, d in ipairs(D.over) do
+        if d.act and d.act >= MA_A.ACTIVE_MIN_PCT then
+            local nb = #d.notable > 0 and (" | " .. devs(d.notable, true)) or ""
+            draft[#draft + 1] = string.format("%s%s %s%s%s", nm(d.t.name), d.share and (" s" .. i0(d.share)) or "", tok(d),
+                d.s.clips > 0 and (" clip" .. string.format("%.0f", d.s.clips)) or "", nb)
+        else
+            omitted = omitted + 1
+        end
+    end
+    draft[#draft + 1] = "REGIONS"
+    for i, reg in ipairs(D.regions) do
+        if reg.na or not reg.mr then
+            draft[#draft + 1] = string.format("R%d %s %s-%s | n/a", i, nm(reg.name), f1(reg.start_s), f1(reg.end_s))
+        else
+            local mr = reg.mr
+            draft[#draft + 1] = string.format("R%d %s %s-%s | I%s M%s S%s LRA%s W%s%s", i, nm(reg.name), f1(reg.start_s), f1(reg.end_s),
+                f1(mr.integrated), f1(mr.max_m), f1(mr.max_s), f1(mr.lra), i0(reg.width),
+                #reg.dev > 0 and (" | " .. devs(reg.dev, true)) or "")
+            local rc = chain(reg.mi, mr)
+            if rc then draft[#draft + 1] = " " .. rc end
+            local shown = {}
+            for _, d in ipairs(reg.sel) do
+                if d.share >= MA_A.MIN_SHARE then
+                    shown[d] = true
+                    named[d.t.guid] = true
+                    draft[#draft + 1] = string.format(" %s s%s %s%s", nm(d.t.name), i0(d.share), tok(d),
+                        #d.notable > 0 and (" | " .. devs(d.notable, true)) or "")
+                end
+            end
+            -- Every other counted track that plays in the region (no folder buses), in track order, with its play time there
+            local also = {}
+            for _, d in ipairs(reg.all) do
+                if not shown[d] and d.r.role ~= "bus" and d.act and d.act >= MA_A.ACTIVE_MIN_PCT then also[#also + 1] = nm(d.t.name) .. " a" .. i0(d.act) end
+            end
+            if #also > 0 then draft[#draft + 1] = string.format(" R%d also %s", i, table.concat(also, ", ")) end
+            for _, m in ipairs(reg.mask) do
+                for _, e in ipairs(m.list) do named[e.d.t.guid] = true end
+            end
+            local mk, ap = mask_ranges(reg, nm), {}
+            for _, d in ipairs(reg.approx) do ap[#ap + 1] = nm(d.t.name) end
+            if #mk > 0 or #ap > 0 then
+                draft[#draft + 1] = " " .. (#mk > 0 and ("mask " .. table.concat(mk, "; ")) or "") ..
+                    ((#mk > 0 and #ap > 0) and " | " or "") .. (#ap > 0 and ("approx: " .. table.concat(ap, ",")) or "")
+            end
+        end
+    end
+    return table.concat(draft, "\n"), named, omitted
+end
+
+--- Stage 4 console output (append to the collection test): ROUTING, SONG, regions, OVERVIEW, DATA BLOCK, TOKENS, SELF-CHECK. Returns the data block, the GUIDs it names and (task 4f.6) the stored
+-- measurements D for build_data_block; nil when the region data failed.
+local function print_region_summary(out, tracks, max_sec, run_id, offsets)
+    local route = track_routing(tracks)
+    local D, err = collect_region_data(tracks, route, max_sec, run_id, offsets)
+    if not D then out[#out + 1] = "\nREGION SUMMARY skipped: " .. tostring(err) return end
+    local song = D.song
+    local f1, n1, _, _, _, chain, pan_label, devs, mask_ranges = MA_A.fmt()
+    for _, t in ipairs(tracks) do t.guid = reaper.GetTrackGUID(t.track) end -- task 4f.6: tracks are found by GUID at send time
 
     -- ROUTING
     out[#out + 1] = "\nROUTING (fader, pan and automation are measured on the phantom tracks, not modelled; parent = folder parent idx)"
@@ -3179,69 +3259,9 @@ local function print_region_summary(out, tracks, max_sec, run_id, offsets)
     out[#out + 1] = "\nOVERVIEW (whole song, every counted track with data; s = share of the K energy of all counted tracks except folder buses, adds up to 100; bus = folder bus (no share, its children carry it); L, pk, pan = after the track's own fader and pan; prepk = pk minus the track's static fader)"
     for _, d in ipairs(D.over) do out[#out + 1] = track_line(d, string.format("%3d ", d.t.idx), true) end
 
-    -- DRAFT DATA BLOCK (what the prompt would send; final format in task 4e), mixed rounding
-    local function bandlist(db)
-        local l = {}
-        for b = 1, 15 do l[b] = KEYS[b] .. f1(db[b]) end
-        return table.concat(l, " ")
-    end
-    local function tok(d)
-        return string.format("L%s pk%s%s a%s W%s c%s %s%s", f1(d.L), f1(d.pk), d.crest and (" cr" .. i0(d.crest)) or "", i0(d.act),
-            i0(d.width), c2(d.corr), pan_label(d.pan100), d.sub_risk and " sub!" or "")
-    end
-    local draft, omitted = {}, 0
-    local named = {} -- task 4e: GUIDs of the tracks the region lines and masking hints name (they keep full plugin settings in the YAML)
-    draft[1] = string.format("SONG I%s M%s S%s LRA%s pk%s clip%s | mid %s | side %s", f1(song.integrated), f1(song.max_m), f1(song.max_s),
-        f1(song.lra), f1(m_peak), m_clips and tostring(m_clips) or "n/a", bandlist(song.mid_db), bandlist(song.side_db))
-    if song_chain then draft[#draft + 1] = song_chain end
-    draft[#draft + 1] = "TRACKS (whole song)"
-    for _, d in ipairs(D.over) do
-        if d.act and d.act >= MA_A.ACTIVE_MIN_PCT then
-            local nb = #d.notable > 0 and (" | " .. devs(d.notable, true)) or ""
-            draft[#draft + 1] = string.format("%s%s %s%s%s", nm(d.t.name), d.share and (" s" .. i0(d.share)) or "", tok(d),
-                d.s.clips > 0 and (" clip" .. string.format("%.0f", d.s.clips)) or "", nb)
-        else
-            omitted = omitted + 1
-        end
-    end
-    draft[#draft + 1] = "REGIONS"
-    for i, reg in ipairs(D.regions) do
-        if reg.na or not reg.mr then
-            draft[#draft + 1] = string.format("R%d %s %s-%s | n/a", i, nm(reg.name), f1(reg.start_s), f1(reg.end_s))
-        else
-            local mr = reg.mr
-            draft[#draft + 1] = string.format("R%d %s %s-%s | I%s M%s S%s LRA%s W%s%s", i, nm(reg.name), f1(reg.start_s), f1(reg.end_s),
-                f1(mr.integrated), f1(mr.max_m), f1(mr.max_s), f1(mr.lra), i0(reg.width),
-                #reg.dev > 0 and (" | " .. devs(reg.dev, true)) or "")
-            local rc = chain(reg.mi, mr)
-            if rc then draft[#draft + 1] = " " .. rc end
-            local shown = {}
-            for _, d in ipairs(reg.sel) do
-                if d.share >= MA_A.MIN_SHARE then
-                    shown[d] = true
-                    named[reaper.GetTrackGUID(d.t.track)] = true
-                    draft[#draft + 1] = string.format(" %s s%s %s%s", nm(d.t.name), i0(d.share), tok(d),
-                        #d.notable > 0 and (" | " .. devs(d.notable, true)) or "")
-                end
-            end
-            -- Every other counted track that plays in the region (no folder buses), in track order, with its play time there
-            local also = {}
-            for _, d in ipairs(reg.all) do
-                if not shown[d] and d.r.role ~= "bus" and d.act and d.act >= MA_A.ACTIVE_MIN_PCT then also[#also + 1] = nm(d.t.name) .. " a" .. i0(d.act) end
-            end
-            if #also > 0 then draft[#draft + 1] = string.format(" R%d also %s", i, table.concat(also, ", ")) end
-            for _, m in ipairs(reg.mask) do
-                for _, e in ipairs(m.list) do named[reaper.GetTrackGUID(e.d.t.track)] = true end
-            end
-            local mk, ap = mask_ranges(reg, nm), {}
-            for _, d in ipairs(reg.approx) do ap[#ap + 1] = nm(d.t.name) end
-            if #mk > 0 or #ap > 0 then
-                draft[#draft + 1] = " " .. (#mk > 0 and ("mask " .. table.concat(mk, "; ")) or "") ..
-                    ((#mk > 0 and #ap > 0) and " | " or "") .. (#ap > 0 and ("approx: " .. table.concat(ap, ",")) or "")
-            end
-        end
-    end
-    local text = table.concat(draft, "\n")
+    -- DATA BLOCK (task 4f.6: from the stored measurements, the same builder the send uses)
+    D.m_peak, D.m_clips = m_peak, m_clips
+    local text, named, omitted = build_data_block(D)
     out[#out + 1] = "\nDATA BLOCK (the measured part of the prompt; the whole prompt is saved to MixAssistant_prompt.txt):\n" .. text
 
     -- TOKENS and SELF-CHECK
@@ -3252,7 +3272,7 @@ local function print_region_summary(out, tracks, max_sec, run_id, offsets)
     out[#out + 1] = string.format("SELF-CHECK: region weights %.2f s + gap seconds %.2f s = %.2f s vs song %.2f s (%s) | regions n/a: %d | tracks counted with data: %d of %d (%d not counted: no direct path to the master)",
         chk.weights, chk.gaps, chk.weights + chk.gaps, D.proj_len, math.abs(chk.weights + chk.gaps - D.proj_len) < 0.05 and "OK" or "MISMATCH",
         chk.n_na, D.tracks_with_data, #tracks, D.dropped)
-    return text, named
+    return text, named, D
 end
 
 --- Task 4e: the whole prompt of the JSFX path. Fixed text first (role, legend, instructions: the same for every project, so a
@@ -3372,7 +3392,7 @@ end
 -- compare = true: also render into the project and compare the Lua DSP with the JSFX master values.
 --- Task 4f.1: one JSFX collection run (analyzers + phantoms, render, read, cleanup that always runs, undo).
 -- Returns nil when the analyzer file cannot be written (a message box says why); otherwise ok, the report lines,
--- and for a normal run (not `compare`) the data block and the GUIDs of the tracks it names.
+-- and for a normal run (not `compare`) the data block, the GUIDs of the tracks it names and the stored measurements (build_data_block).
 local function collect_jsfx_data(compare)
     local run_t0 = reaper.time_precise()
     remove_all_analyzers() -- leftovers from an earlier crash
@@ -3388,7 +3408,7 @@ local function collect_jsfx_data(compare)
     local out = {}
     local old_guids = {}
     for i = 0, reaper.CountTracks(0) - 1 do old_guids[reaper.GetTrackGUID(reaper.GetTrack(0, i))] = true end
-    local data_block, named -- task 4e: the data block and the GUIDs of the tracks it names
+    local data_block, named, coll -- task 4e: the data block and the GUIDs of the tracks it names; 4f.6: the stored measurements
 
     local ok, err = pcall(function()
         reaper.gmem_attach(GMEM_NAME)
@@ -3554,7 +3574,7 @@ local function collect_jsfx_data(compare)
             out[#out + 1] = hdr .. "\n" .. mline .. "\n" .. sline
         end
 
-        if not compare then data_block, named = print_region_summary(out, tracks, max_sec, run_id, offsets) end
+        if not compare then data_block, named, coll = print_region_summary(out, tracks, max_sec, run_id, offsets) end
 
         if compare then
             local lua_m = analyze_region(find_new_tracks(old_guids), region, DEBUG_DURATION)
@@ -3580,7 +3600,7 @@ local function collect_jsfx_data(compare)
     if reaper.Undo_CanUndo2(0) == block_name then reaper.Undo_DoUndo2(0) end
 
     if not ok then out[#out + 1] = "ERROR: " .. tostring(err) end
-    return ok, out, data_block, named
+    return ok, out, data_block, named, coll
 end
 
 --- Task 4f: the whole prompt from a collection (compact YAML read after the cleanup, so no analyzer or phantom is in it).
@@ -3963,7 +3983,7 @@ end
 
 --- "Collect Data": one collection run (report to MixAssistant_report.txt next to the script), then the prompt, saved next to the project like the old flow.
 function AI.collect()
-    local ok, out, block, named = collect_jsfx_data(false)
+    local ok, out, block, named, D = collect_jsfx_data(false)
     if not out then AI.status = "Collection failed: the analyzer file could not be written." return end
     local script_dir = (debug.getinfo(1, "S").source or ""):match("^@(.*[\\/])") or (reaper.GetResourcePath() .. PATH_SEPARATOR)
     write_lines(script_dir .. "MixAssistant_report.txt", out)
@@ -3973,9 +3993,27 @@ function AI.collect()
     end
     local prompt, err = build_collected_prompt(block, named)
     if not prompt then AI.status = "Prompt build failed: " .. tostring(err) return end
-    AI.collected = { prompt = prompt, tokens = MA_A.tokens(#prompt), path = save_prompt_to_txt(prompt, "JSFX Full Mix"),
+    -- Task 4f.6: the measurements are kept (D), prompts are built per focus from them (cache, keyed by the focus name);
+    -- Whole Song is built now so a build error shows at once. The file is saved at send / copy time (AI.full_prompt).
+    AI.collected = { D = D, cache = { [AI.FOCUS[1][1]] = { prompt = prompt, tokens = MA_A.tokens(#prompt) } },
         when = os.date("%H:%M"), changes = reaper.GetProjectStateChangeCount(0), soloed = reaper.AnyTrackSolo(0) }
     AI.sent = false
+end
+
+--- Task 4f.6: the collected prompt for focus i (without the soloed note and the FOCUS line), built from the stored measurements on
+-- first use and cached (no gmem reading; tracks are found by GUID, missing ones are skipped by the YAML). Returns the cache entry
+-- { prompt, tokens, path, saved }, or nil and a message.
+function AI.prompt(i)
+    local c, f = AI.collected, AI.FOCUS[i] or AI.FOCUS[1]
+    local e = c.cache[f[1]]
+    if not e then
+        local block, named = build_data_block(c.D, f)
+        local prompt, err = build_collected_prompt(block, named)
+        if not prompt then return nil, "Prompt build failed: " .. tostring(err) end
+        e = { prompt = prompt, tokens = MA_A.tokens(#prompt) }
+        c.cache[f[1]] = e
+    end
+    return e
 end
 
 -- Task 4f.5: "Focus on" choices (decision A: all data is always sent; the focus is one line at the END of the prompt, so the rest stays
@@ -4008,13 +4046,18 @@ function AI.focus_line(i)
         f[1], table.concat(names, ", "))
 end
 
---- The text that is sent (and copied): the collected prompt + the soloed note + the FOCUS line; or nil and a message
+--- The text that is sent (and copied): the focus's prompt + the soloed note + the FOCUS line; or nil and a message.
+-- Task 4f.6: saved next to the project as AI_Mix_Prompt_JSFX_<focus>_NN.txt (the same text only once); returns the text and the cache entry.
 function AI.full_prompt(i)
     local c = AI.collected
     local fl, err = AI.focus_line(i)
     if not fl then return nil, err end
+    local e, perr = AI.prompt(i)
+    if not e then return nil, perr end
     local note = c.soloed and "\n\nNOTE: only the soloed tracks were playing when this was measured, so the master and region numbers describe them, not the whole mix." or ""
-    return c.prompt .. note .. fl
+    local text = e.prompt .. note .. fl
+    if e.saved ~= text then e.path, e.saved = save_prompt_to_txt(text, "JSFX " .. (AI.FOCUS[i] or AI.FOCUS[1])[1]), text end
+    return text, e
 end
 
 --- Runs a collection run (fn: Collect or a test button) without marking the earlier collection as outdated: every run undoes its own
@@ -4029,11 +4072,11 @@ end
 -- The API's prompt count re-measures the characters-per-token ratio for the next estimates.
 function AI.send(model_choice, think, focus_idx)
     local c = AI.collected
-    local text, err = AI.full_prompt(focus_idx)
-    if not text then AI.status = err return end
+    local text, e = AI.full_prompt(focus_idx)
+    if not text then AI.status = e return end
     chat_history = { { role = "user", content = text, display_content = string.format(
-        "Project info sent (collected %s, about %d tokens, focus: %s).\nPrompt file (without the focus line): %s",
-        c.when, MA_A.tokens(#text), (AI.FOCUS[focus_idx] or AI.FOCUS[1])[1], c.path or "not saved") } }
+        "Project info sent (collected %s, about %d tokens, focus: %s).\nPrompt file: %s",
+        c.when, MA_A.tokens(#text), (AI.FOCUS[focus_idx] or AI.FOCUS[1])[1], e.path or "not saved") } }
     scroll_to_bottom = true
     local u
     AI.sent, u = AI.ask(model_choice, think, MA_A.tokens(#text))
@@ -4188,8 +4231,9 @@ local function main()
                 st, col = "Project changed. Collect Project Info again before proceeding (free).", 0xFFB74DFF
             elseif c then
                 local pk, till = AI.peak()
-                st = string.format("Collected %s%s, about %d tokens; sending costs about $%.3f now (%s)", c.when, c.soloed and " (soloed tracks only)" or "", c.tokens,
-                    AI.cost(get_model_name(model_idx + 1), 0, c.tokens, 0), pk and ("peak until " .. till) or "off-peak")
+                local e, perr = AI.prompt(focus_idx) -- task 4f.6: the chosen focus's prompt (built once, then cached)
+                st = e and string.format("Collected %s%s, about %d tokens; sending costs about $%.3f now (%s)", c.when, c.soloed and " (soloed tracks only)" or "", e.tokens,
+                    AI.cost(get_model_name(model_idx + 1), 0, e.tokens, 0), pk and ("peak until " .. till) or "off-peak") or perr
             else
                 st = "No project info yet. Click Collect Project Info (free)."
             end
