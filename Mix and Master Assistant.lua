@@ -325,7 +325,7 @@ local function get_arrangement_markers()
     return #arrangement > 0 and arrangement or nil
 end
 
-local function get_all_connections(compact) -- compact (task 4e): keep only the "sidechain" label (the other purposes were guesses)
+local function get_all_connections(compact, keep) -- compact (task 4e): keep only the "sidechain" label (the other purposes were guesses); keep (task 4f.7b): only sends from or to these tracks
     local connections = {}
     local num_tracks = reaper.CountTracks(0)
     local track_lookup = {}
@@ -341,12 +341,14 @@ local function get_all_connections(compact) -- compact (task 4e): keep only the 
 
         for s = 0, reaper.GetTrackNumSends(src_track, 0) - 1 do
             local dest_track = reaper.GetTrackSendInfo_Value(src_track, 0, s, "P_DESTTRACK")
-            if dest_track and dest_track ~= 0 then
+            if dest_track and dest_track ~= 0 and (not keep or keep[src_track] or keep[dest_track]) then
                 local conn = { src = track_lookup[src_track], dst = track_lookup[dest_track] or "Unknown Track" }
 
                 local dst_chan = math.floor(reaper.GetTrackSendInfo_Value(src_track, 0, s, "I_DSTCHAN"))
                 local chan_index = dst_chan & 1023
-                local dst_ch_str = string.format("%d/%d", chan_index + 1, chan_index + 2)
+                -- a mono send (mono source, or "mix to mono" flag 1024) lands on ONE channel: "3", not "3/4"
+                local mono = (dst_chan & 1024) ~= 0 or (math.floor(reaper.GetTrackSendInfo_Value(src_track, 0, s, "I_SRCCHAN")) >> 10) == 1
+                local dst_ch_str = mono and tostring(chan_index + 1) or string.format("%d/%d", chan_index + 1, chan_index + 2)
 
                 if chan_index >= 2 then
                     conn.purpose = "sidechain"
@@ -592,6 +594,7 @@ local function process_track_data(track, is_master, current_depth, any_soloed, h
     if solo_state then table.insert(flags, "soloed") end
     if phase_state then table.insert(flags, "phase_flipped") end
     if #flags > 0 then track_data.flags = flags end
+    if fx_mode == "bare" then return { track = track_name, parent = parent_name, flags = track_data.flags } end -- task 4f.7b: outside the focus data
 
     local volume = linear_to_db(reaper.GetMediaTrackInfo_Value(track, "D_VOL"))
     if volume ~= 0.0 then track_data.vol_db = volume end
@@ -653,6 +656,19 @@ local function extract_full_project_yaml(opts)
             end
         end
     end
+    -- task 4f.7b (group focus, opts.listed = GUIDs the data mentions): the other tracks get a bare line unless a mentioned or kept
+    -- track is inside them; connections only where one end is kept
+    local shown
+    if opts and opts.listed then
+        shown = {}
+        for i = 0, num_tracks - 1 do
+            local tr = reaper.GetTrack(0, i)
+            if opts.listed[reaper.GetTrackGUID(tr)] or keep[tr] then
+                while tr do shown[tr] = true; tr = reaper.GetParentTrack(tr) end
+            end
+        end
+        project_data.connections = get_all_connections(true, keep)
+    end
 
     -- 1. Master Track
     table.insert(project_data.tracks, process_track_data(reaper.GetMasterTrack(0), true, 0, any_soloed, has_children, opts and "full" or nil))
@@ -661,7 +677,8 @@ local function extract_full_project_yaml(opts)
     local current_depth = 0
     for i = 0, num_tracks - 1 do
         local track = reaper.GetTrack(0, i)
-        table.insert(project_data.tracks, process_track_data(track, false, current_depth, any_soloed, has_children, opts and (keep[track] and "full" or "names") or nil))
+        table.insert(project_data.tracks, process_track_data(track, false, current_depth, any_soloed, has_children,
+            opts and (keep[track] and "full" or ((shown and not shown[track]) and "bare" or "names")) or nil))
         local folder_delta = reaper.GetMediaTrackInfo_Value(track, "I_FOLDERDEPTH")
         if folder_delta == 1 then
             current_depth = current_depth + 1
@@ -1980,6 +1997,7 @@ local B15_C = 0.6423
 local MA_A = {
     MIBASE = MA_MBASE + 18000 * MA_MSTRIDE, MISTRIDE = 4, -- master input records (JSFX role 2): K energy, count, run id, max |sample|
     TOP_N = 6, NOTABLE_DB = 3, BAND_RANGE_DB = 30, REGION_DEV_DB = 3, MASK_SHARE = 0.25, MASK_PAN = 100,
+    BACKDROP_N = 3, -- task 4f.7b: group focus, the loudest other tracks per focus region that get full lines (backdrop)
     ACTIVE_MIN_PCT = 5, TOKEN_CEILING = 8000, MIN_SHARE = 1, -- MIN_SHARE: region track lines below this share (%) are left out of the data block
     KEYS = { "rumble", "deepsub", "sub", "bass", "body", "mud", "boxy", "honk", "nasal", "bite", "presence", "harsh", "sibilance", "sizzle", "air" },
     -- Task 4f: DeepSeek peak prices, USD per 1M tokens { cache hit, cache miss, output } (api-docs.deepseek.com, 2026-11-04);
@@ -3110,11 +3128,32 @@ end
 --- Task 4f.6: the data block of the prompt from the stored measurements (D = the collect_region_data result plus m_peak, m_clips;
 -- t.guid on every track), so it can be rebuilt at send time without reading gmem. focus = an AI.FOCUS entry; nil or Whole Song gives
 -- the 4e text. Returns the text, the GUIDs of the tracks it names (they keep full plugin settings in the YAML) and the number of
--- tracks left out of TRACKS.
-local function build_data_block(D, focus)
+-- tracks left out of TRACKS. Task 4f.7b: fs = { F = {[idx] = true}, R = {[idx] = true} } for a group focus (F = focus tracks,
+-- R = their returns), nil otherwise; then a 4th value: the GUIDs of every track the data mentions (the others get a bare YAML line).
+local function build_data_block(D, focus, fs)
     local f1, _, i0, c2, nm, chain, pan_label, devs, mask_ranges = MA_A.fmt()
     local song, KEYS, m_peak, m_clips = D.song, MA_A.KEYS, D.m_peak, D.m_clips
     local song_chain = chain(song.mi, song)
+    local inF, inR = fs and fs.F or {}, fs and fs.R or {}
+    local function plays(d) return d.act and d.act >= MA_A.ACTIVE_MIN_PCT end
+    -- focus regions (an F track plays there) and the tracks that play in at least one of them
+    local freg, played, listed = {}, {}, nil
+    if fs then
+        for i, reg in ipairs(D.regions) do
+            if not reg.na and reg.mr then
+                for _, d in ipairs(reg.all) do
+                    if inF[d.t.idx] and plays(d) then freg[i] = true break end
+                end
+                if freg[i] then
+                    for _, d in ipairs(reg.all) do if plays(d) then played[d.t.idx] = true end end
+                end
+            end
+        end
+        listed = {}
+        for _, t in ipairs(D.tracks) do
+            if played[t.idx] or inF[t.idx] or inR[t.idx] then listed[t.guid] = true end
+        end
+    end
     -- DRAFT DATA BLOCK (what the prompt would send; final format in task 4e), mixed rounding
     local function bandlist(db)
         local l = {}
@@ -3132,10 +3171,18 @@ local function build_data_block(D, focus)
     if song_chain then draft[#draft + 1] = song_chain end
     draft[#draft + 1] = "TRACKS (whole song)"
     for _, d in ipairs(D.over) do
-        if d.act and d.act >= MA_A.ACTIVE_MIN_PCT then
+        if d.act and d.act >= MA_A.ACTIVE_MIN_PCT and (not fs or played[d.t.idx] or inF[d.t.idx] or inR[d.t.idx]) then
             local nb = #d.notable > 0 and (" | " .. devs(d.notable, true)) or ""
-            draft[#draft + 1] = string.format("%s%s %s%s%s", nm(d.t.name), d.share and (" s" .. i0(d.share)) or "", tok(d),
-                d.s.clips > 0 and (" clip" .. string.format("%.0f", d.s.clips)) or "", nb)
+            -- task 4f.7b: a focus track also gets its clips, the peak before its fader and all 15 band levels
+            local fo, lv = inF[d.t.idx], ""
+            local clip = (fo or d.s.clips > 0) and (" clip" .. string.format("%.0f", d.s.clips)) or ""
+            if fo then
+                clip = clip .. " prepk" .. f1(d.pk - d.r.fader_db)
+                local l = {}
+                for b = 1, 15 do l[b] = KEYS[b] .. i0(d.bands[b]) end
+                lv = " | levels " .. table.concat(l, " ")
+            end
+            draft[#draft + 1] = string.format("%s%s %s%s%s%s", nm(d.t.name), d.share and (" s" .. i0(d.share)) or "", tok(d), clip, nb, lv)
         else
             omitted = omitted + 1
         end
@@ -3144,6 +3191,10 @@ local function build_data_block(D, focus)
     for i, reg in ipairs(D.regions) do
         if reg.na or not reg.mr then
             draft[#draft + 1] = string.format("R%d %s %s-%s | n/a", i, nm(reg.name), f1(reg.start_s), f1(reg.end_s))
+        elseif fs and not freg[i] then -- task 4f.7b: the header only
+            local mr = reg.mr
+            draft[#draft + 1] = string.format("R%d %s %s-%s | I%s M%s S%s LRA%s W%s | no focus track plays", i, nm(reg.name), f1(reg.start_s),
+                f1(reg.end_s), f1(mr.integrated), f1(mr.max_m), f1(mr.max_s), f1(mr.lra), i0(reg.width))
         else
             local mr = reg.mr
             draft[#draft + 1] = string.format("R%d %s %s-%s | I%s M%s S%s LRA%s W%s%s", i, nm(reg.name), f1(reg.start_s), f1(reg.end_s),
@@ -3151,33 +3202,64 @@ local function build_data_block(D, focus)
                 #reg.dev > 0 and (" | " .. devs(reg.dev, true)) or "")
             local rc = chain(reg.mi, mr)
             if rc then draft[#draft + 1] = " " .. rc end
-            local shown = {}
-            for _, d in ipairs(reg.sel) do
-                if d.share >= MA_A.MIN_SHARE then
+            local shown, lines, rest, mreg, apx = {}, reg.sel, nil, reg, reg.approx
+            if fs then
+                -- task 4f.7b: every playing focus track and return (track order), then the backdrop (the loudest others), the rest on the "others" line
+                lines, rest, apx = {}, {}, {}
+                for _, d in ipairs(reg.all) do
+                    if (inF[d.t.idx] or inR[d.t.idx]) and plays(d) then lines[#lines + 1] = d
+                    elseif d.r.role ~= "bus" and plays(d) then rest[#rest + 1] = d end
+                end
+                table.sort(rest, function(a, b) return a.share > b.share end)
+                for _ = 1, math.min(MA_A.BACKDROP_N, #rest) do lines[#lines + 1] = table.remove(rest, 1) end
+                for _, d in ipairs(lines) do if #d.reasons > 0 then apx[#apx + 1] = d end end
+                -- masking until task 4f.8 (competitors): only the bands that name a focus track
+                mreg = { mask = {} }
+                for _, m in ipairs(reg.mask) do
+                    for _, e in ipairs(m.list) do
+                        if inF[e.d.t.idx] then mreg.mask[#mreg.mask + 1] = m break end
+                    end
+                end
+            end
+            for _, d in ipairs(lines) do
+                if fs or d.share >= MA_A.MIN_SHARE then
                     shown[d] = true
                     named[d.t.guid] = true
-                    draft[#draft + 1] = string.format(" %s s%s %s%s", nm(d.t.name), i0(d.share), tok(d),
+                    draft[#draft + 1] = string.format(" %s%s %s%s", nm(d.t.name), d.share and (" s" .. i0(d.share)) or "", tok(d),
                         #d.notable > 0 and (" | " .. devs(d.notable, true)) or "")
                 end
             end
-            -- Every other counted track that plays in the region (no folder buses), in track order, with its play time there
-            local also = {}
-            for _, d in ipairs(reg.all) do
-                if not shown[d] and d.r.role ~= "bus" and d.act and d.act >= MA_A.ACTIVE_MIN_PCT then also[#also + 1] = nm(d.t.name) .. " a" .. i0(d.act) end
+            if fs then
+                local o = {}
+                for _, d in ipairs(rest) do
+                    if d.share >= MA_A.MIN_SHARE then o[#o + 1] = nm(d.t.name) .. " s" .. i0(d.share) end
+                end
+                if #o > 0 then draft[#draft + 1] = string.format(" R%d others %s", i, table.concat(o, ", ")) end
+            else
+                -- Every other counted track that plays in the region (no folder buses), in track order, with its play time there
+                local also = {}
+                for _, d in ipairs(reg.all) do
+                    if not shown[d] and d.r.role ~= "bus" and d.act and d.act >= MA_A.ACTIVE_MIN_PCT then also[#also + 1] = nm(d.t.name) .. " a" .. i0(d.act) end
+                end
+                if #also > 0 then draft[#draft + 1] = string.format(" R%d also %s", i, table.concat(also, ", ")) end
             end
-            if #also > 0 then draft[#draft + 1] = string.format(" R%d also %s", i, table.concat(also, ", ")) end
-            for _, m in ipairs(reg.mask) do
+            for _, m in ipairs(mreg.mask) do
                 for _, e in ipairs(m.list) do named[e.d.t.guid] = true end
             end
-            local mk, ap = mask_ranges(reg, nm), {}
-            for _, d in ipairs(reg.approx) do ap[#ap + 1] = nm(d.t.name) end
+            local mk, ap = mask_ranges(mreg, nm), {}
+            for _, d in ipairs(apx) do ap[#ap + 1] = nm(d.t.name) end
             if #mk > 0 or #ap > 0 then
                 draft[#draft + 1] = " " .. (#mk > 0 and ("mask " .. table.concat(mk, "; ")) or "") ..
                     ((#mk > 0 and #ap > 0) and " | " or "") .. (#ap > 0 and ("approx: " .. table.concat(ap, ",")) or "")
             end
         end
     end
-    return table.concat(draft, "\n"), named, omitted
+    if fs then -- task 4f.7b: focus tracks and returns keep full plugin settings even where they do not play
+        for _, t in ipairs(D.tracks) do
+            if inF[t.idx] or inR[t.idx] then named[t.guid] = true end
+        end
+    end
+    return table.concat(draft, "\n"), named, omitted, listed
 end
 
 --- Stage 4 console output (append to the collection test): ROUTING, SONG, regions, OVERVIEW, DATA BLOCK, TOKENS, SELF-CHECK. Returns the data block, the GUIDs it names and (task 4f.6) the stored
@@ -3278,7 +3360,7 @@ end
 
 --- Task 4e: the whole prompt of the JSFX path. Fixed text first (role, legend, instructions: the same for every project, so a
 -- cached prompt start can be reused), then the data block and the compact project YAML.
-local function build_jsfx_prompt(block, yaml)
+local function build_jsfx_prompt(block, yaml, focus) -- focus (task 4f.7b): a group focus, adds the focus keys to the legend
     local bands = {}
     for b = 1, 15 do bands[b] = string.format("%s %g-%g", MA_A.KEYS[b], B15_EDGES[b], B15_EDGES[b + 1]) end
     return table.concat({
@@ -3297,7 +3379,11 @@ local function build_jsfx_prompt(block, yaml)
         "- after \"|\": bands that stand out against their neighbouring bands in the same track (dB, + = bump, - = dip).",
         "REGIONS: R n name start-end (seconds), then the master numbers of the region; after \"|\": master bands against the song average, after levelling out the loudness difference (dB). Then the region's top tracks by share (same keys as above). \"R n also\" = every other track that plays in region n, with a = % of the region it plays; compare these lines between regions to see arrangement changes.",
         "mask: Hz ranges where 2 or more of these tracks each hold at least 25% of the energy. The number is each track's share (%) of all energy inside the whole range, so a narrow overlap can look small in a wide range. approx: the shares of these tracks are approximate (their folder also receives sends).",
-        "Differences under 1 dB are measurement noise. Width, correlation and balance are measured after pan.",
+        "Differences under 1 dB are measurement noise. Width, correlation and balance are measured after pan." .. (focus and table.concat({ "",
+            "FOCUS DATA (this prompt has a focus, see FOCUS at the end):",
+            "- TRACKS: a focus track also shows clip n, prepk = its sample peak before its own fader (dB), and after \"levels\" all 15 band levels (dB). Tracks that never play while a focus track plays are left out.",
+            "- REGIONS: \"no focus track plays\" = no focus track plays in that region, so only its master numbers are given. Otherwise the region lists every focus track and return (a track a focus track sends to) that plays there, in track order, then the 3 other tracks with the highest share. \"R n others\" = the remaining tracks that play there with their share (under 1% left out); it replaces the \"R n also\" line. mask lists only the ranges that include a focus track.",
+            "- YAML: tracks left out of the data list only name, parent and flags." }, "\n") or ""),
         "",
         "=== PROJECT YAML ===",
         "Routing and settings: folders (parent, flags: folder), sends (connections; sidechain = feeds a side-chain input; send volume 0 dB when omitted), faders (vol_db), pan, envelopes (auto), plugins in chain order. The master and the tracks named under REGIONS, with their folders, list full plugin settings. All other tracks list plugin names only (fx: \"A > B\"); when you need their settings, ask for \"DETAIL <track name>\" and I will send them. Settings with a common name start are grouped: band_1: {freq: 181} means the setting band_1_freq. A renamed plugin shows its original in brackets, e.g. Ducking Comp (ReaComp).",
@@ -3606,10 +3692,10 @@ end
 
 --- Task 4f: the whole prompt from a collection (compact YAML read after the cleanup, so no analyzer or phantom is in it).
 -- Returns prompt, compact YAML; or nil, error text.
-local function build_collected_prompt(data_block, named)
-    local cok, cyaml = pcall(extract_full_project_yaml, { full = named })
+local function build_collected_prompt(data_block, named, listed) -- listed (task 4f.7b): group focus, see build_data_block
+    local cok, cyaml = pcall(extract_full_project_yaml, { full = named, listed = listed })
     if not (cok and type(cyaml) == "string") then return nil, tostring(cyaml) end
-    return build_jsfx_prompt(data_block, cyaml), cyaml
+    return build_jsfx_prompt(data_block, cyaml, listed ~= nil), cyaml
 end
 
 --- The two JSFX test buttons: one collection, then the report (MixAssistant_report.txt) and the prompt (MixAssistant_prompt.txt) next to the script.
@@ -3997,7 +4083,8 @@ function AI.collect()
     -- Task 4f.6: the measurements are kept (D), prompts are built per focus from them (cache, keyed by the focus name);
     -- Whole Song is built now so a build error shows at once. The file is saved at send / copy time (AI.full_prompt).
     AI.collected = { D = D, cache = { [AI.FOCUS[1][1]] = { prompt = prompt, tokens = MA_A.tokens(#prompt) } },
-        when = os.date("%H:%M"), changes = reaper.GetProjectStateChangeCount(0), soloed = reaper.AnyTrackSolo(0) }
+        when = os.date("%H:%M"), changes = reaper.GetProjectStateChangeCount(0), soloed = reaper.AnyTrackSolo(0),
+        undo = reaper.Undo_CanUndo2(0) or "", sel = AI.sel_sig() } -- task 4f.7b: see AI.changed
     AI.sent = false
 end
 
@@ -4006,13 +4093,42 @@ end
 -- { prompt, tokens, path, saved }, or nil and a message.
 function AI.prompt(i)
     local c, f = AI.collected, AI.FOCUS[i] or AI.FOCUS[1]
-    local e = c.cache[f[1]]
+    -- task 4f.7b: a group focus shapes the data block and the YAML; Selected Tracks is cached per selection
+    local lists = (f.g or f.inst or f.ret or f.sel) and AI.focus_lists() or nil
+    local l = lists and lists[i]
+    if l and #l == 0 then
+        local _, msg = AI.focus_line(i)
+        return nil, msg
+    end
+    local key = f[1] .. ((f.sel and lists) and ("|" .. lists.sig) or "")
+    local e = c.cache[key]
     if not e then
-        local block, named = build_data_block(c.D, f)
-        local prompt, err = build_collected_prompt(block, named)
+        local fs
+        if l then
+            -- F = the focus tracks; R = their returns: counted tracks an F track sends audio to on channel 1 or 2
+            -- (& 1023 strips the mono flag 1024, so a mono send to channel 1 or 2 counts too)
+            fs = { F = {}, R = {} }
+            local by_tr = {}
+            for _, t in ipairs(c.D.tracks) do
+                if not c.D.route[t.idx].no_direct then by_tr[t.track] = t end
+            end
+            for _, x in ipairs(l) do fs.F[x.t.idx] = true end
+            for _, x in ipairs(l) do
+                for k = 0, reaper.GetTrackNumSends(x.tr, 0) - 1 do
+                    local dst = by_tr[reaper.GetTrackSendInfo_Value(x.tr, 0, k, "P_DESTTRACK")]
+                    if dst and not fs.F[dst.idx] and reaper.GetTrackSendInfo_Value(x.tr, 0, k, "B_MUTE") ~= 1
+                        and reaper.GetTrackSendInfo_Value(x.tr, 0, k, "I_SRCCHAN") >= 0
+                        and math.floor(reaper.GetTrackSendInfo_Value(x.tr, 0, k, "I_DSTCHAN")) & 1023 < 2 then
+                        fs.R[dst.idx] = true
+                    end
+                end
+            end
+        end
+        local block, named, _, listed = build_data_block(c.D, f, fs)
+        local prompt, err = build_collected_prompt(block, named, listed)
         if not prompt then return nil, "Prompt build failed: " .. tostring(err) end
         e = { prompt = prompt, tokens = MA_A.tokens(#prompt) }
-        c.cache[f[1]] = e
+        c.cache[key] = e
     end
     return e
 end
@@ -4174,7 +4290,29 @@ end
 function AI.keep(fn)
     local c, before = AI.collected, reaper.GetProjectStateChangeCount(0)
     fn()
-    if c and c == AI.collected and c.changes == before then c.changes = reaper.GetProjectStateChangeCount(0) end
+    if c and c == AI.collected and c.changes == before then c.changes, c.undo = reaper.GetProjectStateChangeCount(0), reaper.Undo_CanUndo2(0) or "" end
+end
+
+--- Task 4f.7b: the track selection as text (selected tracks + the number of selected items)
+function AI.sel_sig()
+    local parts = { reaper.CountSelectedMediaItems(0) }
+    for k = 0, reaper.CountSelectedTracks(0) - 1 do parts[#parts + 1] = tostring(reaper.GetSelectedTrack(0, k)) end
+    return table.concat(parts, ",")
+end
+
+--- Task 4f.7b: has the project changed since the collection? Selecting tracks also moves REAPER's change counter, so a counter
+-- change with a new selection and no new undo point (or a selection undo point) is taken as "unchanged". Once changed, it stays changed.
+function AI.changed()
+    local c = AI.collected
+    local n = reaper.GetProjectStateChangeCount(0)
+    if c.dirty or n == c.changes then return c.dirty end
+    local undo, sel = reaper.Undo_CanUndo2(0) or "", AI.sel_sig()
+    if sel ~= c.sel and (undo == c.undo or undo:lower():find("selection", 1, true)) then
+        c.changes, c.undo, c.sel = n, undo, sel
+        return false
+    end
+    c.dirty = true
+    return true
 end
 
 --- "Send Project Info to Agent": a new chat that starts with the collected prompt (the chat shows only a short line for it).
@@ -4348,7 +4486,7 @@ local function main()
             local st, col = nil, 0xFFD54FFF
             if AI.status ~= "" then
                 st = AI.status
-            elseif c and reaper.GetProjectStateChangeCount(0) ~= c.changes then
+            elseif c and AI.changed() then
                 st, col = "Project changed. Collect Project Info again before proceeding (free).", 0xFFB74DFF
             elseif c then
                 local pk, till = AI.peak()
