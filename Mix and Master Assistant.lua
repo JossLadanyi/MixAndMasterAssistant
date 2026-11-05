@@ -710,6 +710,10 @@ local function extract_full_project_yaml(opts)
             end
         end
     end
+    if opts and opts.only then -- task 4g.3 Track Detail (snapshot only): just these tracks with full settings and their sends, no project part
+        keep = opts.only
+        project_data.meta, project_data.arr, project_data.notes, project_data.connections = nil, nil, nil, conns(keep)
+    end
     -- task 4f.7b (group focus, opts.listed = GUIDs the data mentions): the other tracks get a bare line unless a mentioned or kept
     -- track is inside them; connections only where one end is kept
     local shown
@@ -724,14 +728,16 @@ local function extract_full_project_yaml(opts)
     end
 
     -- 1. Master Track
-    table.insert(project_data.tracks, S and cp(S.td[S.master].full) or process_track_data(reaper.GetMasterTrack(0), true, 0, any_soloed, has_children, opts and "full" or nil))
+    if not (opts and opts.only) then
+        table.insert(project_data.tracks, S and cp(S.td[S.master].full) or process_track_data(reaper.GetMasterTrack(0), true, 0, any_soloed, has_children, opts and "full" or nil))
+    end
 
     -- 2. Child Tracks & Folders
     local current_depth = 0
     for _, track in ipairs(list) do
         local mode = opts and (keep[track] and "full" or ((shown and not shown[track]) and "bare" or "names")) or nil
         if S then
-            table.insert(project_data.tracks, cp(S.td[track][mode]))
+            if not opts.only or opts.only[track] then table.insert(project_data.tracks, cp(S.td[track][mode])) end
         else
             table.insert(project_data.tracks, process_track_data(track, false, current_depth, any_soloed, has_children, mode))
             local folder_delta = reaper.GetMediaTrackInfo_Value(track, "I_FOLDERDEPTH")
@@ -828,7 +834,7 @@ local function extract_full_project_yaml(opts)
             nl[#nl + 1] = "- plugin" .. (#l > 1 and "s " or " ") .. table.concat(l, ", ") .. ": " .. table.concat(e.notes, " ")
         end
         table.sort(nl)
-        if #nl > 0 then project_data.notes = project_data.notes .. "\n" .. table.concat(nl, "\n") end
+        if #nl > 0 then project_data.notes = (project_data.notes and (project_data.notes .. "\n") or "") .. table.concat(nl, "\n") end
     end
 
     return to_yaml(project_data), project_data.arr
@@ -3781,7 +3787,7 @@ local function build_jsfx_prompt(block, yaml, focus, topic) -- focus (task 4f.7b
         "- after \"|\": bands that stand out from their neighbouring bands in the same track (dB, + bump, - dip).",
         "REGIONS: R n name start-end (seconds), the region's master numbers; after \"|\": master bands against the song average with the loudness difference removed (dB). Then the region's top tracks by share (same keys). \"R n also\" = every other track playing in region n, a = % of the region it plays; compare regions to see arrangement changes.",
         "mask: Hz ranges where 2 or more of these tracks each hold at least 25% of the energy; number = each track's % of all energy in the whole range (a narrow overlap looks small in a wide range). approx: these tracks' shares are approximate (their folder also receives sends).",
-        "Differences under 1 dB are measurement noise. Width, correlation and balance are measured after pan." .. (focus and table.concat({ "",
+        "Differences under 1 dB are measurement noise. Width, correlation and balance are measured after pan. The LRA of a single region is naturally small (one section changes little in loudness); judge compression by crest, not by region LRA." .. (focus and table.concat({ "",
             "FOCUS DATA (see FOCUS at the end):",
             "- TRACKS: focus tracks and returns also show clip n, prepk = sample peak before their own fader (dB) and \"levels\" = all 15 band levels (dB). Tracks that never play while a focus track plays are left out.",
             "- auto (under a TRACKS line): the track's envelopes over the whole song, ENVELOPE unit: value@seconds ...; the curve follows straight lines between the points within 0.5 dB (volume), 2% (pan, width) or 1% of a plugin parameter's range; ~ = over " .. MA_A.AUTO_MAX .. " points, drawn coarser; envelopes that never move are left out; Mute lists the switching points. Send_Volume>NAME = the send to NAME, PLUGIN/PARAM = a plugin parameter. The measured numbers already include the automation.",
@@ -3790,15 +3796,16 @@ local function build_jsfx_prompt(block, yaml, focus, topic) -- focus (task 4f.7b
             "- YAML: tracks left out of the data show only name, parent and flags." }, "\n") or "") .. tl,
         "",
         "=== PROJECT YAML ===",
-        "Routing and settings: folders (parent, flags: folder), sends (connections; sidechain = feeds a side-chain input; send volume 0 dB when omitted), faders (vol_db), pan, envelopes (auto), plugins in chain order. The master and the tracks named under REGIONS, with their folders, list full plugin settings. All other tracks list plugin names only (fx: \"A > B\"); when you need their settings, ask for \"DETAIL <track name>\" and I will send them. Settings with a common name start are grouped: band_1: {freq: 181} means the setting band_1_freq. A renamed plugin shows its original in brackets, e.g. Ducking Comp (ReaComp). \"params: same as plugin 3 on Lead Vox\" = exactly the settings of the 3rd plugin in Lead Vox's chain. Plugin values are shown as each plugin reports them; some plugins label units or on/off states wrongly (e.g. a reverb time of 2.5 ms that means 2.5 s), so judge by plausibility.",
+        "Routing and settings: folders (parent, flags: folder), sends (connections; sidechain = feeds a side-chain input; send volume 0 dB when omitted), faders (vol_db), pan, envelopes (auto), plugins in chain order. The master and the tracks named under REGIONS, with their folders, list full plugin settings. All other tracks list plugin names only (fx: \"A > B\"); when you need their settings, ask for \"DETAIL <track name>\" and I will send that track's full plugin settings, sends, automation and measurements per region. Settings with a common name start are grouped: band_1: {freq: 181} means the setting band_1_freq. A renamed plugin shows its original in brackets, e.g. Ducking Comp (ReaComp). \"params: same as plugin 3 on Lead Vox\" = exactly the settings of the 3rd plugin in Lead Vox's chain. Plugin values are shown as each plugin reports them; some plugins label units or on/off states wrongly (e.g. a reverb time of 2.5 ms that means 2.5 s), so judge by plausibility.",
         "",
         "=== INSTRUCTIONS ===",
-        "1. Dynamics: compare loudness, LRA and crest across the regions and tracks. Where contrast is missing, find the compressor or limiter in the YAML and give the gain reduction to aim for (dB), never a threshold.",
-        "2. Low and mid balance: use the track band bumps, the mask ranges and the master band deviations. Name the track, the plugin and the change (frequency, gain, Q).",
-        "3. Highs: tell \"harsh\" apart from \"sibilance\"; suggest a de-esser or a dynamic EQ where needed.",
-        "4. Stereo and mono: check W, c, the balance and sub!; name phase or width problems and how to fix them.",
-        "5. Master: judge the chain gain, the final loudness and the peak.",
-        "6. Arrangement: when two regions of the same kind differ (e.g. Verse 1 and Verse 2), compare their track lines and also lines and say what changed in the arrangement.",
+        "Answer with concrete changes, not a review. First the changes: at most 10, most important first. For each: what to do (track, plugin and parameter exactly as in the YAML, current value -> new value; or a new plugin with its settings; or a fader, pan or automation move), why (the problem in one sentence, with the measured number that shows it) and what to listen for. Then \"Already working\": up to 5 settings or choices that already help the mix, each with the number that shows it. Look for changes in these areas:",
+        "1. Dynamics: loudness, LRA and crest across the regions and tracks. For a compressor or limiter give the gain reduction to aim for (dB), never a threshold.",
+        "2. Low and mid balance: the track band bumps, the mask ranges and the master band deviations; give frequency, gain and Q.",
+        "3. Highs: tell \"harsh\" apart from \"sibilance\"; a de-esser or a dynamic EQ where needed.",
+        "4. Stereo and mono: W, c, the balance and sub!; phase or width problems and how to fix them.",
+        "5. Master: the chain gain, the final loudness and the peak.",
+        "6. Arrangement: two regions of the same kind that differ (e.g. Verse 1 and Verse 2): compare their track lines and also lines and say what changed.",
         "Only advise on tracks that play in that region. Quote exact track, plugin and parameter names from the YAML. When the data does not support a claim, say so. Be honest and short, and say briefly why, so I learn.",
         "Write for a musician in plain studio words. The data keys above are for you only: never write s, L, pk, cr, a, W, c, pL/pR or sub! in your answer; say e.g. \"the kick plays 39% of the time\" or \"the bass makes up 21% of the mix\". Name bands with their Hz range, e.g. \"mud (200-315 Hz)\". Never compute values the data does not give (e.g. a share for a folder bus); say what is missing instead.",
         "",
@@ -4903,6 +4910,75 @@ function AI.send(model_choice, think, focus_idx)
     end
 end
 
+--- Task 4g.3 "Send Track Detail": the tracks selected in REAPER now (track order), as they were at Collect: the whole-song line and one
+-- line per region where the track plays (the data block's keys + clip, prepk and all 15 levels), its automation, then its YAML (full
+-- plugin settings with the notes-file rules, its sends). Returns the text and { names, tokens, skipped }, or nil and a message.
+function AI.detail_text()
+    local c = AI.collected
+    local S, D, KEYS = c.snap, c.D, MA_A.KEYS
+    local f1, _, i0, c2, nm, _, pan_label, devs = MA_A.fmt()
+    local only, skipped, names, any = {}, {}, {}, false
+    for k = 0, reaper.CountSelectedTracks(0) - 1 do
+        local tr = reaper.GetSelectedTrack(0, k)
+        if S.td[tr] then only[tr], any = true, true else
+            local _, n = reaper.GetTrackName(tr)
+            skipped[#skipped + 1] = n
+        end
+    end
+    if not any then
+        return nil, #skipped > 0 and "The selected tracks were not in the last Collect. Collect Project Info again first." or "Select the tracks to send in REAPER first."
+    end
+    local by_tr = {}
+    for _, t in ipairs(D.tracks) do by_tr[t.track] = t end
+    local function line(d)
+        local l = {}
+        for b = 1, 15 do l[b] = KEYS[b] .. i0(d.bands[b]) end
+        return string.format("%sL%s pk%s%s a%s W%s c%s %s%s clip%.0f prepk%s%s | levels %s", d.share and ("s" .. i0(d.share) .. " ") or "",
+            f1(d.L), f1(d.pk), d.crest and (" cr" .. i0(d.crest)) or "", i0(d.act), i0(d.width), c2(d.corr), pan_label(d.pan100),
+            d.sub_risk and " sub!" or "", d.s.clips, f1(d.pk - d.r.fader_db), #d.notable > 0 and (" | " .. devs(d.notable, true)) or "", table.concat(l, " "))
+    end
+    local function plays(d) return d and d.act and d.act >= MA_A.ACTIVE_MIN_PCT end
+    local p = { string.format("TRACK DETAIL (settings, sends and automation as they were when measured at %s; same keys as the data block). Per track: "
+        .. "song = the whole-song line, then R n = one line per region where it plays; clip n = clipped samples, prepk = sample peak before its "
+        .. "own fader (dB), levels = all 15 band levels (dB); auto = its envelopes over the whole song, ENVELOPE unit: value@seconds (straight "
+        .. "lines between the points; the measured numbers already include the automation). Then the YAML (same format as the project YAML).", c.when) }
+    for _, tr in ipairs(S.list) do
+        if only[tr] then
+            local t = by_tr[tr]
+            local name = t and t.name or S.td[tr].full.track
+            names[#names + 1] = name
+            p[#p + 1] = "TRACK " .. nm(name)
+            local od, quiet = nil, {}
+            for _, d in ipairs(t and D.over or {}) do if d.t == t then od = d break end end
+            p[#p + 1] = plays(od) and (" song " .. line(od)) or " song: not playing or not measured"
+            for i, reg in ipairs(t and D.regions or {}) do
+                if not reg.na and reg.mr then
+                    local rd
+                    for _, d in ipairs(reg.all) do if d.t == t then rd = d break end end
+                    if plays(rd) then p[#p + 1] = string.format(" R%d %s %s", i, nm(reg.name), line(rd)) else quiet[#quiet + 1] = "R" .. i end
+                end
+            end
+            if #quiet > 0 then p[#p + 1] = " not playing in " .. table.concat(quiet, ", ") end
+            if S.auto[tr] then p[#p + 1] = " auto " .. S.auto[tr] end
+        end
+    end
+    local ok, y = pcall(extract_full_project_yaml, { full = {}, only = only, snap = S })
+    if not (ok and type(y) == "string") then return nil, "Track detail failed: " .. tostring(y) end
+    p[#p + 1] = "YAML:"
+    p[#p + 1] = y
+    local text = table.concat(p, "\n")
+    return text, { names = table.concat(names, ", "), tokens = MA_A.tokens(#text), skipped = skipped }
+end
+
+--- Task 4g.3: adds the detail to the chat (the chat shows a short line; the text is saved next to the project) and asks the AI.
+function AI.detail_send(model_choice, think, text, info)
+    local path = save_prompt_to_txt(text, "JSFX Detail")
+    table.insert(chat_history, { role = "user", content = text, display_content = string.format(
+        "Track detail sent: %s (about %d tokens).\nFile: %s", info.names, info.tokens, path or "not saved") })
+    scroll_to_bottom = true
+    AI.ask(model_choice, think)
+end
+
 local function send_followup_message(user_text, model_choice)
     if trim_string(user_text) == "" then return end
     local selected_model = get_model_name(model_choice)
@@ -5040,9 +5116,22 @@ local function main()
                 if text then reaper.ImGui_SetClipboardText(ctx, text) else AI.status = err end
             end
             reaper.ImGui_SameLine(ctx)
-            reaper.ImGui_BeginDisabled(ctx, true) -- task 4g
-            reaper.ImGui_Button(ctx, "Send Track Detail...", 0, bh)
-            reaper.ImGui_EndDisabled(ctx)
+            -- task 4g.3: only after Send Project Info in this chat (Clear Chat locks it again); asks before sending
+            if not AI.sent then reaper.ImGui_BeginDisabled(ctx, true) end
+            if reaper.ImGui_Button(ctx, "Send Track Detail...", 0, bh) then
+                local text, info = AI.detail_text()
+                if not text then
+                    AI.status = info
+                elseif reaper.ShowMessageBox(string.format("Send the detail of: %s?\n\nAbout %d tokens (sending this part costs about $%.3f now; the earlier chat is mostly cached).%s",
+                    info.names, info.tokens, AI.cost(get_model_name(model_idx + 1), 0, info.tokens, 0),
+                    #info.skipped > 0 and ("\n\nLeft out (not in the last Collect): " .. table.concat(info.skipped, ", ")) or ""), "Send Track Detail", 1) == 1 then
+                    pending, AI.status = function() AI.detail_send(model_idx + 1, think, text, info) end, "⏳ Waiting for DeepSeek..."
+                end
+            end
+            if reaper.ImGui_IsItemHovered(ctx) then
+                reaper.ImGui_SetTooltip(ctx, "Sends the full settings, sends, automation and measurements of the tracks selected in REAPER\n(as they were at Collect) into this chat. The AI asks for them with \"DETAIL <track name>\".")
+            end
+            if not AI.sent then reaper.ImGui_EndDisabled(ctx) end
             -- Clear Chat right-aligned on the same row
             reaper.ImGui_SameLine(ctx)
             local w2 = reaper.ImGui_CalcTextSize(ctx, "Clear Chat") + 2 * bpad
