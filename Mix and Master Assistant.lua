@@ -1999,6 +1999,8 @@ local MA_A = {
     TOP_N = 6, NOTABLE_DB = 3, BAND_RANGE_DB = 30, REGION_DEV_DB = 3, MASK_SHARE = 0.25, MASK_PAN = 100,
     BACKDROP_N = 3, -- task 4f.7b: group focus, the loudest other tracks per focus region that get full lines (backdrop)
     COMP_MAIN_DB = 10, COMP_DB = 3, COMP_N = 3, -- task 4f.8: main bands within 10 dB of the loudest; competitor >= focus - 3 dB; 3 per range, 3 ranges
+    -- task 4f.9: automation points: at most AUTO_MAX per envelope; tolerances 0.5 dB volume, 2% pan/width, 1% of a plugin parameter's range
+    AUTO_MAX = 200, AUTO_TOL_DB = 0.5, AUTO_TOL_PCT = 2, AUTO_TOL_FX_PCT = 1, AUTO_FLOOR_DB = -90,
     ACTIVE_MIN_PCT = 5, TOKEN_CEILING = 8000, MIN_SHARE = 1, -- MIN_SHARE: region track lines below this share (%) are left out of the data block
     KEYS = { "rumble", "deepsub", "sub", "bass", "body", "mud", "boxy", "honk", "nasal", "bite", "presence", "harsh", "sibilance", "sizzle", "air" },
     -- Task 4f: DeepSeek peak prices, USD per 1M tokens { cache hit, cache miss, output } (api-docs.deepseek.com, 2026-11-04);
@@ -3199,6 +3201,8 @@ local function build_data_block(D, focus, fs)
                 lv = " | levels " .. table.concat(l, " ")
             end
             draft[#draft + 1] = string.format("%s%s %s%s%s%s", nm(d.t.name), d.share and (" s" .. i0(d.share)) or "", tok(d), clip, nb, lv)
+            local au = fo and fs.auto and fs.auto[d.t.idx] -- task 4f.9: the track's automation points
+            if au then draft[#draft + 1] = " auto " .. au end
         else
             omitted = omitted + 1
         end
@@ -3519,6 +3523,7 @@ local function build_jsfx_prompt(block, yaml, focus) -- focus (task 4f.7b): a gr
         "Differences under 1 dB are measurement noise. Width, correlation and balance are measured after pan." .. (focus and table.concat({ "",
             "FOCUS DATA (see FOCUS at the end):",
             "- TRACKS: focus tracks and returns also show clip n, prepk = sample peak before their own fader (dB) and \"levels\" = all 15 band levels (dB). Tracks that never play while a focus track plays are left out.",
+            "- auto (under a TRACKS line): the track's envelopes over the whole song, ENVELOPE unit: value@seconds ...; the curve follows straight lines between the points within 0.5 dB (volume), 2% (pan, width) or 1% of a plugin parameter's range; ~ = over " .. MA_A.AUTO_MAX .. " points, drawn coarser; envelopes that never move are left out; Mute lists the switching points. Send_Volume>NAME = the send to NAME, PLUGIN/PARAM = a plugin parameter. The measured numbers already include the automation.",
             "- REGIONS: \"no focus track plays\" = master numbers only. Otherwise full lines with the track's role in brackets: focus; return = receives audio from a focus track (reverb, delay, parallel bus); backdrop = one of the 3 loudest other tracks while focus tracks play; competitor = see compete. Focus tracks and returns first (track order), then the rest by share; line numbers cover the whole region. \"R n others\" = the remaining playing tracks with their share (under 1% left out); replaces \"R n also\".",
             "- compete NAME range: TRACK +n oN: main bands of NAME = within 10 dB of its loudest band; a competitor is at most 3 dB quieter than NAME in such a band and not panned to the opposite side. +n = competitor level against NAME in that range (dB, + = louder); o = % of NAME's playing seconds when the competitor plays too (no o = all of them). Over the seconds NAME plays in the region, not moment by moment; at most 3 ranges, strongest first. Replaces the mask lines.",
             "- YAML: tracks left out of the data show only name, parent and flags." }, "\n") or ""),
@@ -3630,6 +3635,24 @@ local function collect_jsfx_data(compare)
     -- Task 4f: tick "Automatically close when finished" in the render window for this run (bit 1 of renderclosewhendone; needs SWS), restored in the cleanup
     local close_opt = reaper.SNM_GetIntConfigVar and reaper.SNM_GetIntConfigVar("renderclosewhendone", -1) or -1
     if close_opt >= 0 and close_opt & 1 == 0 then reaper.SNM_SetIntConfigVar("renderclosewhendone", close_opt | 1) end
+    -- Task 4f.9: a normal render into a temporary folder instead of the dry run (the dry run window cannot close by itself and looks
+    -- frozen until the cleanup ends). The project's render path and file name are restored and the folder emptied in the cleanup;
+    -- the folder is emptied before the render too (no overwrite question). The Lua DSP comparison keeps the project's own settings.
+    local _, r_file = reaper.GetSetProjectInfo_String(0, "RENDER_FILE", "", false)
+    local _, r_pat = reaper.GetSetProjectInfo_String(0, "RENDER_PATTERN", "", false)
+    local tmp_dir = not compare and ((os.getenv("TEMP") or os.getenv("TMP") or reaper.GetResourcePath()) .. "/MixAssistant_render") or nil
+    local function clear_tmp()
+        if not tmp_dir then return end
+        reaper.EnumerateFiles(tmp_dir, -1) -- rescan, REAPER caches the listing
+        local names, k = {}, 0
+        while true do
+            local f = reaper.EnumerateFiles(tmp_dir, k)
+            if not f then break end
+            names[#names + 1] = f
+            k = k + 1
+        end
+        for _, f in ipairs(names) do os.remove(tmp_dir .. "/" .. f) end
+    end
     local out = {}
     local old_guids = {}
     for i = 0, reaper.CountTracks(0) - 1 do old_guids[reaper.GetTrackGUID(reaper.GetTrack(0, i))] = true end
@@ -3685,8 +3708,15 @@ local function collect_jsfx_data(compare)
         reaper.gmem_write(6, 1)
         local render_t0 = reaper.time_precise()
         out[#out + 1] = string.format("Script work before the render command: %.1f s (the wait before the render window beyond this is REAPER's own)", render_t0 - run_t0)
-        -- 43349 = dry run render (no file written); the Lua DSP comparison needs the rendered file, so it keeps 42230
-        reaper.Main_OnCommand(compare and 42230 or 43349, 0)
+        -- 42230 = render with the most recent settings and close the render window; task 4f.9: into the temporary folder (was the
+        -- dry run 43349); the Lua DSP comparison renders into the project's own render path and adds the file to the project
+        if tmp_dir then
+            reaper.RecursiveCreateDirectory(tmp_dir, 0)
+            clear_tmp()
+            reaper.GetSetProjectInfo_String(0, "RENDER_FILE", tmp_dir, true)
+            reaper.GetSetProjectInfo_String(0, "RENDER_PATTERN", "MixAssistant_temp", true)
+        end
+        reaper.Main_OnCommand(42230, 0)
         local render_s = reaper.time_precise() - render_t0
         reaper.gmem_write(6, 0)
 
@@ -3696,7 +3726,7 @@ local function collect_jsfx_data(compare)
         out[#out + 1] = string.format("Project length %.1f s | project SR %d | JSFX reported SR %d | master seen: %s",
             proj_len, project_sr, reaper.gmem_read(2), reaper.gmem_read(10) == run_id and "yes" or "NO")
         out[#out + 1] = string.format("Render time %.1f s (%.1fx realtime, %s)", render_s, proj_len / math.max(render_s, 0.001),
-            compare and "normal render" or "dry run")
+            compare and "normal render" or "render to a temporary file")
 
         local jsfx_sr = reaper.gmem_read(2)
         if jsfx_sr < 8000 then jsfx_sr = project_sr end
@@ -3815,6 +3845,11 @@ local function collect_jsfx_data(compare)
     remove_analyzer_file()
     reaper.GetSetProjectInfo(0, "RENDER_ADDTOPROJ", render_opts, true)
     if close_opt >= 0 and close_opt & 1 == 0 then reaper.SNM_SetIntConfigVar("renderclosewhendone", close_opt) end
+    if tmp_dir then
+        reaper.GetSetProjectInfo_String(0, "RENDER_FILE", r_file, true)
+        reaper.GetSetProjectInfo_String(0, "RENDER_PATTERN", r_pat, true)
+        clear_tmp()
+    end
     if compare then
         for _, trk in ipairs(find_new_tracks(old_guids)) do reaper.DeleteTrack(trk) end
     end
@@ -4229,6 +4264,105 @@ end
 --- Task 4f.6: the collected prompt for focus i (without the soloed note and the FOCUS line), built from the stored measurements on
 -- first use and cached (no gmem reading; tracks are found by GUID, missing ones are skipped by the YAML). Returns the cache entry
 -- { prompt, tokens, path, saved }, or nil and a message.
+--- Task 4f.9: the automation of one track for the focus data (4g "Send Track Detail" can reuse it): "NAME unit: v@t ..." per active
+-- envelope (track, send and plugin-parameter envelopes, not hardware outputs), joined by "; "; nil without envelopes. Sampled every
+-- 100 ms over len seconds with Envelope_Evaluate (automation items and every curve shape included), then reduced (Ramer-Douglas-Peucker):
+-- the kept points follow the curve within the tolerance, so curved (non-linear) shapes simply keep more points. Above MA_A.AUTO_MAX points
+-- the tolerance doubles until it fits ("~" after the name). Flat envelopes are left out; Mute lists the switching points. Volume in dB (own
+-- formula), everything else as REAPER formats it (Envelope_FormatValue), spaces removed; a unit shared by every value moves to the name.
+function AI.auto_lines(tr, len)
+    local A, n, items = MA_A, math.max(1, math.floor(len * 10)), {}
+    local function tm(i) return (string.format("%.1f", i / 10):gsub("%.0$", "")) end
+    for ei = 0, reaper.CountTrackEnvelopes(tr) - 1 do
+        local env = reaper.GetTrackEnvelope(tr, ei)
+        local ok, act = reaper.GetSetEnvelopeInfo_String(env, "ACTIVE", "", false)
+        if not (ok and act == "0") and reaper.GetEnvelopeInfo_Value(env, "I_HWOUT_IDX") == 0 then
+            local _, name = reaper.GetEnvelopeName(env, "")
+            local _, fx, prm = reaper.Envelope_GetParentTrack(env)
+            local vol, mute, tol = false, false, A.AUTO_TOL_PCT / 50 -- pan / width run from -1 to 1
+            if fx and fx >= 0 then
+                local _, fxn = reaper.TrackFX_GetFXName(tr, fx, "")
+                local _, pn = reaper.TrackFX_GetParamName(tr, fx, prm, "")
+                local _, lo, hi = reaper.TrackFX_GetParam(tr, fx, prm)
+                name = fxn:gsub("^%w+i?:%s*", ""):gsub("%s*%(.-%)$", "") .. "/" .. pn
+                tol = A.AUTO_TOL_FX_PCT / 100 * ((hi > lo) and (hi - lo) or 1)
+            else
+                vol, mute = name:find("Volume") ~= nil, name:find("Mute") ~= nil
+                if vol then tol = A.AUTO_TOL_DB end
+            end
+            local si = reaper.GetEnvelopeInfo_Value(env, "I_SEND_IDX") -- 1-based send index, 0 = not a send envelope
+            if si > 0 then
+                local dst = reaper.GetTrackSendInfo_Value(tr, 0, si - 1, "P_DESTTRACK")
+                if dst then
+                    local _, dn = reaper.GetTrackName(dst)
+                    name = name .. ">" .. dn
+                end
+            end
+            name = name:gsub("[:;]", ""):gsub("%s+", "_")
+            -- sample: y = the value the tolerance applies to (dB for volume), raw = the envelope value
+            local mode, y, raw, ymin, ymax = reaper.GetEnvelopeScalingMode(env), {}, {}, math.huge, -math.huge
+            for i = 0, n do
+                local _, v = reaper.Envelope_Evaluate(env, i / 10, 0, 0)
+                raw[i] = v
+                if vol then
+                    local g = reaper.ScaleFromEnvelopeMode(mode, v)
+                    v = g > 0 and math.max(A.AUTO_FLOOR_DB, 20 * math.log(g, 10)) or A.AUTO_FLOOR_DB
+                end
+                y[i] = v
+                ymin, ymax = math.min(ymin, v), math.max(ymax, v)
+            end
+            local keep, mark = { 0 }, ""
+            if ymax - ymin <= tol then
+                -- flat: one value
+            elseif mute then
+                for i = 1, n do
+                    if (raw[i] >= 0.5) ~= (raw[i - 1] >= 0.5) then keep[#keep + 1] = i end
+                end
+            else
+                repeat
+                    local k, st = { [0] = true, [n] = true }, { 0, n }
+                    while #st > 0 do
+                        local b = table.remove(st)
+                        local a = table.remove(st)
+                        local dm, im = tol, nil
+                        for i = a + 1, b - 1 do
+                            local d = math.abs(y[i] - y[a] - (y[b] - y[a]) * (i - a) / (b - a))
+                            if d > dm then dm, im = d, i end
+                        end
+                        if im then
+                            k[im] = true
+                            st[#st + 1] = a; st[#st + 1] = im; st[#st + 1] = im; st[#st + 1] = b
+                        end
+                    end
+                    keep = {}
+                    for i = 0, n do if k[i] then keep[#keep + 1] = i end end
+                    if #keep > A.AUTO_MAX then tol, mark = tol * 2, "~" end
+                until #keep <= A.AUTO_MAX
+            end
+            local v = {}
+            for j, i in ipairs(keep) do
+                if vol then
+                    v[j] = y[i] <= A.AUTO_FLOOR_DB and "-inf" or (string.format("%.1f", y[i]):gsub("^%-0%.0$", "0.0")) -- no "-0.0"
+                else
+                    local s = (reaper.Envelope_FormatValue(env, raw[i], "") or ""):gsub("%s+", "")
+                    v[j] = s ~= "" and s or string.format("%.3g", raw[i])
+                end
+            end
+            local unit = vol and "dB" or v[1]:match("%d(%D+)$")
+            if not vol then
+                for _, s in ipairs(v) do if unit and s:match("%d(%D+)$") ~= unit then unit = nil end end
+                if unit then for j, s in ipairs(v) do v[j] = s:sub(1, #s - #unit) end end
+            end
+            if #v > 1 then -- flat envelopes are left out (the user, 2026-11-05)
+                local p = {}
+                for j, i in ipairs(keep) do p[j] = v[j] .. "@" .. tm(i) end
+                items[#items + 1] = string.format("%s%s%s: %s", name, mark, unit and (" " .. unit) or "", table.concat(p, " "))
+            end
+        end
+    end
+    return #items > 0 and table.concat(items, "; ") or nil
+end
+
 function AI.prompt(i)
     local c, f = AI.collected, AI.FOCUS[i] or AI.FOCUS[1]
     -- task 4f.7b: a group focus shapes the data block and the YAML; Selected Tracks is cached per selection
@@ -4260,6 +4394,12 @@ function AI.prompt(i)
                         fs.R[dst.idx] = true
                     end
                 end
+            end
+            -- task 4f.9: the automation of the focus tracks and returns
+            fs.auto = {}
+            local len = math.min(reaper.GetProjectLength(0), MA_MAXSEC)
+            for _, t in ipairs(c.D.tracks) do
+                if (fs.F[t.idx] or fs.R[t.idx]) and reaper.ValidatePtr2(0, t.track, "MediaTrack*") then fs.auto[t.idx] = AI.auto_lines(t.track, len) end
             end
         end
         local block, named, _, listed = build_data_block(c.D, f, fs)
@@ -4431,9 +4571,11 @@ function AI.keep(fn)
     if c and c == AI.collected and c.changes == before then c.changes, c.undo = reaper.GetProjectStateChangeCount(0), reaper.Undo_CanUndo2(0) or "" end
 end
 
---- Task 4f.7b: the track selection as text (selected tracks + the number of selected items)
+--- Task 4f.7b: the track selection as text (selected tracks + the number of selected items); task 4f.9: + the edit cursor and the
+-- time selection (a ruler click moves REAPER's change counter too)
 function AI.sel_sig()
-    local parts = { reaper.CountSelectedMediaItems(0) }
+    local t0, t1 = reaper.GetSet_LoopTimeRange(false, false, 0, 0, false)
+    local parts = { reaper.CountSelectedMediaItems(0), reaper.GetCursorPosition(), t0, t1 }
     for k = 0, reaper.CountSelectedTracks(0) - 1 do parts[#parts + 1] = tostring(reaper.GetSelectedTrack(0, k)) end
     return table.concat(parts, ",")
 end
