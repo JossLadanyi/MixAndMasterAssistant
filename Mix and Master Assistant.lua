@@ -1507,8 +1507,10 @@ end
 local function build_json_messages(messages)
     local json_msgs = {}
     for _, msg in ipairs(messages) do
-        local safe_content = escape_json_string(msg.content)
-        table.insert(json_msgs, '{"role":"'..msg.role..'","content":"'..safe_content..'"}')
+        if msg.role == "user" or msg.role == "assistant" then -- alert and info lines stay local
+            local safe_content = escape_json_string(msg.content)
+            table.insert(json_msgs, '{"role":"'..msg.role..'","content":"'..safe_content..'"}')
+        end
     end
     return "[" .. table.concat(json_msgs, ",") .. "]"
 end
@@ -1746,7 +1748,9 @@ end
 -- HARDENED API DISPATCHER
 -- ==============================================================================
 
-local function ask_deep_seek(chat_history, model_name)
+-- Returns the answer text, plus the reply's `usage` table on success (nil with an error text).
+-- think = true: thinking mode with low effort; the thinking (`reasoning_content`) is never read, so it is not shown or sent back.
+local function ask_deep_seek(chat_history, model_name, think)
     local temp_json_path = reaper.GetResourcePath() .. "/temp_ds_request.json"
     local temp_response_path = reaper.GetResourcePath() .. "/temp_ds_response.txt"
 
@@ -1758,8 +1762,9 @@ local function ask_deep_seek(chat_history, model_name)
     local selected_model = model_name or "deepseek-v4-pro"
     local msgs_json = build_json_messages(chat_history)
 
-    -- NOTE: "thinking":{"type":"disabled"} is included to prevent expensive output token burning
-    local json_payload = '{"model":"' .. selected_model .. '","messages":' .. msgs_json .. ',"thinking":{"type":"disabled"},"temperature":0.1}'
+    -- NOTE: "thinking":{"type":"disabled"} is included to prevent expensive output token burning (thinking is the API default)
+    local mode_json = think and ',"thinking":{"type":"enabled"},"reasoning_effort":"low"}' or ',"thinking":{"type":"disabled"},"temperature":0.1}'
+    local json_payload = '{"model":"' .. selected_model .. '","messages":' .. msgs_json .. mode_json
 
     local json_file = io.open(temp_json_path, "w")
     if not json_file then return "I/O Error: Unable to write request file." end
@@ -1821,7 +1826,7 @@ local function ask_deep_seek(chat_history, model_name)
         if data.choices[1].finish_reason == "length" then
             content = content .. "\n\n⚠️ [WARNING: Response was truncated by DeepSeek token output limit.]"
         end
-        return content
+        return content, type(data.usage) == "table" and data.usage or nil
     end
 
     return "Unexpected API response structure:\n" .. raw_response
@@ -1977,7 +1982,18 @@ local MA_A = {
     TOP_N = 6, NOTABLE_DB = 3, BAND_RANGE_DB = 30, REGION_DEV_DB = 3, MASK_SHARE = 0.25, MASK_PAN = 100,
     ACTIVE_MIN_PCT = 5, TOKEN_CEILING = 8000, MIN_SHARE = 1, -- MIN_SHARE: region track lines below this share (%) are left out of the data block
     KEYS = { "rumble", "deepsub", "sub", "bass", "body", "mud", "boxy", "honk", "nasal", "bite", "presence", "harsh", "sibilance", "sizzle", "air" },
+    -- Task 4f: DeepSeek peak prices, USD per 1M tokens { cache hit, cache miss, output } (api-docs.deepseek.com, 2026-11-04);
+    -- off-peak = half. Peak hours (UTC, Mon-Fri, not Chinese holidays): 01:00-04:00 and 06:00-10:00.
+    PRICE = { ["deepseek-v4-pro"] = { 0.044, 1.32, 3.96 }, ["deepseek-flash"] = { 0.006, 0.30, 1.20 } },
+    PEAK_UTC = { { 1, 4 }, { 6, 10 } },
+    CPT = 2.37, -- characters per token: 4f01 prompt 44,071 chars = 18,617 tokens (DeepSeek's count); every "Send Project Info" re-measures it
 }
+
+--- Token estimate for n characters (the last measured characters-per-token ratio, kept in REAPER's ExtState; MA_A.CPT before the first send)
+function MA_A.tokens(n)
+    local r = tonumber(reaper.GetExtState("MixAssistant", "chars_per_token")) or MA_A.CPT
+    return math.floor(n / r + 0.5)
+end
 
 --- Biquad of one band stage (b1 = 0, b2 = -b0); the JSFX uses the same maths.
 local function band15_coefs(b, sr)
@@ -3229,8 +3245,8 @@ local function print_region_summary(out, tracks, max_sec, run_id, offsets)
     out[#out + 1] = "\nDATA BLOCK (the measured part of the prompt; the whole prompt is saved to MixAssistant_prompt.txt):\n" .. text
 
     -- TOKENS and SELF-CHECK
-    local est = math.floor(#text / 4 + 0.5)
-    out[#out + 1] = string.format("\nTOKENS (rough, characters / 4): data block %d chars = about %d tokens = %.0f%% of the %d ceiling | %d tracks below %d%% active left out of the overview",
+    local est = MA_A.tokens(#text)
+    out[#out + 1] = string.format("\nTOKENS (estimate from the measured characters per token): data block %d chars = about %d tokens = %.0f%% of the %d ceiling | %d tracks below %d%% active left out of the overview",
         #text, est, 100 * est / MA_A.TOKEN_CEILING, MA_A.TOKEN_CEILING, omitted, MA_A.ACTIVE_MIN_PCT)
     local chk = D.check
     out[#out + 1] = string.format("SELF-CHECK: region weights %.2f s + gap seconds %.2f s = %.2f s vs song %.2f s (%s) | regions n/a: %d | tracks counted with data: %d of %d (%d not counted: no direct path to the master)",
@@ -3354,20 +3370,25 @@ end
 
 --- JSFX collection test: inject -> render (nothing added to the project) -> read gmem -> print numbers -> clean up.
 -- compare = true: also render into the project and compare the Lua DSP with the JSFX master values.
-local function run_collection_test(compare)
+--- Task 4f.1: one JSFX collection run (analyzers + phantoms, render, read, cleanup that always runs, undo).
+-- Returns nil when the analyzer file cannot be written (a message box says why); otherwise ok, the report lines,
+-- and for a normal run (not `compare`) the data block and the GUIDs of the tracks it names.
+local function collect_jsfx_data(compare)
     local run_t0 = reaper.time_precise()
-    reaper.ClearConsole()
     remove_all_analyzers() -- leftovers from an earlier crash
 
     local path, write_err = write_analyzer_file()
-    if not path then reaper.ShowMessageBox(write_err, "Analyzer file", 0) return end
+    if not path then reaper.ShowMessageBox(write_err, "Analyzer file", 0) return nil end
 
 	reaper.Undo_BeginBlock2(0)
     local render_opts = math.floor(reaper.GetSetProjectInfo(0, "RENDER_ADDTOPROJ", 0, false))
+    -- Task 4f: tick "Automatically close when finished" in the render window for this run (bit 1 of renderclosewhendone; needs SWS), restored in the cleanup
+    local close_opt = reaper.SNM_GetIntConfigVar and reaper.SNM_GetIntConfigVar("renderclosewhendone", -1) or -1
+    if close_opt >= 0 and close_opt & 1 == 0 then reaper.SNM_SetIntConfigVar("renderclosewhendone", close_opt | 1) end
     local out = {}
     local old_guids = {}
     for i = 0, reaper.CountTracks(0) - 1 do old_guids[reaper.GetTrackGUID(reaper.GetTrack(0, i))] = true end
-    local data_block, named, prompt_text -- task 4e: the data block, the GUIDs of the tracks it names, the whole prompt
+    local data_block, named -- task 4e: the data block and the GUIDs of the tracks it names
 
     local ok, err = pcall(function()
         reaper.gmem_attach(GMEM_NAME)
@@ -3506,6 +3527,11 @@ local function run_collection_test(compare)
         local master_fader = level_db(reaper.GetMediaTrackInfo_Value(reaper.GetMasterTrack(0), "D_VOL"))
         out[#out + 1] = string.format("\nMASTER (pre-fader, fader = %.1f dB): valid 100 ms blocks %d | integrated %.1f LUFS | max momentary %.1f | max short-term %.1f",
             master_fader, m.valid_blocks, m.integrated, m.max_m, m.max_s)
+        -- Task 4f: a cancelled render leaves the master data short; stop here so nothing half-collected is used (1 s tolerance)
+        if m.valid_blocks < math.floor(proj_len * 10) - 10 then
+            error(string.format("The render stopped early (cancelled?) or did not cover the whole project: master data for %.1f of %.1f s. Nothing was collected.",
+                m.valid_blocks / 10, proj_len), 0)
+        end
         -- Stage 3: max 100 ms K level (blocks with at least half of 100 ms), master peak/clips from the header slots
         local max_100 = -144.0
         for k = 0, math.min(18000, max_sec * 10) - 1 do
@@ -3543,6 +3569,7 @@ local function run_collection_test(compare)
     remove_all_analyzers()
     remove_analyzer_file()
     reaper.GetSetProjectInfo(0, "RENDER_ADDTOPROJ", render_opts, true)
+    if close_opt >= 0 and close_opt & 1 == 0 then reaper.SNM_SetIntConfigVar("renderclosewhendone", close_opt) end
     if compare then
         for _, trk in ipairs(find_new_tracks(old_guids)) do reaper.DeleteTrack(trk) end
     end
@@ -3553,21 +3580,38 @@ local function run_collection_test(compare)
     if reaper.Undo_CanUndo2(0) == block_name then reaper.Undo_DoUndo2(0) end
 
     if not ok then out[#out + 1] = "ERROR: " .. tostring(err) end
+    return ok, out, data_block, named
+end
+
+--- Task 4f: the whole prompt from a collection (compact YAML read after the cleanup, so no analyzer or phantom is in it).
+-- Returns prompt, compact YAML; or nil, error text.
+local function build_collected_prompt(data_block, named)
+    local cok, cyaml = pcall(extract_full_project_yaml, { full = named })
+    if not (cok and type(cyaml) == "string") then return nil, tostring(cyaml) end
+    return build_jsfx_prompt(data_block, cyaml), cyaml
+end
+
+--- The two JSFX test buttons: one collection, then the report (MixAssistant_report.txt) and the prompt (MixAssistant_prompt.txt) next to the script.
+local function run_collection_test(compare)
+    reaper.ClearConsole()
+    local ok, out, data_block, named = collect_jsfx_data(compare)
+    if not out then return end
+    local prompt_text
     if ok and not compare then
         -- Size of the project-structure YAML (read-only; measured after the cleanup so the analyzers are not in it)
         local yok, yaml = pcall(extract_full_project_yaml)
         if yok and type(yaml) == "string" then
-            out[#out + 1] = string.format("YAML (old scan, full, rough, characters / 4): %d chars = about %d tokens", #yaml, math.floor(#yaml / 4 + 0.5))
+            out[#out + 1] = string.format("YAML (old scan, full, estimate): %d chars = about %d tokens", #yaml, MA_A.tokens(#yaml))
         else
             out[#out + 1] = "YAML size estimate failed: " .. tostring(yaml)
         end
         -- Task 4e: compact YAML and the whole prompt (saved next to the report)
         if data_block then
-            local cok, cyaml = pcall(extract_full_project_yaml, { full = named })
-            if cok and type(cyaml) == "string" then
-                prompt_text = build_jsfx_prompt(data_block, cyaml)
-                out[#out + 1] = string.format("PROMPT (task 4e, rough, characters / 4): compact YAML %d chars = about %d tokens | whole prompt %d chars = about %d tokens",
-                    #cyaml, math.floor(#cyaml / 4 + 0.5), #prompt_text, math.floor(#prompt_text / 4 + 0.5))
+            local cyaml
+            prompt_text, cyaml = build_collected_prompt(data_block, named)
+            if prompt_text then
+                out[#out + 1] = string.format("PROMPT (task 4e, estimate): compact YAML %d chars = about %d tokens | whole prompt %d chars = about %d tokens",
+                    #cyaml, MA_A.tokens(#cyaml), #prompt_text, MA_A.tokens(#prompt_text))
             else
                 out[#out + 1] = "PROMPT build failed: " .. tostring(cyaml)
             end
@@ -3871,6 +3915,133 @@ local function run_fresh_scan(target_mode, model_choice, mute_parallels, bypass_
     return true
 end
 
+-- Task 4f: the JSFX path's session state and actions (one table, to save top-level locals)
+local AI = { collected = nil, sent = false, status = "" }
+
+--- Peak price now? Returns true and the local time ("hh:mm") when the peak period ends, or false.
+function AI.peak()
+    local u, now = os.date("!*t"), os.time()
+    if u.wday >= 2 and u.wday <= 6 then -- Monday to Friday (os.date: 1 = Sunday)
+        for _, p in ipairs(MA_A.PEAK_UTC) do
+            if u.hour >= p[1] and u.hour < p[2] then
+                return true, os.date("%H:%M", now + (p[2] - u.hour) * 3600 - u.min * 60 - u.sec)
+            end
+        end
+    end
+    return false
+end
+
+--- USD for cached + uncached prompt tokens + output tokens at the price that applies now
+function AI.cost(model, n_hit, n_miss, n_out)
+    local p = MA_A.PRICE[model] or MA_A.PRICE["deepseek-v4-pro"]
+    return (AI.peak() and 1e-6 or 0.5e-6) * (n_hit * p[1] + n_miss * p[2] + n_out * p[3])
+end
+
+--- Grey line after a reply, from the API's own count; est = our characters / 4 estimate (first message only).
+-- completion_tokens is assumed to include the thinking (if "thinking" ever shows more than "output", it does not).
+function AI.usage_line(u, model, est)
+    local pt, hit = u.prompt_tokens or 0, u.prompt_cache_hit_tokens or 0
+    local miss, out_n = u.prompt_cache_miss_tokens or math.max(pt - hit, 0), u.completion_tokens or 0
+    local th = type(u.completion_tokens_details) == "table" and u.completion_tokens_details.reasoning_tokens or 0
+    -- e.g. "Tokens: In 18617 (est 18400 +1%, cache 0) | Out 950 (think 420) | $0.014 (off-peak)"
+    local line = string.format("Tokens: In %d (%scache %d) | Out %d%s | $%.3f (%s)", pt,
+        (est and est > 0) and string.format("est %d %+.0f%%, ", est, 100 * (pt - est) / est) or "", hit,
+        out_n, th > 0 and string.format(" (think %d)", th) or "", AI.cost(model, hit, miss, out_n), AI.peak() and "peak" or "off-peak")
+    return line
+end
+
+--- One API turn on the current chat. An error text becomes an alert line (never sent back to the AI). Returns true on success.
+function AI.ask(model_choice, think, est)
+    local model = get_model_name(model_choice)
+    local reply, u = ask_deep_seek(chat_history, model, think)
+    table.insert(chat_history, { role = u and "assistant" or "alert", content = reply })
+    if u then table.insert(chat_history, { role = "info", content = AI.usage_line(u, model, est) }) end
+    fetch_deep_seek_balance()
+    scroll_to_bottom = true
+    return u ~= nil, u
+end
+
+--- "Collect Data": one collection run (report to MixAssistant_report.txt next to the script), then the prompt, saved next to the project like the old flow.
+function AI.collect()
+    local ok, out, block, named = collect_jsfx_data(false)
+    if not out then AI.status = "Collection failed: the analyzer file could not be written." return end
+    local script_dir = (debug.getinfo(1, "S").source or ""):match("^@(.*[\\/])") or (reaper.GetResourcePath() .. PATH_SEPARATOR)
+    write_lines(script_dir .. "MixAssistant_report.txt", out)
+    if not (ok and block) then
+        AI.status = "Collection failed: " .. tostring(out[#out]):gsub("^ERROR: ", "") .. " (details in MixAssistant_report.txt)"
+        return
+    end
+    local prompt, err = build_collected_prompt(block, named)
+    if not prompt then AI.status = "Prompt build failed: " .. tostring(err) return end
+    AI.collected = { prompt = prompt, tokens = MA_A.tokens(#prompt), path = save_prompt_to_txt(prompt, "JSFX Full Mix"),
+        when = os.date("%H:%M"), changes = reaper.GetProjectStateChangeCount(0), soloed = reaper.AnyTrackSolo(0) }
+    AI.sent = false
+end
+
+-- Task 4f.5: "Focus on" choices (decision A: all data is always sent; the focus is one line at the END of the prompt, so the rest stays
+-- byte-identical and DeepSeek's cache still hits). cat = track category (get_effective_track_category), sel = tracks selected in REAPER.
+AI.FOCUS = { { "Whole Song" }, { "Vocals", cat = 3 }, { "Drums & Bass", cat = 1 }, { "Instruments", cat = 2 }, { "Selected Tracks", sel = true },
+    { "Low End", text = "the low end (20-200 Hz: rumble, deepsub, sub, bass, body): kick and bass balance, sub energy, mud, mono compatibility" },
+    { "Master & Loudness", text = "the master chain and the whole mix's loudness, dynamics and tonal balance (mastering)" },
+    { "Stereo Image", text = "the stereo image: width, panning, side energy, mono compatibility" } }
+
+--- The FOCUS line for choice i ("" for Whole Song), or nil and a message when no track matches
+function AI.focus_line(i)
+    local f = AI.FOCUS[i] or AI.FOCUS[1]
+    if f.text then return "\n\nFOCUS: " .. f[1] .. ". Give advice only about " .. f.text .. "." end
+    if not (f.cat or f.sel) then return "" end
+    local names = {}
+    for t = 0, reaper.CountTracks(0) - 1 do
+        local tr = reaper.GetTrack(0, t)
+        local hit
+        if f.sel then hit = reaper.IsTrackSelected(tr) else hit = get_effective_track_category(tr) == f.cat and not is_track_hierarchy_muted(tr) end
+        if hit then
+            local _, name = reaper.GetSetMediaTrackInfo_String(tr, "P_NAME", "", false)
+            name = trim_string(name)
+            names[#names + 1] = (name ~= "" and name or ("Track " .. (t + 1))):gsub("%s+", "_") -- as the data block writes names
+        end
+    end
+    if #names == 0 then
+        return nil, f.sel and "No tracks are selected in REAPER. Select the tracks to focus on first." or ("No track name matches " .. f[1] .. ".")
+    end
+    return string.format("\n\nFOCUS: %s. Give advice only about these tracks: %s. Mention other tracks only where they affect these (for example masking).",
+        f[1], table.concat(names, ", "))
+end
+
+--- The text that is sent (and copied): the collected prompt + the soloed note + the FOCUS line; or nil and a message
+function AI.full_prompt(i)
+    local c = AI.collected
+    local fl, err = AI.focus_line(i)
+    if not fl then return nil, err end
+    local note = c.soloed and "\n\nNOTE: only the soloed tracks were playing when this was measured, so the master and region numbers describe them, not the whole mix." or ""
+    return c.prompt .. note .. fl
+end
+
+--- Runs a collection run (fn: Collect or a test button) without marking the earlier collection as outdated: every run undoes its own
+-- changes, so a project that was unchanged before the run is unchanged after it (REAPER's change counter still moves).
+function AI.keep(fn)
+    local c, before = AI.collected, reaper.GetProjectStateChangeCount(0)
+    fn()
+    if c and c == AI.collected and c.changes == before then c.changes = reaper.GetProjectStateChangeCount(0) end
+end
+
+--- "Send Project Info to Agent": a new chat that starts with the collected prompt (the chat shows only a short line for it).
+-- The API's prompt count re-measures the characters-per-token ratio for the next estimates.
+function AI.send(model_choice, think, focus_idx)
+    local c = AI.collected
+    local text, err = AI.full_prompt(focus_idx)
+    if not text then AI.status = err return end
+    chat_history = { { role = "user", content = text, display_content = string.format(
+        "Project info sent (collected %s, about %d tokens, focus: %s).\nPrompt file (without the focus line): %s",
+        c.when, MA_A.tokens(#text), (AI.FOCUS[focus_idx] or AI.FOCUS[1])[1], c.path or "not saved") } }
+    scroll_to_bottom = true
+    local u
+    AI.sent, u = AI.ask(model_choice, think, MA_A.tokens(#text))
+    if u and (u.prompt_tokens or 0) > 1000 then
+        reaper.SetExtState("MixAssistant", "chars_per_token", string.format("%.3f", #text / u.prompt_tokens), true)
+    end
+end
+
 local function send_followup_message(user_text, model_choice)
     if trim_string(user_text) == "" then return end
     local selected_model = get_model_name(model_choice)
@@ -3923,12 +4094,10 @@ local function main()
     end
     -- =========================================================
 
-    local target_idx = 3
+    local focus_idx = 1 -- task 4f.5: index into AI.FOCUS
     local model_idx = 0
-    local mute_parallels = false
-    local bypass_master_fx = false
-    local duration_idx = 0
-    local output_api = true
+    local think = false
+    local pending = nil -- task 4f: the action to run after the frame delay (collect, send, follow-up)
 
     local scan_state = 0
 
@@ -3953,48 +4122,101 @@ local function main()
 
             local _ -- throw-away for ImGui's 'changed' return values (keeps them out of the global scope)
 
-            -- SCAN SETTINGS PANEL
-            render_section_header(ctx, "  SCAN CONFIGURATION & CONTROLS")
-
-            _, target_idx = reaper.ImGui_Combo(ctx, "Target", target_idx, TARGET_ITEMS)
-            _, mute_parallels = reaper.ImGui_Checkbox(ctx, "Mute Parallels", mute_parallels)
-            _, bypass_master_fx = reaper.ImGui_Checkbox(ctx, "Bypass Master FX", bypass_master_fx)
-            _, duration_idx = reaper.ImGui_Combo(ctx, "Duration", duration_idx, DURATION_ITEMS)
-            _, output_api = reaper.ImGui_Checkbox(ctx, "Query DeepSeek API (Uncheck for TXT only)", output_api)
-            _, model_idx = reaper.ImGui_Combo(ctx, "AI Model", model_idx, MODEL_ITEMS)
-
-            reaper.ImGui_Dummy(ctx, 0, 4)
-
-            -- 1. Draw button state based on scan_state
+            -- COLLECT (task 4f; the old scan's button and options are out of the window, its code stays until task 4h)
+            render_section_header(ctx, "  COLLECT AND MANAGE PROJECT INFORMATION")
             local is_busy = (scan_state and scan_state > 0)
+            local bh, bpad = 26, 12 -- every button: the same height, horizontal padding inside
+            reaper.ImGui_PushStyleVar(ctx, reaper.ImGui_StyleVar_FramePadding(), bpad, 3)
             if is_busy then reaper.ImGui_BeginDisabled(ctx, true) end
+            if reaper.ImGui_Button(ctx, is_busy and "Working..." or "Collect Project Info", -1, bh) and (not reaper.AnyTrackSolo(0) or
+                reaper.ShowMessageBox("Some tracks are soloed. Collect Project Info will measure only the soloed tracks, and the master numbers will describe only them.\n\nContinue?",
+                    "Soloed tracks", 1) == 1) then
+                pending, AI.status = function() AI.keep(AI.collect) end, "⏳ Rendering the project and reading the analyzers... please wait."
+            end
+            local c = AI.collected
 
-            local btn_label = is_busy and "Scanning in progress..." or "Run Fresh Scan & Reset Chat"
-            local btn_clicked = reaper.ImGui_Button(ctx, btn_label, -1, 30)
-
+            -- SEND (greyed out until collected)
+            reaper.ImGui_Dummy(ctx, 0, 4)
+            reaper.ImGui_SetNextItemWidth(ctx, 320)
+            _, model_idx = reaper.ImGui_Combo(ctx, "AI Model", model_idx, MODEL_ITEMS)
+            reaper.ImGui_SameLine(ctx)
+            _, think = reaper.ImGui_Checkbox(ctx, "Think (hidden)", think)
+            reaper.ImGui_Dummy(ctx, 0, 4) -- same gap below the combo row as above it
+            if not c then reaper.ImGui_BeginDisabled(ctx, true) end
+            if reaper.ImGui_Button(ctx, "Send Project Info to Agent", 0, bh) then
+                pending, AI.status = function() AI.send(model_idx + 1, think, focus_idx) end, "⏳ Waiting for DeepSeek..."
+            end
+            -- "Focus on" combo joined to the Send button (no gap, same height and colour), so it reads as part of it
+            reaper.ImGui_SameLine(ctx, 0, 0)
+            reaper.ImGui_PushStyleVar(ctx, reaper.ImGui_StyleVar_FramePadding(), bpad, (bh - reaper.ImGui_GetTextLineHeight(ctx)) / 2)
+            reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_FrameBg(), reaper.ImGui_GetStyleColor(ctx, reaper.ImGui_Col_Button()))
+            reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_FrameBgHovered(), reaper.ImGui_GetStyleColor(ctx, reaper.ImGui_Col_ButtonHovered()))
+            reaper.ImGui_SetNextItemWidth(ctx, reaper.ImGui_CalcTextSize(ctx, "Focus: Master & Loudness") + 2 * bpad + bh)
+            if reaper.ImGui_BeginCombo(ctx, "##focus", "Focus: " .. AI.FOCUS[focus_idx][1]) then
+                for i, f in ipairs(AI.FOCUS) do
+                    if reaper.ImGui_Selectable(ctx, f[1], i == focus_idx) then focus_idx = i end
+                end
+                reaper.ImGui_EndCombo(ctx)
+            end
+            reaper.ImGui_PopStyleColor(ctx, 2)
+            reaper.ImGui_PopStyleVar(ctx, 1)
+            reaper.ImGui_SameLine(ctx)
+            reaper.ImGui_BeginDisabled(ctx, true) -- task 4g
+            reaper.ImGui_Button(ctx, "Send Track Detail...", 0, bh)
+            reaper.ImGui_EndDisabled(ctx)
+            -- Copy Project Info and Clear Chat right-aligned on the same row
+            reaper.ImGui_SameLine(ctx)
+            local w1 = reaper.ImGui_CalcTextSize(ctx, "Copy Project Info") + 2 * bpad
+            local w2 = reaper.ImGui_CalcTextSize(ctx, "Clear Chat") + 2 * bpad
+            local gap = reaper.ImGui_GetContentRegionAvail(ctx) - w1 - w2 - reaper.ImGui_GetStyleVar(ctx, reaper.ImGui_StyleVar_ItemSpacing())
+            if gap > 0 then reaper.ImGui_SetCursorPosX(ctx, reaper.ImGui_GetCursorPosX(ctx) + gap) end
+            if reaper.ImGui_Button(ctx, "Copy Project Info", w1, bh) then -- the whole prompt with the focus line, for the web chat
+                local text, err = AI.full_prompt(focus_idx)
+                if text then reaper.ImGui_SetClipboardText(ctx, text) else AI.status = err end
+            end
+            reaper.ImGui_SameLine(ctx)
+            if reaper.ImGui_Button(ctx, "Clear Chat", w2, bh) then chat_history, AI.sent = {}, false end
+            if not c then reaper.ImGui_EndDisabled(ctx) end
             if is_busy then reaper.ImGui_EndDisabled(ctx) end
+            reaper.ImGui_PopStyleVar(ctx, 1)
+
+            -- One status line below the buttons: progress or error, else the project-changed warning, else the collection and its cost
+            local st, col = nil, 0xFFD54FFF
+            if AI.status ~= "" then
+                st = AI.status
+            elseif c and reaper.GetProjectStateChangeCount(0) ~= c.changes then
+                st, col = "Project changed. Collect Project Info again before proceeding (free).", 0xFFB74DFF
+            elseif c then
+                local pk, till = AI.peak()
+                st = string.format("Collected %s%s, about %d tokens; sending costs about $%.3f now (%s)", c.when, c.soloed and " (soloed tracks only)" or "", c.tokens,
+                    AI.cost(get_model_name(model_idx + 1), 0, c.tokens, 0), pk and ("peak until " .. till) or "off-peak")
+            else
+                st = "No project info yet. Click Collect Project Info (free)."
+            end
+            reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), col)
+            reaper.ImGui_TextWrapped(ctx, "Status: " .. st)
+            reaper.ImGui_PopStyleColor(ctx, 1)
             reaper.ImGui_Separator(ctx)
 
 			if reaper.ImGui_SmallButton(ctx, "JSFX Collection Test") and not is_busy then
-                run_collection_test()
+                AI.keep(run_collection_test)
             end
             reaper.ImGui_SameLine(ctx)
             if reaper.ImGui_SmallButton(ctx, "JSFX vs Lua DSP check") and not is_busy then
-                run_collection_test(true)
+                AI.keep(function() run_collection_test(true) end)
             end
 
 			-- 2. Strict Frame Delay & Click-Absorption Cooldown
-            if btn_clicked and not is_busy then
-                table.insert(chat_history, {
-                    role = "assistant",
-                    content = "⏳ *Rendering mix and analyzing peaks & frequencies... please wait.*"
-                })
+            -- (the status line is drawn a few frames before the blocking action runs)
+            if pending and scan_state == 0 then
                 scroll_to_bottom = true
                 scan_state = 1
             elseif scan_state == 1 then scan_state = 2
             elseif scan_state == 2 then scan_state = 3
             elseif scan_state == 3 then
-                run_fresh_scan(target_idx + 1, model_idx + 1, mute_parallels, bypass_master_fx, DURATION_SECONDS[duration_idx], output_api)
+                local fn = pending
+                pending, AI.status = nil, ""
+                if fn then fn() end
                 scan_state = 4 -- Enter click-absorption cooldown
             elseif scan_state >= 4 and scan_state < 10 then
                 scan_state = scan_state + 1 -- Absorb queued OS clicks for 6 frames
@@ -4006,7 +4228,7 @@ local function main()
             reaper.ImGui_Dummy(ctx, 0, 8)
             render_section_header(ctx, "  CONVERSATION LOG")
             local _, avail_h = reaper.ImGui_GetContentRegionAvail(ctx)
-            local scroll_h = math.max(150, avail_h - 70)
+            local scroll_h = math.max(150, avail_h - 74) -- room for the input box (2 x button height + spacing)
 
             if reaper.ImGui_BeginChild(ctx, "ChatScroll", 0, scroll_h) then
                 push_chat_font(15)
@@ -4024,9 +4246,14 @@ local function main()
 
                     elseif msg.role == "alert" then
                         -- Red badge (0xEF5350FF) with dark text
-                        render_role_badge(ctx, " CANCELLED ", 0xEF5350FF, 0x111111FF, idx)
+                        render_role_badge(ctx, " ALERT ", 0xEF5350FF, 0x111111FF, idx)
                         -- Bright red warning text
                         reaper.ImGui_TextColored(ctx, 0xEF5350FF, msg.content)
+                    elseif msg.role == "info" then
+                        -- Grey token/cost line (task 4f; never sent to the AI), wrapped so a narrow window does not cut it off
+                        reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), 0x9E9E9EFF)
+                        reaper.ImGui_TextWrapped(ctx, msg.content)
+                        reaper.ImGui_PopStyleColor(ctx, 1)
                     end
 
                     -- Divider shared by every message type
@@ -4051,7 +4278,7 @@ local function main()
             -- Multiline text box with fixed-width font
             -- (Note: ReaImGui does not natively support word-wrap inside input boxes)
             push_chat_font(15)
-            local changed, new_text = reaper.ImGui_InputTextMultiline(ctx, "##chat_in", chat_input_text, -95, 52)
+            local changed, new_text = reaper.ImGui_InputTextMultiline(ctx, "##chat_in", chat_input_text, -95, 2 * bh + 4) -- as high as the two stacked buttons
             if changed then
                 chat_input_text = new_text
             end
@@ -4061,15 +4288,19 @@ local function main()
 
             -- Stacked action buttons
             reaper.ImGui_BeginGroup(ctx)
-            if reaper.ImGui_Button(ctx, "Send", 85, 24) then
+            local can_send = AI.sent and scan_state == 0 -- follow-ups only after "Send Analysis" (task 4f)
+            if not can_send then reaper.ImGui_BeginDisabled(ctx, true) end
+            if reaper.ImGui_Button(ctx, "Send", 85, bh) then
                 if trim_string(chat_input_text) ~= "" then
-                    local user_msg = chat_input_text
+                    table.insert(chat_history, { role = "user", content = chat_input_text })
                     chat_input_text = ""
-                    send_followup_message(user_msg, model_idx + 1)
+                    scroll_to_bottom = true
+                    pending, AI.status = function() AI.ask(model_idx + 1, think) end, "⏳ Waiting for DeepSeek..."
                 end
             end
+            if not can_send then reaper.ImGui_EndDisabled(ctx) end
 
-            if reaper.ImGui_Button(ctx, "Copy Chat", 85, 24) then
+            if reaper.ImGui_Button(ctx, "Copy Chat", 85, bh) then
                 if #chat_history > 0 then
                     local conversation_lines = {}
 
