@@ -1,6 +1,6 @@
 apikey.txt
 *.txt
 *.docx
-claude.md
-/archive
-ROADMAP.md
+# every Markdown file in any folder, except README.md
+*.md
+!README.md
