@@ -3189,6 +3189,7 @@ local function print_region_summary(out, tracks, max_sec, run_id, offsets)
     local song = D.song
     local f1, n1, _, _, _, chain, pan_label, devs, mask_ranges = MA_A.fmt()
     for _, t in ipairs(tracks) do t.guid = reaper.GetTrackGUID(t.track) end -- task 4f.6: tracks are found by GUID at send time
+    D.tracks, D.route = tracks, route -- task 4f.7a: the focus lists are built from the collected tracks
 
     -- ROUTING
     out[#out + 1] = "\nROUTING (fader, pan and automation are measured on the phantom tracks, not modelled; parent = folder parent idx)"
@@ -4017,31 +4018,139 @@ function AI.prompt(i)
 end
 
 -- Task 4f.5: "Focus on" choices (decision A: all data is always sent; the focus is one line at the END of the prompt, so the rest stays
--- byte-identical and DeepSeek's cache still hits). cat = track category (get_effective_track_category), sel = tracks selected in REAPER.
-AI.FOCUS = { { "Whole Song" }, { "Vocals", cat = 3 }, { "Drums & Bass", cat = 1 }, { "Instruments", cat = 2 }, { "Selected Tracks", sel = true },
-    { "Low End", text = "the low end (20-200 Hz: rumble, deepsub, sub, bass, body): kick and bass balance, sub energy, mud, mono compatibility" },
-    { "Master & Loudness", text = "the master chain and the whole mix's loudness, dynamics and tonal balance (mastering)" },
-    { "Stereo Image", text = "the stereo image: width, panning, side energy, mono compatibility" } }
+-- byte-identical and DeepSeek's cache still hits). Task 4f.7a: g = name groups (AI.track_group), inst = every non-return track outside
+-- Vocals and Drums & Bass, ret = returns (AI.is_return), sel = tracks selected in REAPER (a selected folder brings its children),
+-- text = topic focus (no track list).
+AI.FOCUS = { { "Whole Song" }, { "Vocals", g = { vocals = true } }, { "Drums & Bass", g = { drums = true, bass = true } },
+    { "Guitars", g = { guitars = true } }, { "Keys & Synths", g = { keys = true } }, { "Strings & Brass", g = { sb = true } },
+    { "Instruments", inst = true }, { "Effects & Returns", ret = true }, { "Selected Tracks", sel = true },
+    { "Low End", text = "the low end (20-315 Hz: rumble, deepsub, sub, bass, body, mud): kick and bass balance, sub energy, mud, mono compatibility" },
+    { "Mids", text = "the mids (315 Hz-5 kHz: boxy, honk, nasal, bite, presence, harsh): boxiness, honk, clarity, presence, harshness" },
+    { "High End", text = "the high end (5-20 kHz: sibilance, sizzle, air): brightness, sibilance, air" },
+    { "Stereo Image", text = "the stereo image: width, panning, side energy, mono compatibility" },
+    { "Master & Loudness", text = "the master chain and the whole mix's loudness, dynamics and tonal balance (mastering)" } }
 
---- The FOCUS line for choice i ("" for Whole Song), or nil and a message when no track matches
+-- Task 4f.7a: focus name matching, a new classifier (get_track_category stays as it is for the old scan). A key matches the start of a
+-- word, a WHOLE key only a whole word. Groups are checked in this order; the first that matches wins.
+AI.GROUP_KEYS = {
+    { "drums", "drum kick snare tom toms clap rim ride crash splash china cymbal hat hats hihat hh oh ohs overhead perc shaker tamb conga bongo cajon kit bd sd 808 909" },
+    { "bass", "bass sub subbass" },
+    { "vocals", "vox vocal voc vx vo voice bgv bgvs bv bvs choir adlib harm harmony harmonies rap singer acap acapella" },
+    { "guitars", "gtr guitar acoustic uke ukulele banjo mandolin dobro steel ag eg" },
+    { "keys", "piano pno keys keyboard organ rhodes wurli clav ep synth pad pluck arp mellotron" },
+    { "sb", "strings string violin viola cello orch brass horn trumpet trombone sax flute woodwind harp" } }
+AI.WHOLE, AI.NOT_BASS_NEXT = {}, { clarinet = true, flute = true, trombone = true, harmonica = true }
+for w in ("oh hh bd sd bv bvs vx vo ep ag eg sub kit tom rim rap"):gmatch("%S+") do AI.WHOLE[w] = true end
+AI.NOT_VOCAL = { "gtr", "guitar", "synth", "pad", "piano", "keys", "organ", "string", "brass" }
+
+--- Task 4f.7a: the group of a track name ("drums", "bass", "vocals", "guitars", "keys", "sb") or nil. Words: camelCase and
+-- letter/digit boundaries split, lowercase, split on everything that is not a letter or digit.
+function AI.name_group(name)
+    local words = {}
+    for x in name:gsub("(%l)(%u)", "%1 %2"):gsub("(%a)(%d)", "%1 %2"):gsub("(%d)(%a)", "%1 %2"):lower():gmatch("%w+") do words[#words + 1] = x end
+    local function starts(w, key) return w == key or (not AI.WHOLE[key] and w:sub(1, #key) == key) end
+    local not_vocal = false
+    for _, w in ipairs(words) do
+        for _, x in ipairs(AI.NOT_VOCAL) do if w:sub(1, #x) == x then not_vocal = true end end
+    end
+    for _, g in ipairs(AI.GROUP_KEYS) do
+        if not (g[1] == "vocals" and not_vocal) then
+            for key in g[2]:gmatch("%S+") do
+                for i, w in ipairs(words) do
+                    -- bass: not bassoon, not "bass clarinet" and the like
+                    if starts(w, key) and not (g[1] == "bass" and (w:sub(1, 7) == "bassoon" or AI.NOT_BASS_NEXT[words[i + 1] or ""])) then return g[1] end
+                end
+            end
+        end
+    end
+end
+
+--- Task 4f.7a: the group of a track: its own name first, else its nearest folder whose name matches (so "Chr Synth audio stem" in
+-- the Brass Buss folder stays in Keys & Synths)
+function AI.track_group(tr)
+    local cur = tr
+    while cur do
+        local _, name = reaper.GetSetMediaTrackInfo_String(cur, "P_NAME", "", false)
+        local g = AI.name_group(name)
+        if g then return g end
+        cur = reaper.GetParentTrack(cur)
+    end
+end
+
+--- Task 4f.7a: a return (reverb, delay, parallel bus), found by routing: not a folder, no media items, no instrument plugin, receives audio on channels 1/2;
+-- or a parallel name (nyc, rear, parallel)
+function AI.is_return(tr, folder)
+    if folder then return false end
+    local _, name = reaper.GetSetMediaTrackInfo_String(tr, "P_NAME", "", false)
+    if name_has_any(name:lower(), PARALLEL_WORDS) then return true end
+    -- media items, or an instrument plugin (a sampler played by MIDI sends, e.g. the drum tracks fed by a sequencer): not a return
+    if reaper.CountTrackMediaItems(tr) > 0 or reaper.TrackFX_GetInstrument(tr) >= 0 then return false end
+    for k = 0, reaper.GetTrackNumSends(tr, -1) - 1 do
+        if reaper.GetTrackSendInfo_Value(tr, -1, k, "B_MUTE") ~= 1 and reaper.GetTrackSendInfo_Value(tr, -1, k, "I_SRCCHAN") >= 0
+            and math.floor(reaper.GetTrackSendInfo_Value(tr, -1, k, "I_DSTCHAN")) & 1023 < 2 then
+            -- only when the sending track is also heard on its own (main send on along its folder chain, fader not off): a track fed by
+            -- a silent source (e.g. the drum tracks fed by a send-only sequencer) carries the real sound, it is not a return
+            local cur, lin = reaper.GetTrackSendInfo_Value(tr, -1, k, "P_SRCTRACK"), 1
+            while cur and lin > 1e-5 do
+                lin = lin * reaper.GetMediaTrackInfo_Value(cur, "D_VOL")
+                if reaper.GetMediaTrackInfo_Value(cur, "B_MAINSEND") ~= 1 then lin = 0 end
+                cur = reaper.GetParentTrack(cur)
+            end
+            if lin > 1e-5 then return true end
+        end
+    end
+    return false
+end
+
+--- Task 4f.7a: the focus track lists from the collected tracks (counted ones only, not muted, still in the project), indexed like
+-- AI.FOCUS: lists[i] = { { t = track entry, tr = track }, ... } in track order; nil for Whole Song and the topic focuses.
+-- Rebuilt when the project or the track selection changes.
+function AI.focus_lists()
+    local c = AI.collected
+    if not c then return {} end
+    local parts = { reaper.GetProjectStateChangeCount(0) }
+    for k = 0, reaper.CountSelectedTracks(0) - 1 do parts[#parts + 1] = tostring(reaper.GetSelectedTrack(0, k)) end
+    local sig = table.concat(parts, ",")
+    if c.lists and c.lists.sig == sig then return c.lists end
+    local info = {}
+    for _, t in ipairs(c.D.tracks) do
+        local tr, r = t.track, c.D.route[t.idx]
+        if r and not r.no_direct and reaper.ValidatePtr2(0, tr, "MediaTrack*") and not is_track_hierarchy_muted(tr) then
+            info[#info + 1] = { t = t, tr = tr, g = AI.track_group(tr), ret = AI.is_return(tr, r.role == "bus") }
+        end
+    end
+    local lists = { sig = sig }
+    for i, f in ipairs(AI.FOCUS) do
+        if f.g or f.inst or f.ret or f.sel then
+            local l = {}
+            for _, x in ipairs(info) do
+                local hit
+                if f.sel then
+                    local cur = x.tr
+                    while cur and not hit do hit, cur = reaper.IsTrackSelected(cur), reaper.GetParentTrack(cur) end
+                elseif f.inst then hit = not x.ret and x.g ~= "vocals" and x.g ~= "drums" and x.g ~= "bass"
+                elseif f.ret then hit = x.ret
+                else hit = f.g[x.g or ""] end
+                if hit then l[#l + 1] = x end
+            end
+            lists[i] = l
+        end
+    end
+    c.lists = lists
+    return lists
+end
+
+--- The FOCUS line for choice i ("" for Whole Song), or nil and a message when the focus has no track
 function AI.focus_line(i)
     local f = AI.FOCUS[i] or AI.FOCUS[1]
     if f.text then return "\n\nFOCUS: " .. f[1] .. ". Give advice only about " .. f.text .. "." end
-    if not (f.cat or f.sel) then return "" end
+    local l = AI.focus_lists()[i]
+    if not l then return "" end
+    if #l == 0 then
+        return nil, f.sel and "No collected track is selected in REAPER. Select the tracks to focus on first." or ("No track belongs to " .. f[1] .. ".")
+    end
     local names = {}
-    for t = 0, reaper.CountTracks(0) - 1 do
-        local tr = reaper.GetTrack(0, t)
-        local hit
-        if f.sel then hit = reaper.IsTrackSelected(tr) else hit = get_effective_track_category(tr) == f.cat and not is_track_hierarchy_muted(tr) end
-        if hit then
-            local _, name = reaper.GetSetMediaTrackInfo_String(tr, "P_NAME", "", false)
-            name = trim_string(name)
-            names[#names + 1] = (name ~= "" and name or ("Track " .. (t + 1))):gsub("%s+", "_") -- as the data block writes names
-        end
-    end
-    if #names == 0 then
-        return nil, f.sel and "No tracks are selected in REAPER. Select the tracks to focus on first." or ("No track name matches " .. f[1] .. ".")
-    end
+    for _, x in ipairs(l) do names[#names + 1] = (x.t.name:gsub("%s+", "_")) end -- as the data block writes names
     return string.format("\n\nFOCUS: %s. Give advice only about these tracks: %s. Mention other tracks only where they affect these (for example masking).",
         f[1], table.concat(names, ", "))
 end
@@ -4186,38 +4295,50 @@ local function main()
             _, think = reaper.ImGui_Checkbox(ctx, "Think (hidden)", think)
             reaper.ImGui_Dummy(ctx, 0, 4) -- same gap below the combo row as above it
             if not c then reaper.ImGui_BeginDisabled(ctx, true) end
+            -- "Focus on" combo first (it shapes both Send and Copy): standard combo look, same height as the buttons
+            reaper.ImGui_PushStyleVar(ctx, reaper.ImGui_StyleVar_FramePadding(), bpad, (bh - reaper.ImGui_GetTextLineHeight(ctx)) / 2)
+            -- Task 4f.7a: track counts, empty groups greyed out, hovering lists the focus tracks (the name guess can be wrong)
+            local lists = AI.focus_lists()
+            local function flabel(i) return AI.FOCUS[i][1] .. (lists[i] and string.format(" (%d)", #lists[i]) or "") end
+            local function ftip(i)
+                if not reaper.ImGui_IsItemHovered(ctx) then return end
+                local l, n = lists[i], {}
+                for _, x in ipairs(l or {}) do n[#n + 1] = x.t.name end
+                if #n > 0 then reaper.ImGui_SetTooltip(ctx, table.concat(n, "\n"))
+                elseif AI.FOCUS[i].text then reaper.ImGui_SetTooltip(ctx, "Advice about " .. AI.FOCUS[i].text) end
+            end
+            reaper.ImGui_SetNextItemWidth(ctx, reaper.ImGui_CalcTextSize(ctx, "Focus: Effects & Returns (99)") + 2 * bpad + bh)
+            if reaper.ImGui_BeginCombo(ctx, "##focus", "Focus: " .. flabel(focus_idx), reaper.ImGui_ComboFlags_HeightLargest()) then
+                for i, f in ipairs(AI.FOCUS) do
+                    local empty = lists[i] and #lists[i] == 0 and not f.sel -- Selected Tracks stays choosable (select tracks afterwards)
+                    if empty then reaper.ImGui_BeginDisabled(ctx, true) end
+                    if reaper.ImGui_Selectable(ctx, flabel(i), i == focus_idx) then focus_idx = i end
+                    if empty then reaper.ImGui_EndDisabled(ctx) end
+                    ftip(i)
+                end
+                reaper.ImGui_EndCombo(ctx)
+            else
+                ftip(focus_idx)
+            end
+            reaper.ImGui_PopStyleVar(ctx, 1)
+            reaper.ImGui_SameLine(ctx)
             if reaper.ImGui_Button(ctx, "Send Project Info to Agent", 0, bh) then
                 pending, AI.status = function() AI.send(model_idx + 1, think, focus_idx) end, "⏳ Waiting for DeepSeek..."
             end
-            -- "Focus on" combo joined to the Send button (no gap, same height and colour), so it reads as part of it
-            reaper.ImGui_SameLine(ctx, 0, 0)
-            reaper.ImGui_PushStyleVar(ctx, reaper.ImGui_StyleVar_FramePadding(), bpad, (bh - reaper.ImGui_GetTextLineHeight(ctx)) / 2)
-            reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_FrameBg(), reaper.ImGui_GetStyleColor(ctx, reaper.ImGui_Col_Button()))
-            reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_FrameBgHovered(), reaper.ImGui_GetStyleColor(ctx, reaper.ImGui_Col_ButtonHovered()))
-            reaper.ImGui_SetNextItemWidth(ctx, reaper.ImGui_CalcTextSize(ctx, "Focus: Master & Loudness") + 2 * bpad + bh)
-            if reaper.ImGui_BeginCombo(ctx, "##focus", "Focus: " .. AI.FOCUS[focus_idx][1]) then
-                for i, f in ipairs(AI.FOCUS) do
-                    if reaper.ImGui_Selectable(ctx, f[1], i == focus_idx) then focus_idx = i end
-                end
-                reaper.ImGui_EndCombo(ctx)
-            end
-            reaper.ImGui_PopStyleColor(ctx, 2)
-            reaper.ImGui_PopStyleVar(ctx, 1)
             reaper.ImGui_SameLine(ctx)
-            reaper.ImGui_BeginDisabled(ctx, true) -- task 4g
-            reaper.ImGui_Button(ctx, "Send Track Detail...", 0, bh)
-            reaper.ImGui_EndDisabled(ctx)
-            -- Copy Project Info and Clear Chat right-aligned on the same row
-            reaper.ImGui_SameLine(ctx)
-            local w1 = reaper.ImGui_CalcTextSize(ctx, "Copy Project Info") + 2 * bpad
-            local w2 = reaper.ImGui_CalcTextSize(ctx, "Clear Chat") + 2 * bpad
-            local gap = reaper.ImGui_GetContentRegionAvail(ctx) - w1 - w2 - reaper.ImGui_GetStyleVar(ctx, reaper.ImGui_StyleVar_ItemSpacing())
-            if gap > 0 then reaper.ImGui_SetCursorPosX(ctx, reaper.ImGui_GetCursorPosX(ctx) + gap) end
-            if reaper.ImGui_Button(ctx, "Copy Project Info", w1, bh) then -- the whole prompt with the focus line, for the web chat
+            if reaper.ImGui_Button(ctx, "Copy Project Info", 0, bh) then -- the whole prompt with the focus line, for the web chat
                 local text, err = AI.full_prompt(focus_idx)
                 if text then reaper.ImGui_SetClipboardText(ctx, text) else AI.status = err end
             end
             reaper.ImGui_SameLine(ctx)
+            reaper.ImGui_BeginDisabled(ctx, true) -- task 4g
+            reaper.ImGui_Button(ctx, "Send Track Detail...", 0, bh)
+            reaper.ImGui_EndDisabled(ctx)
+            -- Clear Chat right-aligned on the same row
+            reaper.ImGui_SameLine(ctx)
+            local w2 = reaper.ImGui_CalcTextSize(ctx, "Clear Chat") + 2 * bpad
+            local gap = reaper.ImGui_GetContentRegionAvail(ctx) - w2
+            if gap > 0 then reaper.ImGui_SetCursorPosX(ctx, reaper.ImGui_GetCursorPosX(ctx) + gap) end
             if reaper.ImGui_Button(ctx, "Clear Chat", w2, bh) then chat_history, AI.sent = {}, false end
             if not c then reaper.ImGui_EndDisabled(ctx) end
             if is_busy then reaper.ImGui_EndDisabled(ctx) end
