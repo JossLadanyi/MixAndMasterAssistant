@@ -687,6 +687,71 @@ local function extract_full_project_yaml(opts)
         end
     end
 
+    -- task 4f.11 (compact YAML only): screen-only settings and the user's drop rules removed; settings equal to an earlier plugin of the
+    -- same kind become "same as plugin n on TRACK"; the notes of the plugins whose settings are shown go into additional_information.
+    -- MixAssistant_plugin_notes.txt (next to the script): "[original plugin name]", then "note: text" and "drop: name, name_*" lines
+    -- (a drop name is the setting as the prompt shows it, groups joined by "_", e.g. band_1_selected; * = any text).
+    if opts then
+        local pn, cur = {}, nil
+        local dir = (debug.getinfo(1, "S").source or ""):match("^@(.*[\\/])")
+        local f = dir and io.open(dir .. "MixAssistant_plugin_notes.txt", "r")
+        if f then
+            for line in f:lines() do
+                line = trim_string(line) or ""
+                local h = line:match("^%[(.+)%]$")
+                if h then
+                    cur = { notes = {}, drop = {} }
+                    pn[trim_string(h):lower()] = cur
+                elseif cur then
+                    local k, v = line:match("^(%a+):%s*(.+)$")
+                    if k == "note" then
+                        cur.notes[#cur.notes + 1] = v
+                    elseif k == "drop" then
+                        for p in v:gmatch("[^,%s]+") do
+                            cur.drop[#cur.drop + 1] = "^" .. p:lower():gsub("[%^%$%(%)%%%.%[%]%+%-%?]", "%%%0"):gsub("%*", ".*") .. "$"
+                        end
+                    end
+                end
+            end
+            f:close()
+        end
+        local SCREEN = { "^selected$", "_selected$", "^visible$", "_visible$" } -- which band is highlighted / which panel is open
+        local function strip(t, path, drop)
+            for k, v in pairs(t) do
+                local full = (path and (path .. "_") or "") .. tostring(k):lower()
+                if type(v) == "table" then
+                    strip(v, full, drop)
+                    if next(v) == nil then t[k] = nil end
+                else
+                    for _, list in ipairs({ SCREEN, drop }) do
+                        for _, p in ipairs(list) do if full:find(p) then t[k] = nil end end
+                    end
+                end
+            end
+        end
+        local seen, used, nl = {}, {}, {}
+        for _, td in ipairs(project_data.tracks) do
+            if type(td.fx) == "table" then
+                for n, pl in ipairs(td.fx) do
+                    local orig = pl.name:match("%((.+)%)$") or pl.name
+                    local e = pn[orig:lower()]
+                    if type(pl.params) == "table" then
+                        strip(pl.params, nil, e and e.drop or {})
+                        if next(pl.params) == nil then pl.params = nil end
+                    end
+                    if pl.params then
+                        if e and #e.notes > 0 then used[orig] = e end
+                        local key = orig .. " " .. to_inline_yaml(pl.params)
+                        if seen[key] then pl.params = seen[key] else seen[key] = "same as plugin " .. n .. " on " .. td.track end
+                    end
+                end
+            end
+        end
+        for name, e in pairs(used) do nl[#nl + 1] = "- plugin " .. name .. ": " .. table.concat(e.notes, " ") end
+        table.sort(nl)
+        if #nl > 0 then project_data.notes = project_data.notes .. "\n" .. table.concat(nl, "\n") end
+    end
+
     return to_yaml(project_data), project_data.arr
 end
 
@@ -3646,7 +3711,7 @@ local function build_jsfx_prompt(block, yaml, focus, topic) -- focus (task 4f.7b
             "- YAML: tracks left out of the data show only name, parent and flags." }, "\n") or "") .. tl,
         "",
         "=== PROJECT YAML ===",
-        "Routing and settings: folders (parent, flags: folder), sends (connections; sidechain = feeds a side-chain input; send volume 0 dB when omitted), faders (vol_db), pan, envelopes (auto), plugins in chain order. The master and the tracks named under REGIONS, with their folders, list full plugin settings. All other tracks list plugin names only (fx: \"A > B\"); when you need their settings, ask for \"DETAIL <track name>\" and I will send them. Settings with a common name start are grouped: band_1: {freq: 181} means the setting band_1_freq. A renamed plugin shows its original in brackets, e.g. Ducking Comp (ReaComp). Plugin values are shown as each plugin reports them; some plugins label units or on/off states wrongly (e.g. a reverb time of 2.5 ms that means 2.5 s), so judge by plausibility.",
+        "Routing and settings: folders (parent, flags: folder), sends (connections; sidechain = feeds a side-chain input; send volume 0 dB when omitted), faders (vol_db), pan, envelopes (auto), plugins in chain order. The master and the tracks named under REGIONS, with their folders, list full plugin settings. All other tracks list plugin names only (fx: \"A > B\"); when you need their settings, ask for \"DETAIL <track name>\" and I will send them. Settings with a common name start are grouped: band_1: {freq: 181} means the setting band_1_freq. A renamed plugin shows its original in brackets, e.g. Ducking Comp (ReaComp). \"params: same as plugin 3 on Lead Vox\" = exactly the settings of the 3rd plugin in Lead Vox's chain. Plugin values are shown as each plugin reports them; some plugins label units or on/off states wrongly (e.g. a reverb time of 2.5 ms that means 2.5 s), so judge by plausibility.",
         "",
         "=== INSTRUCTIONS ===",
         "1. Dynamics: compare loudness, LRA and crest across the regions and tracks. Where contrast is missing, find the compressor or limiter in the YAML and give the gain reduction to aim for (dB), never a threshold.",
@@ -4488,6 +4553,17 @@ function AI.prompt(i)
     if l and #l == 0 then
         local _, msg = AI.focus_line(i)
         return nil, msg
+    end
+    -- task 4f.11: the plugin notes file goes into every prompt; when its text changes, the cached prompts are rebuilt (checked once a second)
+    local now = reaper.time_precise()
+    if not c.notes_t or now - c.notes_t > 1 then
+        c.notes_t = now
+        local dir = (debug.getinfo(1, "S").source or ""):match("^@(.*[\\/])")
+        local fh = dir and io.open(dir .. "MixAssistant_plugin_notes.txt", "r")
+        local txt = fh and fh:read("*a") or ""
+        if fh then fh:close() end
+        if c.notes and c.notes ~= txt then c.cache = {} end
+        c.notes = txt
     end
     local key = f[1] .. ((f.sel and lists) and ("|" .. lists.sig) or "")
     local e = c.cache[key]
