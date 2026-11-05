@@ -508,11 +508,13 @@ local function get_track_fx_chain(track, mode)
     for i = 0, num_fx - 1 do
         local _, raw_name = reaper.TrackFX_GetFXName(track, i)
         local fx_name = clean(raw_name)
-        local orig
+        local orig, vend
         if mode then
             local ok_o, o = reaper.TrackFX_GetNamedConfigParm(track, i, "original_name")
             orig = ok_o and o and o ~= "" and clean(o) or nil
             if orig == fx_name then orig = nil end
+            vend = ((ok_o and o and o ~= "") and o or raw_name):match("(%b())%s*$") -- task 4f.11: the maker, "(Waves)", for [vendor: ...] blocks
+            vend = vend and trim_string(vend:sub(2, -2))
         end
 
         local plugin = { name = fx_name .. (orig and (" (" .. orig .. ")") or "") }
@@ -532,7 +534,7 @@ local function get_track_fx_chain(track, mode)
 
         if plugin_type == "effect" and not plugin.bypassed and not names_only then
             plugin.params = extract_fx_params(track, i)
-            if mode == "full" and plugin.params then plugin.params = regroup(plugin.params, (orig or fx_name) == "ReaEQ") end
+            if mode == "full" and plugin.params then plugin.params, plugin.vendor = regroup(plugin.params, (orig or fx_name) == "ReaEQ"), vend end -- vendor: removed again in extract_full_project_yaml
         end
         if names_only then
             local tags = {}
@@ -701,7 +703,13 @@ local function extract_full_project_yaml(opts)
                 local h = line:match("^%[(.+)%]$")
                 if h then
                     cur = { notes = {}, drop = {} }
-                    pn[trim_string(h):lower()] = cur
+                    local key = trim_string(h):lower():gsub("^vendor:%s*", "vendor: ")
+                    if key:find("^vendor: ") then pn[key] = cur else -- [ReaComp, ReaGate]: one block for several plugins
+                        for p in key:gmatch("[^,]+") do
+                            p = trim_string(p)
+                            if p and p ~= "" then pn[p] = cur end
+                        end
+                    end
                 elseif cur then
                     local k, v = line:match("^(%a+):%s*(.+)$")
                     if k == "note" then
@@ -735,19 +743,36 @@ local function extract_full_project_yaml(opts)
                 for n, pl in ipairs(td.fx) do
                     local orig = pl.name:match("%((.+)%)$") or pl.name
                     local e = pn[orig:lower()]
+                    local vn = pl.vendor
+                    local ev = vn and pn["vendor: " .. vn:lower()] -- [vendor: Waves]: drop and note lines for every plugin of that maker
+                    pl.vendor = nil
                     if type(pl.params) == "table" then
-                        strip(pl.params, nil, e and e.drop or {})
+                        local drop = { table.unpack(e and e.drop or {}) }
+                        for _, p in ipairs(ev and ev.drop or {}) do drop[#drop + 1] = p end
+                        strip(pl.params, nil, drop)
                         if next(pl.params) == nil then pl.params = nil end
                     end
                     if pl.params then
-                        if e and #e.notes > 0 then used[orig] = e end
+                        -- one line per block, listing the block's plugins this prompt shows (the prompt has no maker names)
+                        for _, b in ipairs({ e or false, ev or false }) do
+                            if b and #b.notes > 0 then
+                                b.shown = b.shown or {}
+                                b.shown[orig] = true
+                                used[b] = true
+                            end
+                        end
                         local key = orig .. " " .. to_inline_yaml(pl.params)
                         if seen[key] then pl.params = seen[key] else seen[key] = "same as plugin " .. n .. " on " .. td.track end
                     end
                 end
             end
         end
-        for name, e in pairs(used) do nl[#nl + 1] = "- plugin " .. name .. ": " .. table.concat(e.notes, " ") end
+        for e in pairs(used) do -- "plugin CLA Epic Mono/Stereo: ..." or "plugins ReaComp, ReaGate: ..."
+            local l = {}
+            for k in pairs(e.shown) do l[#l + 1] = k end
+            table.sort(l)
+            nl[#nl + 1] = "- plugin" .. (#l > 1 and "s " or " ") .. table.concat(l, ", ") .. ": " .. table.concat(e.notes, " ")
+        end
         table.sort(nl)
         if #nl > 0 then project_data.notes = project_data.notes .. "\n" .. table.concat(nl, "\n") end
     end
@@ -4554,9 +4579,9 @@ function AI.prompt(i)
         local _, msg = AI.focus_line(i)
         return nil, msg
     end
-    -- task 4f.11: the plugin notes file goes into every prompt; when its text changes, the cached prompts are rebuilt (checked once a second)
+    -- task 4f.11: the plugin notes file goes into every prompt; when its text changes, the cached prompts are rebuilt (checked every 5 s)
     local now = reaper.time_precise()
-    if not c.notes_t or now - c.notes_t > 1 then
+    if not c.notes_t or now - c.notes_t > 5 then
         c.notes_t = now
         local dir = (debug.getinfo(1, "S").source or ""):match("^@(.*[\\/])")
         local fh = dir and io.open(dir .. "MixAssistant_plugin_notes.txt", "r")
@@ -4897,6 +4922,7 @@ local function main()
                 pending, AI.status = function() AI.keep(AI.collect) end, "⏳ Rendering the project and reading the analyzers... please wait."
             end
             local c = AI.collected
+            local stale = c and AI.changed() -- task 4f.11: after a project change only Collect stays usable
 
             -- SEND (greyed out until collected)
             reaper.ImGui_Dummy(ctx, 0, 4)
@@ -4905,7 +4931,7 @@ local function main()
             reaper.ImGui_SameLine(ctx)
             _, think = reaper.ImGui_Checkbox(ctx, "Think (hidden)", think)
             reaper.ImGui_Dummy(ctx, 0, 4) -- same gap below the combo row as above it
-            if not c then reaper.ImGui_BeginDisabled(ctx, true) end
+            if not c or stale then reaper.ImGui_BeginDisabled(ctx, true) end
             -- "Focus on" combo first (it shapes both Send and Copy): standard combo look, same height as the buttons
             reaper.ImGui_PushStyleVar(ctx, reaper.ImGui_StyleVar_FramePadding(), bpad, (bh - reaper.ImGui_GetTextLineHeight(ctx)) / 2)
             -- Task 4f.7a: track counts, empty groups greyed out, hovering lists the focus tracks (the name guess can be wrong)
@@ -4950,8 +4976,10 @@ local function main()
             local w2 = reaper.ImGui_CalcTextSize(ctx, "Clear Chat") + 2 * bpad
             local gap = reaper.ImGui_GetContentRegionAvail(ctx) - w2
             if gap > 0 then reaper.ImGui_SetCursorPosX(ctx, reaper.ImGui_GetCursorPosX(ctx) + gap) end
+            if stale then reaper.ImGui_EndDisabled(ctx) end -- Clear Chat stays usable after a project change
             if reaper.ImGui_Button(ctx, "Clear Chat", w2, bh) then chat_history, AI.sent = {}, false end
-            if not c then reaper.ImGui_EndDisabled(ctx) end
+            if stale then reaper.ImGui_BeginDisabled(ctx, true) end
+            if not c or stale then reaper.ImGui_EndDisabled(ctx) end
             if is_busy then reaper.ImGui_EndDisabled(ctx) end
             reaper.ImGui_PopStyleVar(ctx, 1)
 
