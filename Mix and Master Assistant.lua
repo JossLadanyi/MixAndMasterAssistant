@@ -325,7 +325,7 @@ local function get_arrangement_markers()
     return #arrangement > 0 and arrangement or nil
 end
 
-local function get_all_connections(compact, keep) -- compact (task 4e): keep only the "sidechain" label (the other purposes were guesses); keep (task 4f.7b): only sends from or to these tracks
+local function get_all_connections(compact, keep, ptrs) -- compact (task 4e): keep only the "sidechain" label (the other purposes were guesses); keep (task 4f.7b): only sends from or to these tracks; ptrs (task 4g.3): ptrs[conn] = { source, destination track }
     local connections = {}
     local num_tracks = reaper.CountTracks(0)
     local track_lookup = {}
@@ -371,6 +371,7 @@ local function get_all_connections(compact, keep) -- compact (task 4e): keep onl
                 end
 
                 table.insert(connections, conn)
+                if ptrs then ptrs[conn] = { src_track, dest_track } end
             end
         end
     end
@@ -622,39 +623,90 @@ end
 -- opts (task 4e compact YAML, nil = old full output): full = { [track GUID] = true }: these tracks, their folders and the master keep
 -- their full plugin settings, every other track lists plugin names only; connections keep only the "sidechain" label.
 local function extract_full_project_yaml(opts)
-    local num, den = reaper.TimeMap_GetTimeSigAtTime(0, 0)
-    local sr = reaper.GetSetProjectInfo(0, "PROJECT_SRATE", 0, false)
-    local proj_notes = trim_string(reaper.GetSetProjectNotes(0, false, ""))
-
-    local project_data = {
+    -- task 4g.3 snapshot: opts.take = read every setting the compact YAML can use (every track in every fx mode) and return that table;
+    -- opts.snap = such a table: every read below then comes from it, so a prompt describes the project as it was measured, not as it is now
+    local S = opts and opts.snap
+    local function cp(x) -- the YAML is built from copies (the plugin-settings pass below changes them); to_yaml sorts keys, so copies print the same
+        if type(x) ~= "table" then return x end
+        local y = {}
+        for k, v in pairs(x) do y[k] = cp(v) end
+        return y
+    end
+    local function par(tr) if S then return S.parent[tr] end return reaper.GetParentTrack(tr) end
+    local function gid(tr) if S then return S.guid[tr] end return reaper.GetTrackGUID(tr) end
+    if opts and opts.take then
+        local num, den = reaper.TimeMap_GetTimeSigAtTime(0, 0)
+        local sr = reaper.GetSetProjectInfo(0, "PROJECT_SRATE", 0, false)
+        S = { meta = { bpm = reaper.Master_GetTempo(), time_sig = string.format("%d/%d", num, den), sample_rate = sr > 0 and math.floor(sr) or "Default" },
+            notes = trim_string(reaper.GetSetProjectNotes(0, false, "")), arr = get_arrangement_markers(), any_soloed = reaper.AnyTrackSolo(0),
+            list = {}, parent = {}, guid = {}, has_children = {}, td = {}, cptr = {}, master = reaper.GetMasterTrack(0) }
+        S.conns = get_all_connections(true, nil, S.cptr)
+        for i = 0, reaper.CountTracks(0) - 1 do
+            local tr = reaper.GetTrack(0, i)
+            S.list[i + 1], S.guid[tr], S.parent[tr] = tr, reaper.GetTrackGUID(tr), reaper.GetParentTrack(tr)
+            if S.parent[tr] then S.has_children[S.parent[tr]] = true end
+        end
+        S.td[S.master] = { full = process_track_data(S.master, true, 0, S.any_soloed, S.has_children, "full") }
+        local depth = 0
+        for _, tr in ipairs(S.list) do
+            local d = {}
+            for _, m in ipairs({ "full", "names", "bare" }) do d[m] = process_track_data(tr, false, depth, S.any_soloed, S.has_children, m) end
+            S.td[tr] = d
+            local fd = reaper.GetMediaTrackInfo_Value(tr, "I_FOLDERDEPTH")
+            if fd == 1 then depth = depth + 1 elseif fd < 0 then depth = math.max(0, depth + fd) end
+        end
+        return S
+    end
+    local function conns(keep) -- the snapshot's connections, filtered like get_all_connections(true, keep)
+        local l = {}
+        for _, c in ipairs(S.conns or {}) do
+            local p = S.cptr[c]
+            if not keep or keep[p[1]] or keep[p[2]] then l[#l + 1] = cp(c) end
+        end
+        return #l > 0 and l or nil
+    end
+    local meta, proj_notes, arr
+    if S then
+        meta, proj_notes, arr = cp(S.meta), S.notes, cp(S.arr)
+    else
+        local num, den = reaper.TimeMap_GetTimeSigAtTime(0, 0)
+        local sr = reaper.GetSetProjectInfo(0, "PROJECT_SRATE", 0, false)
+        proj_notes = trim_string(reaper.GetSetProjectNotes(0, false, ""))
         meta = {
             bpm = reaper.Master_GetTempo(),
             time_sig = string.format("%d/%d", num, den),
             sample_rate = sr > 0 and math.floor(sr) or "Default"
-        },
-        arr = get_arrangement_markers(),
-        connections = get_all_connections(opts ~= nil),
+        }
+        arr = get_arrangement_markers()
+    end
+
+    local project_data = {
+        meta = meta,
+        arr = arr,
+        connections = S and conns(nil) or (not S and get_all_connections(opts ~= nil)) or nil,
         tracks = {}
     }
 
     project_data.notes = "- any routing send volume omitted is at 0.0 dB unity gain."
     if proj_notes and proj_notes ~= "" then project_data.notes = project_data.notes .. '\n' .. proj_notes end
 
-    local any_soloed = reaper.AnyTrackSolo(0)
-    local num_tracks = reaper.CountTracks(0)
-
-    -- Pre-calculate parent folders that actually have children
-    local has_children = {}
-    for i = 0, num_tracks - 1 do
-        local p = reaper.GetParentTrack(reaper.GetTrack(0, i))
-        if p then has_children[p] = true end
+    local any_soloed, list, has_children
+    if S then
+        any_soloed, list, has_children = S.any_soloed, S.list, S.has_children
+    else
+        any_soloed, list, has_children = reaper.AnyTrackSolo(0), {}, {}
+        for i = 0, reaper.CountTracks(0) - 1 do list[i + 1] = reaper.GetTrack(0, i) end
+        -- Pre-calculate parent folders that actually have children
+        for _, tr in ipairs(list) do
+            local p = reaper.GetParentTrack(tr)
+            if p then has_children[p] = true end
+        end
     end
     local keep = {} -- compact mode: tracks with full plugin settings (the named tracks and their folder chain)
     if opts then
-        for i = 0, num_tracks - 1 do
-            local tr = reaper.GetTrack(0, i)
-            if opts.full[reaper.GetTrackGUID(tr)] then
-                while tr do keep[tr] = true; tr = reaper.GetParentTrack(tr) end
+        for _, tr in ipairs(list) do
+            if opts.full[gid(tr)] then
+                while tr do keep[tr] = true; tr = par(tr) end
             end
         end
     end
@@ -663,29 +715,31 @@ local function extract_full_project_yaml(opts)
     local shown
     if opts and opts.listed then
         shown = {}
-        for i = 0, num_tracks - 1 do
-            local tr = reaper.GetTrack(0, i)
-            if opts.listed[reaper.GetTrackGUID(tr)] or keep[tr] then
-                while tr do shown[tr] = true; tr = reaper.GetParentTrack(tr) end
+        for _, tr in ipairs(list) do
+            if opts.listed[gid(tr)] or keep[tr] then
+                while tr do shown[tr] = true; tr = par(tr) end
             end
         end
-        project_data.connections = get_all_connections(true, keep)
+        project_data.connections = S and conns(keep) or (not S and get_all_connections(true, keep)) or nil
     end
 
     -- 1. Master Track
-    table.insert(project_data.tracks, process_track_data(reaper.GetMasterTrack(0), true, 0, any_soloed, has_children, opts and "full" or nil))
+    table.insert(project_data.tracks, S and cp(S.td[S.master].full) or process_track_data(reaper.GetMasterTrack(0), true, 0, any_soloed, has_children, opts and "full" or nil))
 
     -- 2. Child Tracks & Folders
     local current_depth = 0
-    for i = 0, num_tracks - 1 do
-        local track = reaper.GetTrack(0, i)
-        table.insert(project_data.tracks, process_track_data(track, false, current_depth, any_soloed, has_children,
-            opts and (keep[track] and "full" or ((shown and not shown[track]) and "bare" or "names")) or nil))
-        local folder_delta = reaper.GetMediaTrackInfo_Value(track, "I_FOLDERDEPTH")
-        if folder_delta == 1 then
-            current_depth = current_depth + 1
-        elseif folder_delta < 0 then
-            current_depth = math.max(0, current_depth + folder_delta)
+    for _, track in ipairs(list) do
+        local mode = opts and (keep[track] and "full" or ((shown and not shown[track]) and "bare" or "names")) or nil
+        if S then
+            table.insert(project_data.tracks, cp(S.td[track][mode]))
+        else
+            table.insert(project_data.tracks, process_track_data(track, false, current_depth, any_soloed, has_children, mode))
+            local folder_delta = reaper.GetMediaTrackInfo_Value(track, "I_FOLDERDEPTH")
+            if folder_delta == 1 then
+                current_depth = current_depth + 1
+            elseif folder_delta < 0 then
+                current_depth = math.max(0, current_depth + folder_delta)
+            end
         end
     end
 
@@ -4072,8 +4126,8 @@ end
 
 --- Task 4f: the whole prompt from a collection (compact YAML read after the cleanup, so no analyzer or phantom is in it).
 -- Returns prompt, compact YAML; or nil, error text.
-local function build_collected_prompt(data_block, named, listed, topic) -- listed (task 4f.7b): see build_data_block; topic (4f.10): a topic focus entry
-    local cok, cyaml = pcall(extract_full_project_yaml, { full = named, listed = listed })
+local function build_collected_prompt(data_block, named, listed, topic, snap) -- listed (task 4f.7b): see build_data_block; topic (4f.10): a topic focus entry; snap (4g.3): the settings read at Collect
+    local cok, cyaml = pcall(extract_full_project_yaml, { full = named, listed = listed, snap = snap })
     if not (cok and type(cyaml) == "string") then return nil, tostring(cyaml) end
     return build_jsfx_prompt(data_block, cyaml, listed ~= nil and not topic, topic), cyaml
 end
@@ -4449,6 +4503,29 @@ function AI.ask(model_choice, think, est)
 end
 
 --- "Collect Data": one collection run (report to MixAssistant_report.txt next to the script), then the prompt, saved next to the project like the old flow.
+--- Task 4g.3: every setting the prompts use, read once at Collect (the project exactly as it sounds in the measurement,
+-- without the analyzers): the YAML parts (extract_full_project_yaml take mode) + per track the automation, the return candidates
+-- (counted sends on channels 1/2), the name group, is_return (non-folder answer), muted along the folder chain and the selection.
+function AI.snapshot()
+    local S = extract_full_project_yaml({ take = true })
+    S.len = math.min(reaper.GetProjectLength(0), MA_MAXSEC)
+    S.auto, S.ret_to, S.group, S.ret, S.muted, S.sel = {}, {}, {}, {}, {}, {}
+    for _, tr in ipairs(S.list) do
+        S.auto[tr] = AI.auto_lines(tr, S.len)
+        -- & 1023 strips the mono flag 1024, so a mono send to channel 1 or 2 counts too
+        local to = {}
+        for k = 0, reaper.GetTrackNumSends(tr, 0) - 1 do
+            if reaper.GetTrackSendInfo_Value(tr, 0, k, "B_MUTE") ~= 1 and reaper.GetTrackSendInfo_Value(tr, 0, k, "I_SRCCHAN") >= 0
+                and math.floor(reaper.GetTrackSendInfo_Value(tr, 0, k, "I_DSTCHAN")) & 1023 < 2 then
+                to[#to + 1] = reaper.GetTrackSendInfo_Value(tr, 0, k, "P_DESTTRACK")
+            end
+        end
+        S.ret_to[tr] = to
+        S.group[tr], S.ret[tr], S.muted[tr], S.sel[tr] = AI.track_group(tr), AI.is_return(tr, false), is_track_hierarchy_muted(tr), reaper.IsTrackSelected(tr)
+    end
+    return S
+end
+
 function AI.collect()
     local ok, out, block, named, D = collect_jsfx_data(false)
     if not out then AI.status = "Collection failed: the analyzer file could not be written." return end
@@ -4458,11 +4535,15 @@ function AI.collect()
         AI.status = "Collection failed: " .. tostring(out[#out]):gsub("^ERROR: ", "") .. " (details in MixAssistant_report.txt)"
         return
     end
-    local prompt, err = build_collected_prompt(block, named)
+    -- task 4g.3: read after the collection's cleanup (analyzers removed, the run undone; REAPER blocks editing while it renders)
+    local sok, S = pcall(AI.snapshot)
+    if not sok then AI.status = "Reading the project settings failed: " .. tostring(S) return end
+    local prompt, err = build_collected_prompt(block, named, nil, nil, S)
     if not prompt then AI.status = "Prompt build failed: " .. tostring(err) return end
     -- Task 4f.6: the measurements are kept (D), prompts are built per focus from them (cache, keyed by the focus name);
     -- Whole Song is built now so a build error shows at once. The file is saved at send / copy time (AI.full_prompt).
-    AI.collected = { D = D, cache = { [AI.FOCUS[1][1]] = { prompt = prompt, tokens = MA_A.tokens(#prompt) } },
+    -- Task 4g.3: snap = the settings at the measurement; every prompt and the focus lists come from it until the next Collect.
+    AI.collected = { D = D, snap = S, cache = { [AI.FOCUS[1][1]] = { prompt = prompt, tokens = MA_A.tokens(#prompt) } },
         when = os.date("%H:%M"), changes = reaper.GetProjectStateChangeCount(0), soloed = reaper.AnyTrackSolo(0),
         undo = reaper.Undo_CanUndo2(0) or "", sel = AI.sel_sig() } -- task 4f.7b: see AI.changed
     AI.sent = false
@@ -4590,13 +4671,13 @@ function AI.prompt(i)
         if c.notes and c.notes ~= txt then c.cache = {} end
         c.notes = txt
     end
-    local key = f[1] .. ((f.sel and lists) and ("|" .. lists.sig) or "")
+    local key = f[1] -- task 4g.3: Selected Tracks = the selection at Collect, so one entry per focus
     local e = c.cache[key]
     if not e then
         local fs
         if l then
             -- F = the focus tracks; R = their returns: counted tracks an F track sends audio to on channel 1 or 2
-            -- (& 1023 strips the mono flag 1024, so a mono send to channel 1 or 2 counts too)
+            -- (task 4g.3: the sends as they were at Collect, see AI.snapshot)
             fs = { F = {}, R = {} }
             local by_tr = {}
             for _, t in ipairs(c.D.tracks) do
@@ -4604,24 +4685,19 @@ function AI.prompt(i)
             end
             for _, x in ipairs(l) do fs.F[x.t.idx] = true end
             for _, x in ipairs(l) do
-                for k = 0, reaper.GetTrackNumSends(x.tr, 0) - 1 do
-                    local dst = by_tr[reaper.GetTrackSendInfo_Value(x.tr, 0, k, "P_DESTTRACK")]
-                    if dst and not fs.F[dst.idx] and reaper.GetTrackSendInfo_Value(x.tr, 0, k, "B_MUTE") ~= 1
-                        and reaper.GetTrackSendInfo_Value(x.tr, 0, k, "I_SRCCHAN") >= 0
-                        and math.floor(reaper.GetTrackSendInfo_Value(x.tr, 0, k, "I_DSTCHAN")) & 1023 < 2 then
-                        fs.R[dst.idx] = true
-                    end
+                for _, d in ipairs(c.snap.ret_to[x.tr] or {}) do
+                    local dst = by_tr[d]
+                    if dst and not fs.F[dst.idx] then fs.R[dst.idx] = true end
                 end
             end
-            -- task 4f.9: the automation of the focus tracks and returns
+            -- task 4f.9: the automation of the focus tracks and returns (4g.3: read at Collect)
             fs.auto = {}
-            local len = math.min(reaper.GetProjectLength(0), MA_MAXSEC)
             for _, t in ipairs(c.D.tracks) do
-                if (fs.F[t.idx] or fs.R[t.idx]) and reaper.ValidatePtr2(0, t.track, "MediaTrack*") then fs.auto[t.idx] = AI.auto_lines(t.track, len) end
+                if fs.F[t.idx] or fs.R[t.idx] then fs.auto[t.idx] = c.snap.auto[t.track] end
             end
         end
         local block, named, _, listed = build_data_block(c.D, f, fs)
-        local prompt, err = build_collected_prompt(block, named, listed, f.tp and f)
+        local prompt, err = build_collected_prompt(block, named, listed, f.tp and f, c.snap)
         if not prompt then return nil, "Prompt build failed: " .. tostring(err) end
         e = { prompt = prompt, tokens = MA_A.tokens(#prompt) }
         c.cache[key] = e
@@ -4716,22 +4792,19 @@ end
 
 --- Task 4f.7a: the focus track lists from the collected tracks (counted ones only, not muted, still in the project), indexed like
 -- AI.FOCUS: lists[i] = { { t = track entry, tr = track }, ... } in track order; nil for Whole Song and the topic focuses.
--- Rebuilt when the project or the track selection changes.
+-- Task 4g.3: built once per collection from the snapshot (names, routing, mutes and the track selection as they were at Collect).
 function AI.focus_lists()
     local c = AI.collected
     if not c then return {} end
-    local parts = { reaper.GetProjectStateChangeCount(0) }
-    for k = 0, reaper.CountSelectedTracks(0) - 1 do parts[#parts + 1] = tostring(reaper.GetSelectedTrack(0, k)) end
-    local sig = table.concat(parts, ",")
-    if c.lists and c.lists.sig == sig then return c.lists end
-    local info = {}
+    if c.lists then return c.lists end
+    local S, info = c.snap, {}
     for _, t in ipairs(c.D.tracks) do
         local tr, r = t.track, c.D.route[t.idx]
-        if r and not r.no_direct and reaper.ValidatePtr2(0, tr, "MediaTrack*") and not is_track_hierarchy_muted(tr) then
-            info[#info + 1] = { t = t, tr = tr, g = AI.track_group(tr), ret = AI.is_return(tr, r.role == "bus") }
+        if r and not r.no_direct and S.td[tr] and not S.muted[tr] then
+            info[#info + 1] = { t = t, tr = tr, g = S.group[tr], ret = r.role ~= "bus" and S.ret[tr] }
         end
     end
-    local lists = { sig = sig }
+    local lists = {}
     for i, f in ipairs(AI.FOCUS) do
         if f.g or f.inst or f.ret or f.sel then
             local l = {}
@@ -4739,7 +4812,7 @@ function AI.focus_lists()
                 local hit
                 if f.sel then
                     local cur = x.tr
-                    while cur and not hit do hit, cur = reaper.IsTrackSelected(cur), reaper.GetParentTrack(cur) end
+                    while cur and not hit do hit, cur = S.sel[cur], S.parent[cur] end
                 elseif f.inst then hit = not x.ret and x.g ~= "vocals" and x.g ~= "drums" and x.g ~= "bass"
                 elseif f.ret then hit = x.ret
                 else hit = f.g[x.g or ""] end
@@ -4759,7 +4832,7 @@ function AI.focus_line(i)
     local l = AI.focus_lists()[i]
     if not l then return "" end
     if #l == 0 then
-        return nil, f.sel and "No collected track is selected in REAPER. Select the tracks to focus on first." or ("No track belongs to " .. f[1] .. ".")
+        return nil, f.sel and "No track was selected at Collect. Select the tracks to focus on, then Collect Project Info again." or ("No track belongs to " .. f[1] .. ".")
     end
     local names = {}
     for _, x in ipairs(l) do names[#names + 1] = (x.t.name:gsub("%s+", "_")) end -- as the data block writes names
@@ -4922,7 +4995,6 @@ local function main()
                 pending, AI.status = function() AI.keep(AI.collect) end, "⏳ Rendering the project and reading the analyzers... please wait."
             end
             local c = AI.collected
-            local stale = c and AI.changed() -- task 4f.11: after a project change only Collect stays usable
 
             -- SEND (greyed out until collected)
             reaper.ImGui_Dummy(ctx, 0, 4)
@@ -4931,7 +5003,7 @@ local function main()
             reaper.ImGui_SameLine(ctx)
             _, think = reaper.ImGui_Checkbox(ctx, "Think (hidden)", think)
             reaper.ImGui_Dummy(ctx, 0, 4) -- same gap below the combo row as above it
-            if not c or stale then reaper.ImGui_BeginDisabled(ctx, true) end
+            if not c then reaper.ImGui_BeginDisabled(ctx, true) end -- task 4g.3: usable after a project change too (prompts come from the snapshot)
             -- "Focus on" combo first (it shapes both Send and Copy): standard combo look, same height as the buttons
             reaper.ImGui_PushStyleVar(ctx, reaper.ImGui_StyleVar_FramePadding(), bpad, (bh - reaper.ImGui_GetTextLineHeight(ctx)) / 2)
             -- Task 4f.7a: track counts, empty groups greyed out, hovering lists the focus tracks (the name guess can be wrong)
@@ -4947,7 +5019,7 @@ local function main()
             reaper.ImGui_SetNextItemWidth(ctx, reaper.ImGui_CalcTextSize(ctx, "Focus: Effects & Returns (99)") + 2 * bpad + bh)
             if reaper.ImGui_BeginCombo(ctx, "##focus", "Focus: " .. flabel(focus_idx), reaper.ImGui_ComboFlags_HeightLargest()) then
                 for i, f in ipairs(AI.FOCUS) do
-                    local empty = lists[i] and #lists[i] == 0 and not f.sel -- Selected Tracks stays choosable (select tracks afterwards)
+                    local empty = lists[i] and #lists[i] == 0 -- task 4g.3: Selected Tracks too (the selection at Collect counts)
                     if empty then reaper.ImGui_BeginDisabled(ctx, true) end
                     if reaper.ImGui_Selectable(ctx, flabel(i), i == focus_idx) then focus_idx = i end
                     if empty then reaper.ImGui_EndDisabled(ctx) end
@@ -4976,10 +5048,8 @@ local function main()
             local w2 = reaper.ImGui_CalcTextSize(ctx, "Clear Chat") + 2 * bpad
             local gap = reaper.ImGui_GetContentRegionAvail(ctx) - w2
             if gap > 0 then reaper.ImGui_SetCursorPosX(ctx, reaper.ImGui_GetCursorPosX(ctx) + gap) end
-            if stale then reaper.ImGui_EndDisabled(ctx) end -- Clear Chat stays usable after a project change
             if reaper.ImGui_Button(ctx, "Clear Chat", w2, bh) then chat_history, AI.sent = {}, false end
-            if stale then reaper.ImGui_BeginDisabled(ctx, true) end
-            if not c or stale then reaper.ImGui_EndDisabled(ctx) end
+            if not c then reaper.ImGui_EndDisabled(ctx) end
             if is_busy then reaper.ImGui_EndDisabled(ctx) end
             reaper.ImGui_PopStyleVar(ctx, 1)
 
@@ -4987,13 +5057,16 @@ local function main()
             local st, col = nil, 0xFFD54FFF
             if AI.status ~= "" then
                 st = AI.status
-            elseif c and AI.changed() then
-                st, col = "Project changed. Collect Project Info again before proceeding (free).", 0xFFB74DFF
             elseif c then
                 local pk, till = AI.peak()
                 local e, perr = AI.prompt(focus_idx) -- task 4f.6: the chosen focus's prompt (built once, then cached)
                 st = e and string.format("Collected %s%s, about %d tokens; sending costs about $%.3f now (%s)", c.when, c.soloed and " (soloed tracks only)" or "", e.tokens,
                     AI.cost(get_model_name(model_idx + 1), 0, e.tokens, 0), pk and ("peak until " .. till) or "off-peak") or perr
+                -- task 4g.3: the prompts keep describing the project as it was collected
+                if AI.changed() then
+                    st, col = string.format("Project changed since Collect at %s. Prompts describe the project as it was then; Collect again to include your changes (free). %s",
+                        c.when, st), 0xFFB74DFF
+                end
             else
                 st = "No project info yet. Click Collect Project Info (free)."
             end
