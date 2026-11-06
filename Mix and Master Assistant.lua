@@ -1,30 +1,39 @@
 -- ==============================================================================
--- REAPER AI MIX ASSISTANT & SCANNER (v5.6)
+-- REAPER AI MIX & MASTER ASSISTANT (v6.0)
 -- ==============================================================================
--- Features:
--- 1. Token-Optimized YAML Architecture Scanner (Reduces LLM cost, retains data)
--- 2. Mix State Manager (Target Soloing & Parallel / Master FX Muting)
--- 3. Ghost Render Engine with Auto-Cleanup & Non-Destructive State Restore
--- 4. 9-Band Mastering DSP Engine (accurate biquad band-pass filters) + Sub-Mono (<120Hz) Phase Check
--- 5. Active Track Detection (Tells AI exactly what is playing in each region)
--- 6. DeepSeek API Integration & Free Web-LLM Prompt Exporter (.txt)
+-- What it does:
+-- 1. Collect Project Info: ONE render of the project into a temporary folder. During it,
+--    analyzer JSFX on hidden copies of the tracks ("phantom" tracks, post-fader) and on the
+--    master measure the mix: per track and second (level, peak, crest, 15 frequency bands,
+--    stereo, sub-mono, clips, when the track plays), per 100 ms on the master (loudness,
+--    15 mid + 15 side bands, correlation, sub-mono, balance, peak, clips) and the master input.
+--    Everything is removed again afterwards (one undo block), the render settings restored,
+--    the temporary folder emptied.
+-- 2. Compact YAML of the routing and FX settings, plus the measured data per region.
+-- 3. Focus prompts (Whole Song, Vocals, Drums & Bass, ..., Low End, Mids, ...), sent to
+--    DeepSeek (Flash default, or Pro; optional Think) or copied for a web chat; the prompt is
+--    also saved as AI_Mix_Prompt_JSFX_<focus>.txt next to the project. Send Track Detail asks
+--    about selected tracks in the same chat.
+-- 4. Optional MixAssistant_plugin_notes.txt next to the script: short notes per plugin and
+--    settings to drop from the YAML (fewer tokens).
+-- Limit: tracks x song length must fit in the analyzer memory (e.g. 128 tracks for about
+-- 30 min, 49 tracks for about 68 min); Collect says so before changing anything.
+-- The old scan (ghost render, 9-band Lua DSP, mix state manager) is still in this file but
+-- not reachable from the window; it is deleted in a later version.
 -- ==============================================================================
 -- 1. What Needs to Be Installed
 -- - REAPER (v6 or above),
 -- - ReaImGui,
--- - DeepSeek API Key (only if you want AI responses; not needed for .txt export mode).
+-- - SWS (recommended: lets the script close the render window by itself),
+-- - DeepSeek API key (only for Send): first line of "apikey.txt" next to this script.
+--   Copy Project Info works without it.
 -- 2. Render Window Setup (One-Time Setup)
---   Open File > Render... (Ctrl+Alt+R / Cmd+Opt+R) and configure these settings:
+--   Open File > Render... and set:
 --   Source: Master mix
 --   Bounds: Entire project
---   Directory: Choose your project folder (or any valid folder like C:\temp).
---   File name: temp_mix_render
---   Format: WAV, 24-bit PCM, 44100 Hz, Stereo.
---   Options (MANDATORY):
---     [x] Add rendered items to new tracks in project
---     [x] Silently increment filenames to avoid overwriting
---     [x] Auto-close all render windows when finished
---   Crucial Final Step: Click "Save settings"
+--   Then click "Save settings". The script sets the folder, the file name, "add to project"
+--   and auto-close itself for its render and restores your settings afterwards.
+--   Tip: set the audio device to the project sample rate (the analyzers run at the device rate).
 -- ==============================================================================
 
 local reaper = reaper
@@ -1319,6 +1328,7 @@ local function process_audio_chunk(take, item_pos, analyze_start, analyze_dur)
     local denom = math.sqrt(sum_sub_LL * sum_sub_RR)
     local correlation = denom > 0 and (sum_sub_LR / denom) or 1.0
     dsp_debug.sub_corr = correlation
+    dsp_debug.peak, dsp_debug.rms, dsp_debug.width, dsp_debug.corr = peak_db, rms_db, width_pct, phase_corr -- task 5c: unrounded
 
     -- Only flag if there is actual bass AND phase correlation drops below 0 (canceling out)
     local sub_mono_status = "Safe"
@@ -3927,7 +3937,7 @@ local function find_new_tracks(old_guids)
     return list
 end
 
-local function print_dsp_comparison(out, region, run_id, lua_m, win0, win1, fader_db)
+local function print_dsp_comparison(out, region, run_id, lua_m, win0, win1, fader_db, render_tracks, max_sec)
     local function g(i) return reaper.gmem_read(i) end
     local n = g(192)
     if g(203) ~= run_id or n < 1 then
@@ -3956,11 +3966,91 @@ local function print_dsp_comparison(out, region, run_id, lua_m, win0, win1, fade
     out[#out + 1] = string.format("\nLua DSP vs JSFX | '%s' window %.2f-%.2f s | JSFX samples %d | master fader %.1f dB",
         region.name, win0, win1, n, fader_db)
     out[#out + 1] = "metric            Lua      JSFX     delta"
-    for _, r in ipairs(rows) do
+    local band_worst = 0 -- task 5c: the 9 old bands of this window, allowed 0.05 dB
+    for i, r in ipairs(rows) do
         out[#out + 1] = string.format("%-12s %9.2f %9.2f %9.2f", r[1], r[2] or 0, r[3], r[3] - (r[2] or 0))
+        if i > 6 then band_worst = math.max(band_worst, math.abs(r[3] - (r[2] or 0))) end
     end
     local jsfx_status = (convert_energy_to_db((sll + srr) / 2, n) > -50.0 and sub_corr < 0.0) and "Phase_Risk" or "Safe"
     out[#out + 1] = "sub-mono status: Lua " .. tostring(lua_m.stereo.sub_mono) .. " | JSFX " .. jsfx_status
+
+    -- Task 5c: every region, old Lua DSP (reads the rendered file) vs the JSFX master record, over exactly the same 100 ms blocks
+    out[#out + 1] = "\nTASK 5c: Lua DSP vs JSFX master record per region (same 100 ms blocks and samples on both sides; post-fader)"
+    local sr = g(2)
+    if math.abs(sr - SAMPLE_RATE) > 0.5 then
+        out[#out + 1] = string.format("5c verdict: NOT RUN. The JSFX ran at %d Hz, the Lua DSP reads at %d Hz: set the audio device to %d Hz.", sr, SAMPLE_RATE, SAMPLE_RATE)
+        return
+    end
+    -- the project may render a lossy main format plus a WAV second format: read the WAV (lossy files have higher sample peaks)
+    local take, item_pos, src_name
+    for _, trk in ipairs(render_tracks or {}) do
+        local it = reaper.GetTrackMediaItem(trk, 0)
+        local tk = it and reaper.GetActiveTake(it)
+        if tk then
+            local fn = reaper.GetMediaSourceFileName(reaper.GetMediaItemTake_Source(tk), "")
+            if not take or fn:lower():match("%.wav$") then
+                take, item_pos, src_name = tk, reaper.GetMediaItemInfo_Value(it, "D_POSITION"), fn
+            end
+            if fn:lower():match("%.wav$") then break end
+        end
+    end
+    if not take then out[#out + 1] = "5c verdict: NOT RUN. No rendered item found." return end
+    -- REAPER adds only the main format to the project; the WAV second format lies next to it with the same name
+    local wav = not src_name:lower():match("%.wav$") and src_name:gsub("%.[^%.\\/]+$", ".wav")
+    if wav and reaper.file_exists(wav) then
+        local src = reaper.PCM_Source_CreateFromFile(wav)
+        if src and reaper.SetMediaItemTake_Source(take, src) then src_name = wav end
+    end
+    out[#out + 1] = "Lua DSP reads: " .. (src_name:match("[^\\/]+$") or src_name) .. (src_name:lower():match("%.wav$") and "" or "  (NOT WAV: peaks will differ)")
+    local names = { "peak", "rms", "crest", "width", "corr", "sub corr" }
+    local tol = { 0.05, 0.05, 0.05, 0.5, 0.01, 0.02 }
+    local worst, fails, n_ok = { 0, 0, 0, 0, 0, 0 }, {}, 0
+    out[#out + 1] = string.format("%-22s %8s %8s %8s %8s %8s %8s", "", names[1], names[2], names[3], names[4], names[5], names[6])
+    local ri = 0
+    for _, rg in ipairs(get_arrangement_markers() or {}) do
+        if rg.end_s then
+            ri = ri + 1
+            local blk0, blk1 = math.ceil(rg.start_s * 10 - 1e-6), math.floor(rg.end_s * 10 + 1e-6) - 1
+            local mr = blk1 >= blk0 and summarize_master(max_sec, run_id, blk0, blk1) or nil
+            local nblk = blk1 - blk0 + 1
+            local lm = mr and mr.samples > 0 and process_audio_chunk(take, item_pos, blk0 / 10, nblk / 10 + 0.25 / SAMPLE_RATE)
+            local label = string.format("R%d %s", ri, rg.name):sub(1, 22)
+            if not lm then
+                fails[#fails + 1] = label .. ": no data on one side"
+            else
+                local d, x = dsp_debug, MA_A.mstereo(mr, fader_db)
+                local lv = { d.peak, d.rms, d.peak - d.rms, d.width, d.corr, d.sub_corr }
+                local jv = { x.pk, x.rms, x.crest, x.width, x.corr, x.sub_corr }
+                local l1, l2, l3 = string.format("%-22s", label), string.format("%-22s", "  JSFX"), string.format("%-22s", "  delta")
+                local bad = {}
+                for k = 1, 6 do
+                    local dk = jv[k] - lv[k]
+                    l1, l2, l3 = l1 .. string.format(" %8.3f", lv[k]), l2 .. string.format(" %8.3f", jv[k]), l3 .. string.format(" %8.3f", dk)
+                    worst[k] = math.max(worst[k], math.abs(dk))
+                    if math.abs(dk) > tol[k] then bad[#bad + 1] = string.format("%s off by %.3f (allowed %.2f)", names[k], math.abs(dk), tol[k]) end
+                end
+                local ls, js = lm.stereo.sub_mono, x.sub_risk and "Phase_Risk" or "Safe"
+                local l_n = math.floor((nblk / 10 + 0.25 / SAMPLE_RATE) * SAMPLE_RATE)
+                if ls ~= js then bad[#bad + 1] = "sub-mono status " .. ls .. " vs " .. js end
+                if math.abs(l_n - mr.samples) > 1 then bad[#bad + 1] = string.format("sample counts differ (Lua %d, JSFX %d)", l_n, mr.samples) end
+                out[#out + 1] = l1 .. string.format("  (Lua; %.1f-%.1f s, %d samples, sub-mono %s)", blk0 / 10, (blk1 + 1) / 10, l_n, ls)
+                out[#out + 1] = l2 .. string.format("  (%d samples, sub-mono %s)", mr.samples, js)
+                out[#out + 1] = l3
+                if #bad > 0 then fails[#fails + 1] = label .. ": " .. table.concat(bad, ", ") else n_ok = n_ok + 1 end
+            end
+        end
+    end
+    local wl = {}
+    for k = 1, 6 do wl[k] = string.format("%s %.3f", names[k], worst[k]) end
+    out[#out + 1] = "largest differences: " .. table.concat(wl, " | ") .. string.format(" | 9 bands (window above) %.3f dB", band_worst)
+    if band_worst > 0.05 then fails[#fails + 1] = string.format("9 bands in the window off by %.3f dB (allowed 0.05)", band_worst) end
+    if n_ok == 0 and #fails == 0 then fails[1] = "no regions in the project" end
+    if #fails == 0 then
+        out[#out + 1] = string.format("5c verdict: PASSED. All %d regions within tolerance; the old Lua DSP may be deleted (task 5f).", n_ok)
+    else
+        out[#out + 1] = string.format("5c verdict: FAILED (%d problem(s)):", #fails)
+        for _, f in ipairs(fails) do out[#out + 1] = "  " .. f end
+    end
 end
 
 --- JSFX collection test: inject -> render (nothing added to the project) -> read gmem -> print numbers -> clean up.
@@ -4208,10 +4298,11 @@ local function collect_jsfx_data(compare)
         end
 
         if compare then
-            local lua_m = analyze_region(find_new_tracks(old_guids), region, DEBUG_DURATION)
+            local new_tracks = find_new_tracks(old_guids)
+            local lua_m = analyze_region(new_tracks, region, DEBUG_DURATION)
             if not lua_m then error("Lua DSP found no rendered item for the region", 0) end
             local fader_db = level_db(reaper.GetMediaTrackInfo_Value(reaper.GetMasterTrack(0), "D_VOL"))
-            print_dsp_comparison(out, region, run_id, lua_m, win0, win1, fader_db)
+            print_dsp_comparison(out, region, run_id, lua_m, win0, win1, fader_db, new_tracks, max_sec)
         end
     end)
 
@@ -5275,15 +5366,15 @@ local function main()
             if reaper.ImGui_Button(ctx, "Send Track Detail...", 0, bh) then
                 local text, info = AI.detail_text()
                 if not text then
-                    AI.status = info
+                    reaper.ShowMessageBox(info, "Send Track Detail", 0)
                 elseif reaper.ShowMessageBox(string.format("Send the detail of: %s?\n\nAbout %d tokens (sending this part costs about $%.3f now; the earlier chat is mostly cached).%s",
                     info.names, info.tokens, AI.cost(get_model_name(model_idx + 1), 0, info.tokens, 0),
                     #info.skipped > 0 and ("\n\nLeft out (not in the last Collect): " .. table.concat(info.skipped, ", ")) or ""), "Send Track Detail", 1) == 1 then
                     pending, AI.status = function() AI.detail_send(model_idx + 1, think, text, info) end, "⏳ Waiting for DeepSeek (with Think on this can take a few minutes)..."
                 end
             end
-            if reaper.ImGui_IsItemHovered(ctx) then
-                reaper.ImGui_SetTooltip(ctx, "Sends the full settings, sends, automation and measurements of the tracks selected in REAPER\n(as they were at Collect) into this chat. The AI asks for them with \"DETAIL <track name>\".")
+            if reaper.ImGui_IsItemHovered(ctx, reaper.ImGui_HoveredFlags_AllowWhenDisabled()) then
+                reaper.ImGui_SetTooltip(ctx, (AI.sent and "" or "Send Project Info first. ") .. "Sends the selected tracks' full data to this chat.")
             end
             if not AI.sent then reaper.ImGui_EndDisabled(ctx) end
             -- Clear Chat right-aligned on the same row
