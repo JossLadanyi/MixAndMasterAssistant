@@ -535,7 +535,27 @@ local function get_track_fx_chain(track, mode)
 
         if plugin_type == "effect" and not plugin.bypassed and not names_only then
             plugin.params = extract_fx_params(track, i)
-            if mode == "full" and plugin.params then plugin.params, plugin.vendor = regroup(plugin.params, (orig or fx_name) == "ReaEQ"), vend end -- vendor: removed again in extract_full_project_yaml
+            if mode == "full" and plugin.params then
+                local reaeq = (orig or fx_name) == "ReaEQ"
+                plugin.params, plugin.vendor = regroup(plugin.params, reaeq), vend -- vendor: removed again in extract_full_project_yaml
+                if reaeq then -- task 4h: a band switched off in ReaEQ (no parameter shows it) becomes "off"
+                    local types, seen, b = { high_pass = 0, low_shelf = 1, band = 2, notch = 3, high_shelf = 4, low_pass = 5, band_pass = 6 }, {}, 0
+                    while true do
+                        local ok_n, pn = reaper.TrackFX_GetParamName(track, i, b * 3) -- each band: freq, gain, bw
+                        local key = ok_n and clean_param_key(pn):match("^freq_(.+)$")
+                        if not key then break end
+                        local tp = (key:gsub("_%d+$", ""))
+                        local idx = seen[tp] or 0
+                        seen[tp] = idx + 1
+                        local ok_e, en = reaper.TrackFX_GetNamedConfigParm(track, i, "BANDENABLED" .. b)
+                        local off
+                        if ok_e and en and en ~= "" then off = (en == "0")
+                        elseif types[tp] then off = not reaper.TrackFX_GetEQBandEnabled(track, i, types[tp], idx) end
+                        if off and plugin.params[key] ~= nil then plugin.params[key] = "off" end
+                        b = b + 1
+                    end
+                end
+            end
         end
         if names_only then
             local tags = {}
@@ -3782,9 +3802,9 @@ local function build_jsfx_prompt(block, yaml, focus, topic) -- focus (task 4f.7b
         "chain in > out: master loudness before vs after the master FX; gain = loudness the chain adds (dB).",
         "TRACKS (whole song), one line per playing track:",
         "- s = % share of the mix (loudness-weighted energy; all counted tracks add up to 100). Folder buses have no s (their children carry it). Tracks with no path to the master are left out; what they send is measured on the receiving tracks.",
-        "- L = average loudness including pauses (LUFS, ungated), pk = sample peak (dBFS), cr = crest factor (dB, median per second of peak minus RMS; low = dense or heavily compressed), a = % of the time the track plays.",
+        "- L = average loudness including pauses (LUFS, ungated; a track that plays more often gets a higher L at the same level, compare pk), pk = sample peak (dBFS), cr = crest factor (dB, median per second of peak minus RMS; low = dense or heavily compressed), a = % of the time the track plays.",
         "- W = width (0 mono, about 50 wide and uncorrelated, above 50 more side than mid), c = left/right correlation (1 mono, 0 unrelated, below 0 out of phase), pC / pL n / pR n = measured balance (0-100 towards that side), sub! = out of phase below 120 Hz (cancels in mono), clip n = clipped samples.",
-        "- after \"|\": bands that stand out from their neighbouring bands in the same track (dB, + bump, - dip).",
+        "- after \"|\": bands that stand out from their neighbouring bands in the same track (dB, + bump, - dip). A bump right next to the track's high-pass or low-pass filter is usually only the filter's slope (the filter cuts the band next to it, so this band only looks raised); do not cut it for that reason alone.",
         "REGIONS: R n name start-end (seconds), the region's master numbers; after \"|\": master bands against the song average with the loudness difference removed (dB). Then the region's top tracks by share (same keys). \"R n also\" = every other track playing in region n, a = % of the region it plays; compare regions to see arrangement changes.",
         "mask: Hz ranges where 2 or more of these tracks each hold at least 25% of the energy; number = each track's % of all energy in the whole range (a narrow overlap looks small in a wide range). approx: these tracks' shares are approximate (their folder also receives sends).",
         "Differences under 1 dB are measurement noise. Width, correlation and balance are measured after pan. The LRA of a single region is naturally small (one section changes little in loudness); judge compression by crest, not by region LRA." .. (focus and table.concat({ "",
@@ -3799,14 +3819,21 @@ local function build_jsfx_prompt(block, yaml, focus, topic) -- focus (task 4f.7b
         "Routing and settings: folders (parent, flags: folder), sends (connections; sidechain = feeds a side-chain input; send volume 0 dB when omitted), faders (vol_db), pan, envelopes (auto), plugins in chain order. The master and the tracks named under REGIONS, with their folders, list full plugin settings. All other tracks list plugin names only (fx: \"A > B\"); when you need their settings, ask for \"DETAIL <track name>\" and I will send that track's full plugin settings, sends, automation and measurements per region. Settings with a common name start are grouped: band_1: {freq: 181} means the setting band_1_freq. A renamed plugin shows its original in brackets, e.g. Ducking Comp (ReaComp). \"params: same as plugin 3 on Lead Vox\" = exactly the settings of the 3rd plugin in Lead Vox's chain. Plugin values are shown as each plugin reports them; some plugins label units or on/off states wrongly (e.g. a reverb time of 2.5 ms that means 2.5 s), so judge by plausibility.",
         "",
         "=== INSTRUCTIONS ===",
-        "Answer with concrete changes, not a review. First the changes: at most 10, most important first. For each: what to do (track, plugin and parameter exactly as in the YAML, current value -> new value; or a new plugin with its settings; or a fader, pan or automation move), why (the problem in one sentence, with the measured number that shows it) and what to listen for. Then \"Already working\": up to 5 settings or choices that already help the mix, each with the number that shows it. Look for changes in these areas:",
-        "1. Dynamics: loudness, LRA and crest across the regions and tracks. For a compressor or limiter give the gain reduction to aim for (dB), never a threshold.",
-        "2. Low and mid balance: the track band bumps, the mask ranges and the master band deviations; give frequency, gain and Q.",
-        "3. Highs: tell \"harsh\" apart from \"sibilance\"; a de-esser or a dynamic EQ where needed.",
-        "4. Stereo and mono: W, c, the balance and sub!; phase or width problems and how to fix them.",
-        "5. Master: the chain gain, the final loudness and the peak.",
-        "6. Arrangement: two regions of the same kind that differ (e.g. Verse 1 and Verse 2): compare their track lines and also lines and say what changed.",
-        "Only advise on tracks that play in that region. Quote exact track, plugin and parameter names from the YAML. When the data does not support a claim, say so. Be honest and short, and say briefly why, so I learn.",
+        "Answer in three parts.",
+        "Part 1 \"Overview\": 3 to 5 short lines on what already works and 3 to 5 on the main problems, each with the measured number that shows it.",
+        "Part 2: one section per area below, in this order. In each: what the data shows (numbers, regions, tracks), the cause (which tracks and plugins), then the fixes. A fix = what to do (track, plugin and parameter exactly as in the YAML, current value -> new value; or a new plugin with its settings; or a fader, pan or automation move), why (with the number) and what to listen for. Name the settings that already work. In the band areas go band by band where a band shows something. An area with nothing to fix gets one line saying why.",
+        "1. Dynamics and loudness: loudness, LRA and crest across the regions and tracks, the build from verse to chorus. Do not judge compression by a region's LRA; use crest.",
+        "2. Low end (rumble, deepsub, sub, bass: 20-125 Hz): kick against bass, sub! and the mask ranges.",
+        "3. Low mids (body, mud, boxy: 125-500 Hz).",
+        "4. Mids (honk, nasal, bite: 500-2000 Hz).",
+        "5. Highs (presence, harsh, sibilance, sizzle, air: 2000-20000 Hz): tell \"harsh\" apart from \"sibilance\"; a de-esser or a dynamic EQ where needed.",
+        "In areas 2-5 use the track band bumps, the mask ranges and the master band deviations; give frequency, gain and Q. Before cutting a bump, check the track's high-pass and low-pass filters.",
+        "6. Stereo and mono: W, c, the balance and sub!; phase or width problems and how to fix them.",
+        "7. Arrangement: two regions of the same kind that differ (e.g. Verse 1 and Verse 2): compare their track lines and also lines and say what changed.",
+        "8. Master: the chain gain, the final loudness and the peak.",
+        "Part 3 \"To-do by priority\": a table of the fixes from part 2, biggest effect first, at most 12 rows: priority, track, plugin and parameter, change (current -> new), why (the number).",
+        "If the prompt ends with a FOCUS line, keep only the areas that matter for that focus. Do not write a FOCUS line yourself.",
+        "A setting inside a module or band that is switched off (Out, Off, bypassed, active: Off) has no effect. Never give a threshold (compressor, limiter, gate, de-esser or dynamic EQ band, also in a new plugin): the levels going into a plugin are not measured, so give the gain reduction or cut to aim for on the loud parts (dB) instead. Only advise on tracks that play in that region. Quote exact track, plugin and parameter names from the YAML. When the data does not support a claim, say so. Be honest and short, and say briefly why, so I learn.",
         "Write for a musician in plain studio words. The data keys above are for you only: never write s, L, pk, cr, a, W, c, pL/pR or sub! in your answer; say e.g. \"the kick plays 39% of the time\" or \"the bass makes up 21% of the mix\". Name bands with their Hz range, e.g. \"mud (200-315 Hz)\". Never compute values the data does not give (e.g. a share for a folder bus); say what is missing instead.",
         "",
         "=== MEASURED DATA ===",
@@ -4304,16 +4331,58 @@ local function draw_markdown_blocks(ctx, blocks, msg_id)
                         | reaper.ImGui_TableFlags_SizingFixedFit()
                         | reaper.ImGui_TableFlags_NoSavedSettings()
 
+            -- column widths, measured once per block: nat = longest cell, min = longest single word
+            if not block.nat then
+                block.nat, block.min = {}, {}
+                for c = 1, block.cols do block.nat[c], block.min[c] = 0, 0 end
+                for _, cells in ipairs(block.rows) do
+                    for c, cell in ipairs(cells) do
+                        if c <= block.cols then
+                            block.nat[c] = math.max(block.nat[c], (reaper.ImGui_CalcTextSize(ctx, cell)))
+                            for word in cell:gmatch("%S+") do
+                                block.min[c] = math.max(block.min[c], (reaper.ImGui_CalcTextSize(ctx, word)))
+                            end
+                        end
+                    end
+                end
+            end
+            -- too wide for the window: shrink every column in proportion (never below its longest word) and wrap the cells
+            local padx = reaper.ImGui_GetStyleVar(ctx, reaper.ImGui_StyleVar_CellPadding())
+            local avail = reaper.ImGui_GetContentRegionAvail(ctx) - block.cols * 2 * padx - (block.cols + 1) - 2
+            local widths, total = nil, 0
+            for c = 1, block.cols do total = total + block.nat[c] end
+            if total > avail then
+                widths = {}
+                local fixed, free, rest = {}, avail, total
+                for _ = 1, block.cols do -- a column that would fall below its longest word keeps that width; the rest share what is left
+                    local changed = false
+                    for c = 1, block.cols do
+                        if not fixed[c] and rest > 0 and block.nat[c] * free / rest < block.min[c] then
+                            fixed[c], changed = true, true
+                            free, rest = free - block.min[c], rest - block.nat[c]
+                        end
+                    end
+                    if not changed then break end
+                end
+                for c = 1, block.cols do
+                    widths[c] = (fixed[c] or rest <= 0) and block.min[c] or math.max(1, block.nat[c] * free / rest)
+                end
+            end
+
             local table_id = "MDTable_" .. tostring(msg_id or 0) .. "_" .. table_counter
             if reaper.ImGui_BeginTable(ctx, table_id, block.cols, flags) then
                 for c = 0, block.cols - 1 do
-                    reaper.ImGui_TableSetupColumn(ctx, "Col" .. c)
+                    if widths then
+                        reaper.ImGui_TableSetupColumn(ctx, "Col" .. c, reaper.ImGui_TableColumnFlags_WidthFixed(), widths[c + 1])
+                    else
+                        reaper.ImGui_TableSetupColumn(ctx, "Col" .. c)
+                    end
                 end
                 for _, cells in ipairs(block.rows) do
                     reaper.ImGui_TableNextRow(ctx)
                     for col_idx, cell in ipairs(cells) do
                         reaper.ImGui_TableSetColumnIndex(ctx, col_idx - 1)
-                        reaper.ImGui_Text(ctx, cell)
+                        if widths then reaper.ImGui_TextWrapped(ctx, cell) else reaper.ImGui_Text(ctx, cell) end
                     end
                 end
                 reaper.ImGui_EndTable(ctx)
@@ -5033,7 +5102,7 @@ local function main()
 
     local focus_idx = 1 -- task 4f.5: index into AI.FOCUS
     local model_idx = 0
-    local think = false
+    local think = true
     local pending = nil -- task 4f: the action to run after the frame delay (collect, send, follow-up)
 
     local scan_state = 0
@@ -5108,7 +5177,7 @@ local function main()
             reaper.ImGui_PopStyleVar(ctx, 1)
             reaper.ImGui_SameLine(ctx)
             if reaper.ImGui_Button(ctx, "Send Project Info to Agent", 0, bh) then
-                pending, AI.status = function() AI.send(model_idx + 1, think, focus_idx) end, "⏳ Waiting for DeepSeek..."
+                pending, AI.status = function() AI.send(model_idx + 1, think, focus_idx) end, "⏳ Waiting for DeepSeek (with Think on this can take a few minutes)..."
             end
             reaper.ImGui_SameLine(ctx)
             if reaper.ImGui_Button(ctx, "Copy Project Info", 0, bh) then -- the whole prompt with the focus line, for the web chat
@@ -5125,7 +5194,7 @@ local function main()
                 elseif reaper.ShowMessageBox(string.format("Send the detail of: %s?\n\nAbout %d tokens (sending this part costs about $%.3f now; the earlier chat is mostly cached).%s",
                     info.names, info.tokens, AI.cost(get_model_name(model_idx + 1), 0, info.tokens, 0),
                     #info.skipped > 0 and ("\n\nLeft out (not in the last Collect): " .. table.concat(info.skipped, ", ")) or ""), "Send Track Detail", 1) == 1 then
-                    pending, AI.status = function() AI.detail_send(model_idx + 1, think, text, info) end, "⏳ Waiting for DeepSeek..."
+                    pending, AI.status = function() AI.detail_send(model_idx + 1, think, text, info) end, "⏳ Waiting for DeepSeek (with Think on this can take a few minutes)..."
                 end
             end
             if reaper.ImGui_IsItemHovered(ctx) then
@@ -5261,7 +5330,7 @@ local function main()
                     table.insert(chat_history, { role = "user", content = chat_input_text })
                     chat_input_text = ""
                     scroll_to_bottom = true
-                    pending, AI.status = function() AI.ask(model_idx + 1, think) end, "⏳ Waiting for DeepSeek..."
+                    pending, AI.status = function() AI.ask(model_idx + 1, think) end, "⏳ Waiting for DeepSeek (with Think on this can take a few minutes)..."
                 end
             end
             if not can_send then reaper.ImGui_EndDisabled(ctx) end
