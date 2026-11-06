@@ -2147,7 +2147,7 @@ end
 local GMEM_NAME = "MixAssistant"
 local ANALYZER_FX_PATH = "JS:MixAssistant/mix_assistant_analyzer"
 -- gmem layout (must match the JSFX): header | per track-second records | master 100 ms blocks
-local MA_HDR, MA_MAXTR, MA_MAXSEC, MA_STRIDE, MA_MSTRIDE = 256, 128, 1800, 32, 36
+local MA_HDR, MA_MAXTR, MA_MAXSEC, MA_STRIDE, MA_MSTRIDE = 256, 128, 1800, 32, 45
 local MA_MBASE = MA_HDR + MA_MAXTR * MA_MAXSEC * MA_STRIDE
 -- Stage 3 short-window dynamics: thresholds are passed to the JSFX through header slots, so changing them needs no JSFX edit
 local MA_ACTIVE_DB, MA_CLIP_THRESHOLD = -60, 1.0 -- 100 ms sub-block is "active" above this stereo RMS (dBFS); clipped frame: |L| or |R| >= this
@@ -2166,6 +2166,7 @@ local B15_C = 0.6423
 -- Stage 4 (feeding the JSFX data to the AI): all constants in ONE table to spare top-level locals.
 local MA_A = {
     MIBASE = MA_MBASE + 18000 * MA_MSTRIDE, MISTRIDE = 4, -- master input records (JSFX role 2): K energy, count, run id, max |sample|
+    GMEM_SIZE = 8388608, -- task 5b: REAPER's gmem slots; the layout (MA_MAXSEC, MA_MAXTR, MA_MBASE, MIBASE) is set per run in collect_jsfx_data
     TOP_N = 6, NOTABLE_DB = 3, BAND_RANGE_DB = 30, REGION_DEV_DB = 3, MASK_SHARE = 0.25, MASK_PAN = 100,
     BACKDROP_N = 3, -- task 4f.7b: group focus, the loudest other tracks per focus region that get full lines (backdrop)
     COMP_MAIN_DB = 10, COMP_DB = 3, COMP_N = 3, -- task 4f.8: main bands within 10 dB of the loudest; competitor >= focus - 3 dB; 3 per range, 3 ranges
@@ -2230,10 +2231,10 @@ local MA_MAGIC = 20261103
 
 local ANALYZER_JSFX = [==[
 desc:Mix Assistant Analyzer (temp)
-//MA_JSFX_VERSION=4
+//MA_JSFX_VERSION=5
 options:gmem=MixAssistant
 
-slider1:0<0,127,1>Track index
+slider1:0<0,4095,1>Track index
 slider2:0<0,2,1{Track,Master,Master input}>Role
 slider3:0<0,1,1{Off,On}>Debug: Lua DSP check (master only)
 
@@ -2244,10 +2245,12 @@ out_pin:right output
 
 @init
 ext_noinit = 1; // keep the state when REAPER restarts the FX after a render (else the idle blocks look like a fresh run)
-MAGIC = 20261103; VERSION = 4;
+MAGIC = 20261103; VERSION = 5;
 HDR = 256; MAXTR = 128; MAXSEC = 1800; STRIDE = 32;
-MBASE = HDR + MAXTR * MAXSEC * STRIDE; MSTRIDE = 36;
-// master input records (role 2): 18000 blocks x 4 slots after the master blocks: K energy, count, run id, max |sample|
+// master block: 0-2 K energy/count/run, 3-32 mid+side bands, 33-35 LL/RR/LR, 36-38 sub-mono LL/RR/LR, 39-40 peak |L|/|R|, 41 clip frames
+MBASE = HDR + MAXTR * MAXSEC * STRIDE; MSTRIDE = 45;
+// master input records (role 2): MAXSEC x 10 blocks x 4 slots after the master blocks: K energy, count, run id, max |sample|
+// (task 5b: MAXSEC / MAXTR come from Lua per run, gmem[11] / gmem[12]; see @block)
 MIBASE = MBASE + 18000 * MSTRIDE; mipk = 0;
 gmem[0] = MAGIC; gmem[1] = VERSION;
 invsr = 1 / srate;
@@ -2342,11 +2345,14 @@ function put_track() global(idx,cur_sec,pkl,pkr,sll,srr,slr,ske,scnt,run,HDR,MAX
   );
   gmem[b+26] = pf; gmem[b+27] = clipc; gmem[b+28] = pa; gmem[b+29] = pk; gmem[b+30] = pe;
 );
-function put_master() global(cur_mb,mke,mcnt,run,MBASE,MSTRIDE,ACC,gmem) local(b,bi) (
+function put_master() global(cur_mb,mke,mcnt,run,MBASE,MSTRIDE,ACC,gmem,m_ll,m_rr,m_lr,m_sll,m_srr,m_slr,m_pl,m_pr,m_cl) local(b,bi) (
   b = MBASE + cur_mb * MSTRIDE;
   gmem[b] = mke; gmem[b+1] = mcnt; gmem[b+2] = run;
   bi = 0;
   loop(30, gmem[b+3+bi] = ACC[bi]; bi += 1;);
+  gmem[b+33] = m_ll; gmem[b+34] = m_rr; gmem[b+35] = m_lr;
+  gmem[b+36] = m_sll; gmem[b+37] = m_srr; gmem[b+38] = m_slr;
+  gmem[b+39] = m_pl; gmem[b+40] = m_pr; gmem[b+41] = m_cl;
 );
 function put_master_in() global(cur_mb,mke,mcnt,run,mipk,MIBASE,gmem) local(b) (
   b = MIBASE + cur_mb * 4;
@@ -2360,13 +2366,15 @@ dbg = slider3 | 0;
 
 @block
 run = gmem[9];
-ok = (role || ismin) ? 1 : (idx >= 0 && idx < MAXTR);
 t0 = play_position;
 run != last_run ? (
   last_run = run; cur_sec = -1; cur_mb = -1; exp_t = -1; reach = -1;
   cur_sb = -1; sbcnt = 0; sb_fe = 0; sb_ke = 0;
   sb_maxf = 0; sb_maxk = 0; sb_act = 0; sb_elig = 0; clipc = 0; mclipc = 0; mpeak = 0;
   act_thr = gmem[16]; clip_thr = gmem[17] > 0 ? gmem[17] : 1; mclip_thr = gmem[18] > 0 ? gmem[18] : 1;
+  // task 5b: the run's layout from Lua (seconds and track slots that fit in gmem); the @init values are only the fallback
+  MAXSEC = gmem[11] > 0 ? gmem[11] : 1800; MAXTR = gmem[12] > 0 ? gmem[12] : 128;
+  MBASE = HDR + MAXTR * MAXSEC * STRIDE; MIBASE = MBASE + MAXSEC * 10 * MSTRIDE;
   bq =gmem[185] > 0 ? gmem[185] : 0.6423;
   bi = 0;
   loop(15,
@@ -2417,13 +2425,14 @@ run != last_run ? (
 );
 // a block starting at the render start (gmem[7]) is accepted only before this run got 1 s past it: after the render, a stopped
 // project with the edit cursor at the start must not count as a new start (it overwrote the master peak with idle noise)
+ok = (role || ismin) ? 1 : (idx >= 0 && idx < MAXTR); // after the run-id change (task 5b: MAXTR comes with the run)
 synced = (exp_t >= 0 && abs(t0 - exp_t) < 0.004) || (abs(t0 - gmem[7]) < 0.05 && reach < gmem[7] + 1);
 exp_t = t0 + samplesblock * invsr;
 active = (gmem[6] == 1) && (run > 0) && ok && synced;
 active && t0 > reach ? reach = t0;
 n = 0;
 active ? (
-  role ? ( gmem[10] = run; ) : ( !ismin ? gmem[32 + idx] = run; );
+  role ? gmem[10] = run;
   gmem[2] = srate;
   role && dbg ? (
     gmem[192] = acN; gmem[193] = acPL; gmem[194] = acPR;
@@ -2457,13 +2466,19 @@ active ? (
         cur_mb >= 0 ? put_master();
         cur_mb = mb; mke = 0; mcnt = 0;
         memset(ACC, 0, 30);
+        m_ll = m_rr = m_lr = m_sll = m_srr = m_slr = m_pl = m_pr = m_cl = 0;
       );
       mke += ke; mcnt += 1;
-      sb_pk = max(abs(spl0), abs(spl1)); sb_pk > mpeak ? mpeak = sb_pk; sb_pk >= mclip_thr ? mclipc += 1;
+      sb_pk = max(abs(spl0), abs(spl1)); sb_pk > mpeak ? mpeak = sb_pk; sb_pk >= mclip_thr ? ( mclipc += 1; m_cl += 1; );
+      a = abs(spl0); a > m_pl ? m_pl = a;
+      a = abs(spl1); a > m_pr ? m_pr = a;
+      m_ll += spl0 * spl0; m_rr += spl1 * spl1; m_lr += spl0 * spl1;
       !skip ? (
         mdx = (spl0 + spl1) * 0.5; sdx = (spl0 - spl1) * 0.5;
         bandrun(mdx, STM, ACC);
         bandrun(sdx, STS, ACC + 15);
+        ylp = lpl.lp4(spl0); yrp = lpr.lp4(spl1);
+        m_sll += ylp * ylp; m_srr += yrp * yrp; m_slr += ylp * yrp;
       );
       dbg && t >= dw0 && t < dw1 ? (
         xl = spl0; xr = spl1;
@@ -2618,7 +2633,8 @@ end
 --- Picks the qualifying tracks, then adds one phantom track per chosen track (post-fader send from the original, main send off, the
 -- analyzer on the phantom) and the analyzers on the master. List entries: idx and name of the original, slot = gmem record index.
 -- Returns list, skipped count | nil, error.
-local function inject_analyzers(debug_on)
+-- Task 5b: max_tr = how many track slots fit in gmem at this project length; more chosen tracks: nil, nil, message (nothing changed yet).
+local function inject_analyzers(debug_on, max_tr)
     local num_tracks = reaper.CountTracks(0)
     local has_children = {}
     for i = 0, num_tracks - 1 do
@@ -2631,11 +2647,18 @@ local function inject_analyzers(debug_on)
     -- 1. choose the tracks first, while no send of ours exists yet
     for i = 0, num_tracks - 1 do
         local track = reaper.GetTrack(0, i)
-        if #list >= MA_MAXTR or not should_analyze(track, has_children, memo) then
+        if not should_analyze(track, has_children, memo) then
             skipped = skipped + 1
         else
             list[#list + 1] = { idx = i, name = get_track_identity(track), slot = #list, track = track }
         end
+    end
+    if #list > max_tr then
+        reaper.PreventUIRefresh(-1)
+        local len = reaper.GetProjectLength(0)
+        local fit_s = math.floor((MA_A.GMEM_SIZE - MA_HDR) / (#list * MA_STRIDE + 10 * (MA_MSTRIDE + MA_A.MISTRIDE))) - 2
+        return nil, nil, string.format("This project is too big for the analyzer memory: %d tracks to measure x %.0f s. At this length up to %d tracks fit; with %d tracks up to %.1f min. Shorten the project or mute / remove tracks, then try again. Nothing was changed.",
+            #list, len, math.max(max_tr, 0), #list, math.max(fit_s, 0) / 60)
     end
     -- 2. one phantom per chosen track, appended at the end of the project (the original track numbers do not change)
     local clock = reaper.time_precise
@@ -2867,12 +2890,15 @@ local function summarize_master(max_sec, run_id, blk0, blk1, input)
     local base, stride = MA_MBASE, MA_MSTRIDE
     if input then base, stride = MA_A.MIBASE, MA_A.MISTRIDE end
     local in_peak = 0
-    local nblk = math.min(18000, max_sec * 10)
+    local nblk = math.min(MA_MAXSEC * 10, max_sec * 10)
     blk0 = blk0 or 0
     blk1 = blk1 and math.min(blk1, nblk - 1) or nblk - 1
     local pe, pc, pv = { [0] = 0 }, { [0] = 0 }, { [0] = 0 }
     local mid_e, side_e = {}, {} -- summed band energies of the valid blocks
     for i = 1, 15 do mid_e[i], side_e[i] = 0, 0 end
+    -- task 5a: stereo sums (slots 33-38: LL, RR, LR, sub-mono LL, RR, LR), peaks |L| / |R| (39-40, max), clip frames (41)
+    local st = { 0, 0, 0, 0, 0, 0 }
+    local pkl, pkr, clips = 0, 0, 0
     for k = 0, nblk - 1 do
         local b = base + k * stride
         local ok = reaper.gmem_read(b + 2) == run_id
@@ -2884,6 +2910,9 @@ local function summarize_master(max_sec, run_id, blk0, blk1, input)
                     mid_e[i] = mid_e[i] + reaper.gmem_read(b + 2 + i)
                     side_e[i] = side_e[i] + reaper.gmem_read(b + 17 + i)
                 end
+                for i = 1, 6 do st[i] = st[i] + reaper.gmem_read(b + 32 + i) end
+                pkl, pkr = math.max(pkl, reaper.gmem_read(b + 39)), math.max(pkr, reaper.gmem_read(b + 40))
+                clips = clips + reaper.gmem_read(b + 41)
             end
         end
         pe[k + 1] = pe[k] + (ok and reaper.gmem_read(b) or 0)
@@ -2938,7 +2967,28 @@ local function summarize_master(max_sec, run_id, blk0, blk1, input)
         if n2 > 0 then integrated = lufs(sum2 / n2) end
     end
     return { valid_blocks = pv[blk1 + 1] - pv[blk0], integrated = integrated, max_m = max_m, max_s = max_s,
-        samples = pc[blk1 + 1] - pc[blk0], mid = mid_e, side = side_e, ke = pe[blk1 + 1] - pe[blk0], lra = lra, peak = in_peak }
+        samples = pc[blk1 + 1] - pc[blk0], mid = mid_e, side = side_e, ke = pe[blk1 + 1] - pe[blk0], lra = lra, peak = in_peak,
+        ll = st[1], rr = st[2], lr = st[3], sub_ll = st[4], sub_rr = st[5], sub_lr = st[6], pkl = pkl, pkr = pkr, clips = clips }
+end
+
+--- Task 5a: stereo and level values of a summarize_master result m (same formulas as the tracks in collect_region_data).
+-- fader_db: the master fader (the analyzer sits before it). Returns { corr, sub_corr, sub_risk, pan100, width, pk, rms, crest }.
+function MA_A.mstereo(m, fader_db)
+    local n = math.max(m.samples, 1)
+    local r = {}
+    r.corr = (m.ll * m.rr > 0) and m.lr / math.sqrt(m.ll * m.rr) or 1
+    r.sub_corr = (m.sub_ll * m.sub_rr > 0) and m.sub_lr / math.sqrt(m.sub_ll * m.sub_rr) or 1
+    r.sub_risk = convert_energy_to_db((m.sub_ll + m.sub_rr) / 2, n) > -50.0 and r.sub_corr < 0
+    local pw = m.ll + m.rr
+    local p = pw > 0 and 100 * (m.rr - m.ll) / pw or 0
+    r.pan100 = p >= 0 and math.floor(p + 0.5) or -math.floor(-p + 0.5)
+    local rm = math.sqrt(math.max((m.ll + m.rr + 2 * m.lr) / 4, 0))
+    local rs = math.sqrt(math.max((m.ll + m.rr - 2 * m.lr) / 4, 0))
+    r.width = (rm + rs) > 0 and 100 * rs / (rm + rs) or 0
+    r.pk = level_db(math.max(m.pkl, m.pkr)) + fader_db
+    r.rms = level_db(math.sqrt(pw / (2 * n))) + fader_db
+    r.crest = r.pk - r.rms
+    return r
 end
 
 -- ------------------------------------------------------------------------------
@@ -3967,8 +4017,17 @@ local function collect_jsfx_data(compare)
 
         reaper.gmem_write(162, SUB_MONO_CUTOFF_HZ)
         reaper.gmem_write(185, B15_C)
-        local tracks, skipped, inject_err = inject_analyzers(compare)
+        -- task 5b: the layout follows the project: seconds = length + 2 s, then as many track slots as fit (header, tracks, master, master input)
+        local nsec = math.ceil(reaper.GetProjectLength(0)) + 2
+        local max_tr = math.min(4096, math.floor((MA_A.GMEM_SIZE - MA_HDR - nsec * 10 * (MA_MSTRIDE + MA_A.MISTRIDE)) / (nsec * MA_STRIDE)))
+        local tracks, skipped, inject_err = inject_analyzers(compare, max_tr)
         if not tracks then error(inject_err, 0) end
+        MA_MAXSEC, MA_MAXTR = nsec, math.max(#tracks, 1)
+        MA_MBASE = MA_HDR + MA_MAXTR * MA_MAXSEC * MA_STRIDE
+        MA_A.MIBASE = MA_MBASE + MA_MAXSEC * 10 * MA_MSTRIDE
+        out[#out + 1] = string.format("Analyzer memory: %d track slots x %d s, %d of %d gmem slots used (%.1f%%; at this length up to %d tracks fit)",
+            MA_MAXTR, MA_MAXSEC, MA_A.MIBASE + MA_MAXSEC * 10 * MA_A.MISTRIDE, MA_A.GMEM_SIZE,
+            100 * (MA_A.MIBASE + MA_MAXSEC * 10 * MA_A.MISTRIDE) / MA_A.GMEM_SIZE, max_tr)
         out[#out + 1] = string.format("Analyzers: %d phantom tracks + master (%d tracks skipped)", #tracks, skipped)
         local tm = tracks.timing
         out[#out + 1] = string.format("Setup time %.1f s (inserting the phantom tracks %.1f s, copying the first phantom's chunk / naming + main send off %.1f s, hiding %.1f s, creating the sends %.1f s, analyzers %.1f s, master %.1f s, final check %.1f s; phantoms the check had to repair: %d of %d)",
@@ -3998,6 +4057,8 @@ local function collect_jsfx_data(compare)
         reaper.gmem_write(MA_H_MCLIPS, 0)
         reaper.gmem_write(MA_H_MSTAMP, 0)
         reaper.gmem_write(MA_H_MPEAK, 0)
+        reaper.gmem_write(11, MA_MAXSEC) -- task 5b: the run's layout, read by the JSFX on the run-id change
+        reaper.gmem_write(12, MA_MAXTR)
 		reaper.gmem_write(9, run_id)
         reaper.gmem_write(7, 0)
         reaper.gmem_write(6, 1)
@@ -4104,7 +4165,7 @@ local function collect_jsfx_data(compare)
         end
         -- Stage 3: max 100 ms K level (blocks with at least half of 100 ms), master peak/clips from the header slots
         local max_100 = -144.0
-        for k = 0, math.min(18000, max_sec * 10) - 1 do
+        for k = 0, math.min(MA_MAXSEC * 10, max_sec * 10) - 1 do
             local b = MA_MBASE + k * MA_MSTRIDE
             local cnt = reaper.gmem_read(b + 1)
             if reaper.gmem_read(b + 2) == run_id and cnt >= 0.05 * jsfx_sr then
@@ -4122,9 +4183,29 @@ local function collect_jsfx_data(compare)
                 sline = sline .. string.format("%6.1f", convert_energy_to_db(m.side[b], m.samples, offsets[b]))
             end
             out[#out + 1] = hdr .. "\n" .. mline .. "\n" .. sline
+            -- task 5a: the new per-block master values (report only; the prompt uses them from task 5d)
+            local x = MA_A.mstereo(m, master_fader)
+            local pk_ok = stamped and math.abs(math.max(m.pkl, m.pkr) - reaper.gmem_read(MA_H_MPEAK)) < 1e-12
+            local cl_ok = stamped and m.clips == reaper.gmem_read(MA_H_MCLIPS)
+            out[#out + 1] = string.format("  stereo: corr %.3f | sub corr %.3f%s | balance %+d (+ = right) | width %.1f (broadband) | rms %.1f dBFS | crest %.1f dB | clips %d",
+                x.corr, x.sub_corr, x.sub_risk and " sub!" or "", x.pan100, x.width, x.rms, x.crest, m.clips)
+            out[#out + 1] = string.format("self-check (5a): highest block peak = song peak: %s | block clips add up to the song clips: %s",
+                pk_ok and "yes" or "NO", cl_ok and "yes" or "NO")
         end
 
-        if not compare then data_block, named, coll = print_region_summary(out, tracks, max_sec, run_id, offsets) end
+        if not compare then
+            data_block, named, coll = print_region_summary(out, tracks, max_sec, run_id, offsets)
+            if coll then -- task 5a: the new master values per region
+                out[#out + 1] = "\nMASTER PER REGION (task 5a, report only): corr | sub corr | balance | width (broadband / bands) | peak | rms | crest | clips"
+                for i, reg in ipairs(coll.regions) do
+                    if reg.mr then
+                        local x = MA_A.mstereo(reg.mr, master_fader)
+                        out[#out + 1] = string.format("  R%d %-16s corr %.3f | sub %.3f%s | bal %+d | W %.1f / %.1f | pk %.1f | rms %.1f | crest %.1f | clips %d",
+                            i, reg.name:sub(1, 16), x.corr, x.sub_corr, x.sub_risk and " sub!" or "", x.pan100, x.width, reg.width or 0, x.pk, x.rms, x.crest, reg.mr.clips)
+                    end
+                end
+            end
+        end
 
         if compare then
             local lua_m = analyze_region(find_new_tracks(old_guids), region, DEBUG_DURATION)
@@ -4987,9 +5068,13 @@ function AI.detail_text()
     local S, D, KEYS = c.snap, c.D, MA_A.KEYS
     local f1, _, i0, c2, nm, _, pan_label, devs = MA_A.fmt()
     local only, skipped, names, any = {}, {}, {}, false
+    -- matched by GUID (task 5b fix): REAPER can reuse a deleted track's pointer for a new track
+    local by_guid = {}
+    for _, st in ipairs(S.list) do by_guid[S.guid[st]] = st end
     for k = 0, reaper.CountSelectedTracks(0) - 1 do
         local tr = reaper.GetSelectedTrack(0, k)
-        if S.td[tr] then only[tr], any = true, true else
+        local st = by_guid[reaper.GetTrackGUID(tr)]
+        if st then only[st], any = true, true else
             local _, n = reaper.GetTrackName(tr)
             skipped[#skipped + 1] = n
         end
@@ -5101,7 +5186,7 @@ local function main()
     -- =========================================================
 
     local focus_idx = 1 -- task 4f.5: index into AI.FOCUS
-    local model_idx = 0
+    local model_idx = 1 -- DeepSeek Flash by default (4h: about a third of Pro's price, same quality range)
     local think = true
     local pending = nil -- task 4f: the action to run after the frame delay (collect, send, follow-up)
 
