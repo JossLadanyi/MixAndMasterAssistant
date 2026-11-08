@@ -2177,7 +2177,7 @@ local B15_C = 0.6423
 local MA_A = {
     MIBASE = MA_MBASE + 18000 * MA_MSTRIDE, MISTRIDE = 4, -- master input records (JSFX role 2): K energy, count, run id, max |sample|
     GMEM_SIZE = 8388608, -- task 5b: REAPER's gmem slots; the layout (MA_MAXSEC, MA_MAXTR, MA_MBASE, MIBASE) is set per run in collect_jsfx_data
-    TOP_N = 6, NOTABLE_DB = 3, BAND_RANGE_DB = 30, REGION_DEV_DB = 3, MASK_SHARE = 0.25, MASK_PAN = 100,
+    TOP_N = 6, NOTABLE_DB = 3, BAND_RANGE_DB = 30, REGION_DEV_DB = 3, MASK_SHARE = 0.25, MASK_PAN = 100, MASK_OVERLAP = 25,
     BACKDROP_N = 3, -- task 4f.7b: group focus, the loudest other tracks per focus region that get full lines (backdrop)
     COMP_MAIN_DB = 10, COMP_DB = 3, COMP_N = 3, -- task 4f.8: main bands within 10 dB of the loudest; competitor >= focus - 3 dB; 3 per range, 3 ranges
     -- task 4f.10: band topics keep tracks with >= TOPIC_PCT of the range energy in a region; Master & Loudness region lines: loudest first
@@ -3283,31 +3283,10 @@ local function collect_region_data(tracks, route, max_sec, run_id, offsets)
                 table.sort(cand, function(a, b) return a.share > b.share end)
                 for i = 1, math.min(MA_A.TOP_N, #cand) do reg.sel[i] = cand[i] end
 
-                -- Masking: a band where 2+ selected tracks each hold >= MASK_SHARE of the band energy of all non-bus tracks together
-                -- and are not on opposite sides
+                -- Masking: see MA_A.mask_band (task 5e: only over the seconds the tracks play together)
                 for b = 1, 15 do
-                    local den = 0
-                    for _, d in ipairs(reg.all) do
-                        if d.r.role ~= "bus" then den = den + d.s.bands[b] * d.gain_lin end
-                    end
-                    if den > 0 then
-                        local c = {}
-                        for _, d in ipairs(reg.sel) do
-                            local sh = d.s.bands[b] * d.gain_lin / den
-                            if sh >= MA_A.MASK_SHARE then c[#c + 1] = { d = d, sh = sh } end
-                        end
-                        local inc, list = {}, {}
-                        for i = 1, #c do
-                            for j = i + 1, #c do
-                                if math.abs(c[i].d.pan100 - c[j].d.pan100) <= MA_A.MASK_PAN then inc[i], inc[j] = true, true end
-                            end
-                        end
-                        for i = 1, #c do if inc[i] then list[#list + 1] = c[i] end end
-                        if #list >= 2 then
-                            table.sort(list, function(x, y) return x.sh > y.sh end)
-                            reg.mask[#reg.mask + 1] = { band = b, list = list, cen = den * 10 ^ (offsets[b] / 10) } -- cen: calibrated band energy of all non-bus tracks (weight when a merged range's shares are combined)
-                        end
-                    end
+                    local list, cen = MA_A.mask_band(D, reg, b, reg.sel)
+                    if list then reg.mask[#reg.mask + 1] = { band = b, list = list, cen = cen } end
                 end
                 for _, d in ipairs(reg.sel) do
                     if #d.reasons > 0 then reg.approx[#reg.approx + 1] = d end
@@ -3317,6 +3296,83 @@ local function collect_region_data(tracks, route, max_sec, run_id, offsets)
     end
     D.check = { weights = total_w, gaps = proj_len - covered, n_na = n_na }
     return D
+end
+
+--- Task 5e: masking in band b of a region among the tracks of pool. A pair counts when it is not on opposite sides, plays together for at
+--- least MASK_OVERLAP % of the shorter track's playing seconds, and over those seconds each holds >= MASK_SHARE of the band energy of all
+--- non-bus tracks. Returns the tracks of the counting pairs { d, sh } (loudest first; sh = the track's largest share in such a pair, so never
+--- under MASK_SHARE) and cen (the calibrated band energy over the seconds of those pairs: the weight when a merged range's shares are combined), or nil.
+function MA_A.mask_band(D, reg, b, pool)
+    local A, P = MA_A, D.ps
+    local s0, s1 = math.floor(reg.start_s + 1e-9), math.ceil(reg.end_s - 1e-9)
+    local w, tot = {}, {}
+    for sec = s0, s1 - 1 do
+        w[sec] = math.max(0, math.min(1, math.min(sec + 1, reg.end_s) - math.max(sec, reg.start_s)))
+        tot[sec] = 0
+    end
+    for _, d in ipairs(reg.all) do
+        local p = P[d.t.idx]
+        if p and d.r.role ~= "bus" then
+            for sec = s0, s1 - 1 do tot[sec] = tot[sec] + (p[sec * 18 + 1 + b] or 0) * d.gain_lin end
+        end
+    end
+    local function total(g)
+        local s = 0
+        for sec = s0, s1 - 1 do
+            if g[sec] then s = s + tot[sec] * g[sec] end
+        end
+        return s
+    end
+    local function energy(d, g)
+        local p, s = P[d.t.idx], 0
+        if not p then return 0 end
+        for sec = s0, s1 - 1 do
+            if g[sec] then s = s + (p[sec * 18 + 1 + b] or 0) * g[sec] end
+        end
+        return s * d.gain_lin
+    end
+    -- the seconds each track plays (the act rule per second, as in the compete lines)
+    local on, time = {}, {}
+    for _, d in ipairs(pool) do
+        local p, o, t = P[d.t.idx], {}, 0
+        for sec = s0, s1 - 1 do
+            local k = sec * 18
+            if p and (p[k + 18] or 0) > 0 and 100 * p[k + 17] / p[k + 18] >= A.ACTIVE_MIN_PCT then
+                o[sec] = true
+                t = t + w[sec]
+            end
+        end
+        on[d], time[d] = o, t
+    end
+    local inc, union = {}, {}
+    for x = 1, #pool do
+        for y = x + 1, #pool do
+            local a, c = pool[x], pool[y]
+            if math.abs(a.pan100 - c.pan100) <= A.MASK_PAN then
+                local g, both = {}, 0
+                for sec = s0, s1 - 1 do
+                    if on[a][sec] and on[c][sec] then g[sec] = w[sec]; both = both + w[sec] end
+                end
+                local short = math.min(time[a], time[c])
+                if short > 0 and 100 * both / short >= A.MASK_OVERLAP then
+                    local den = total(g)
+                    local sa, sc = den > 0 and energy(a, g) / den or 0, den > 0 and energy(c, g) / den or 0
+                    if sa >= A.MASK_SHARE and sc >= A.MASK_SHARE then
+                        inc[a], inc[c] = math.max(inc[a] or 0, sa), math.max(inc[c] or 0, sc)
+                        for sec, wt in pairs(g) do union[sec] = wt end
+                    end
+                end
+            end
+        end
+    end
+    local den = total(union)
+    if not next(inc) or den <= 0 then return nil end
+    local list = {}
+    for _, d in ipairs(pool) do
+        if inc[d] then list[#list + 1] = { d = d, sh = inc[d] } end
+    end
+    table.sort(list, function(x, y) return x.sh > y.sh end)
+    return list, den * 10 ^ (D.offsets[b] / 10)
 end
 
 --- Task 4f.6: number and text helpers shared by the report (print_region_summary) and the data block (build_data_block)
@@ -3658,27 +3714,8 @@ local function build_data_block(D, focus, fs)
                     table.sort(c, function(a, b) return rs[a] > rs[b] end)
                     for _, d in ipairs(c) do if rs[d] >= MA_A.TOPIC_PCT then lines[#lines + 1] = d end end
                     for b = bl, bh do
-                        local den = 0
-                        for _, d in ipairs(reg.all) do
-                            if d.r.role ~= "bus" then den = den + d.s.bands[b] * d.gain_lin end
-                        end
-                        if den > 0 then
-                            local cc, inc, list = {}, {}, {}
-                            for _, d in ipairs(c) do
-                                local sh = d.s.bands[b] * d.gain_lin / den
-                                if sh >= MA_A.MASK_SHARE then cc[#cc + 1] = { d = d, sh = sh } end
-                            end
-                            for x = 1, #cc do
-                                for y = x + 1, #cc do
-                                    if math.abs(cc[x].d.pan100 - cc[y].d.pan100) <= MA_A.MASK_PAN then inc[x], inc[y] = true, true end
-                                end
-                            end
-                            for x = 1, #cc do if inc[x] then list[#list + 1] = cc[x] end end
-                            if #list >= 2 then
-                                table.sort(list, function(x, y) return x.sh > y.sh end)
-                                mreg.mask[#mreg.mask + 1] = { band = b, list = list, cen = den * 10 ^ (D.offsets[b] / 10) }
-                            end
-                        end
+                        local list, cen = MA_A.mask_band(D, reg, b, lines) -- task 5e: only the listed tracks; a brief track off the list can top a quiet band in its few seconds
+                        if list then mreg.mask[#mreg.mask + 1] = { band = b, list = list, cen = cen } end
                     end
                 else
                     table.sort(c, function(a, b) return a.share > b.share end)
@@ -3849,7 +3886,7 @@ local function build_jsfx_prompt(block, yaml, focus, topic) -- focus (task 4f.7b
             local r = string.format("%g-%g Hz", B15_EDGES[topic.lo], B15_EDGES[topic.hi + 1])
             t = { "- Only tracks with at least " .. A.TOPIC_PCT .. "% of the " .. r .. " energy in some region. Band data (SONG mid / side, bumps, region deviations) only inside " .. r .. ".",
                 "- rs = % of the " .. r .. " energy (all counted tracks add up to 100; s stays the share of the whole mix); levels = the track's band levels in that range (dB).",
-                "- REGIONS: every track with rs " .. A.TOPIC_PCT .. " or more there, highest rs first; no \"also\" line; mask = the same rule over every playing track, inside the range only.",
+                "- REGIONS: every track with rs " .. A.TOPIC_PCT .. " or more there, highest rs first; no \"also\" line; mask = the same rule over these tracks, inside the range only.",
                 "- YAML: tracks left out of the data show only name, parent and flags." }
         elseif topic.tp == "stereo" then
             t = { "- Band data left out (bumps, region band deviations, mask lines); the SONG line keeps the master mid and side bands." }
@@ -3876,7 +3913,7 @@ local function build_jsfx_prompt(block, yaml, focus, topic) -- focus (task 4f.7b
         "- after \"|\": bands that stand out from their neighbouring bands in the same track (dB, + bump, - dip). A bump right next to the track's high-pass or low-pass filter is usually only the filter's slope (the filter cuts the band next to it, so this band only looks raised); do not cut it for that reason alone.",
         "REGIONS: R n name start-end (seconds), the region's master numbers; after \"|\": master bands against the song average with the loudness difference removed (dB). Then the region's top tracks by share (same keys). \"R n also\" = every other track playing in region n, a = % of the region it plays; compare regions to see arrangement changes.",
         "On a region's master numbers, c, pL/pR, sub! and clip appear only when notable (c below 0, balance " .. MA_A.M_BAL_MIN .. " or more); none shown = normal.",
-        "mask: Hz ranges where 2 or more of these tracks each hold at least 25% of the energy; number = each track's % of all energy in the whole range (a narrow overlap looks small in a wide range). approx: these tracks' shares are approximate (their folder also receives sends).",
+        "mask: Hz ranges where 2 or more of these tracks each hold at least 25% of the energy, measured over the seconds they play together; number = each track's % of all energy in the whole range (a narrow overlap looks small in a wide range). approx: these tracks' shares are approximate (their folder also receives sends).",
         "Differences under 1 dB are measurement noise. Width, correlation and balance are measured after pan. The LRA of a single region is naturally small (one section changes little in loudness); judge compression by crest, not by region LRA." .. (focus and table.concat({ "",
             "FOCUS DATA (see FOCUS at the end):",
             "- TRACKS: focus tracks and returns also show clip n, prepk = sample peak before their own fader (dB) and \"levels\" = all 15 band levels (dB). Tracks that never play while a focus track plays are left out.",
