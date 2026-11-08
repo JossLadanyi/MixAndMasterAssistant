@@ -2186,6 +2186,7 @@ local MA_A = {
     -- task 4f.9: automation points: at most AUTO_MAX per envelope; tolerances 0.5 dB volume, 2% pan/width, 1% of a plugin parameter's range
     AUTO_MAX = 200, AUTO_TOL_DB = 0.5, AUTO_TOL_PCT = 2, AUTO_TOL_FX_PCT = 1, AUTO_FLOOR_DB = -90,
     ACTIVE_MIN_PCT = 5, TOKEN_CEILING = 8000, MIN_SHARE = 1, -- MIN_SHARE: region track lines below this share (%) are left out of the data block
+    M_CORR_MAX = -0.005, M_BAL_MIN = 12, -- task 5d: a region's master c shows below this (rounds to under 0), its balance from this (about 1 dB between the sides)
     KEYS = { "rumble", "deepsub", "sub", "bass", "body", "mud", "boxy", "honk", "nasal", "bite", "presence", "harsh", "sibilance", "sizzle", "air" },
     -- Task 4f: DeepSeek peak prices, USD per 1M tokens { cache hit, cache miss, output } (api-docs.deepseek.com, 2026-11-04);
     -- off-peak = half. Peak hours (UTC, Mon-Fri, not Chinese holidays): 01:00-04:00 and 06:00-10:00.
@@ -3484,17 +3485,25 @@ local function build_data_block(D, focus, fs)
         end
     end
     draft[#draft + 1] = "REGIONS"
+    local function mnotable(mr) -- task 5d: a region's master stereo values and clips, only when they say something
+        local x, s = MA_A.mstereo(mr, 0), ""
+        if x.corr < MA_A.M_CORR_MAX then s = s .. " c" .. c2(x.corr) end
+        if math.abs(x.pan100) >= MA_A.M_BAL_MIN then s = s .. " " .. pan_label(x.pan100) end
+        if x.sub_risk and bl == 1 then s = s .. " sub!" end
+        if mr.clips > 0 then s = s .. string.format(" clip%.0f", mr.clips) end
+        return s
+    end
     for i, reg in ipairs(D.regions) do
         if reg.na or not reg.mr then
             draft[#draft + 1] = string.format("R%d %s %s-%s | n/a", i, nm(reg.name), f1(reg.start_s), f1(reg.end_s))
         elseif fs and not freg[i] then -- task 4f.7b: the header only
             local mr = reg.mr
-            draft[#draft + 1] = string.format("R%d %s %s-%s | I%s M%s S%s LRA%s W%s | no focus track plays", i, nm(reg.name), f1(reg.start_s),
-                f1(reg.end_s), f1(mr.integrated), f1(mr.max_m), f1(mr.max_s), f1(mr.lra), i0(reg.width))
+            draft[#draft + 1] = string.format("R%d %s %s-%s | I%s M%s S%s LRA%s W%s%s | no focus track plays", i, nm(reg.name), f1(reg.start_s),
+                f1(reg.end_s), f1(mr.integrated), f1(mr.max_m), f1(mr.max_s), f1(mr.lra), i0(reg.width), mnotable(mr))
         else
             local mr, rd = reg.mr, devs_in(reg.dev)
-            draft[#draft + 1] = string.format("R%d %s %s-%s | I%s M%s S%s LRA%s W%s%s", i, nm(reg.name), f1(reg.start_s), f1(reg.end_s),
-                f1(mr.integrated), f1(mr.max_m), f1(mr.max_s), f1(mr.lra), i0(reg.width),
+            draft[#draft + 1] = string.format("R%d %s %s-%s | I%s M%s S%s LRA%s W%s%s%s", i, nm(reg.name), f1(reg.start_s), f1(reg.end_s),
+                f1(mr.integrated), f1(mr.max_m), f1(mr.max_s), f1(mr.lra), i0(reg.width), mnotable(mr),
                 #rd > 0 and (" | " .. devs(rd, true)) or "")
             local rc = chain(reg.mi, mr)
             if rc then draft[#draft + 1] = " " .. rc end
@@ -3866,6 +3875,7 @@ local function build_jsfx_prompt(block, yaml, focus, topic) -- focus (task 4f.7b
         "- W = width (0 mono, about 50 wide and uncorrelated, above 50 more side than mid), c = left/right correlation (1 mono, 0 unrelated, below 0 out of phase), pC / pL n / pR n = measured balance (0-100 towards that side), sub! = out of phase below 120 Hz (cancels in mono), clip n = clipped samples.",
         "- after \"|\": bands that stand out from their neighbouring bands in the same track (dB, + bump, - dip). A bump right next to the track's high-pass or low-pass filter is usually only the filter's slope (the filter cuts the band next to it, so this band only looks raised); do not cut it for that reason alone.",
         "REGIONS: R n name start-end (seconds), the region's master numbers; after \"|\": master bands against the song average with the loudness difference removed (dB). Then the region's top tracks by share (same keys). \"R n also\" = every other track playing in region n, a = % of the region it plays; compare regions to see arrangement changes.",
+        "On a region's master numbers, c, pL/pR, sub! and clip appear only when notable (c below 0, balance " .. MA_A.M_BAL_MIN .. " or more); none shown = normal.",
         "mask: Hz ranges where 2 or more of these tracks each hold at least 25% of the energy; number = each track's % of all energy in the whole range (a narrow overlap looks small in a wide range). approx: these tracks' shares are approximate (their folder also receives sends).",
         "Differences under 1 dB are measurement noise. Width, correlation and balance are measured after pan. The LRA of a single region is naturally small (one section changes little in loudness); judge compression by crest, not by region LRA." .. (focus and table.concat({ "",
             "FOCUS DATA (see FOCUS at the end):",
