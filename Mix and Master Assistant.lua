@@ -18,8 +18,6 @@
 --    settings to drop from the YAML (fewer tokens).
 -- Limit: tracks x song length must fit in the analyzer memory (e.g. 128 tracks for about
 -- 30 min, 49 tracks for about 68 min); Collect says so before changing anything.
--- The old scan (ghost render, 9-band Lua DSP, mix state manager) is still in this file but
--- not reachable from the window; it is deleted in a later version.
 -- ==============================================================================
 -- 1. What Needs to Be Installed
 -- - REAPER (v6 or above),
@@ -58,17 +56,6 @@ end)()
 
 -- Maximum plugin parameters to capture per effect (Balances precision vs tokens)
 local MAX_PLUGIN_PARAMS = 128
-
--- DSP Sample Rate
-local SAMPLE_RATE = 44100
-
--- Sub-Mono check: everything below this frequency (24 dB/oct low-pass) must be mono-compatible
-local SUB_MONO_CUTOFF_HZ = 120
-
--- Tonal bands have different widths (see section 7). When true, each band level is reported as the level of a
--- 1-octave-wide band (dBFS), so the narrow 6k/8k/12k bands stay directly comparable with the wider bands below them.
--- Set to false for the raw band-limited RMS level of each band.
-local NORMALIZE_BANDS_TO_OCTAVE = true
 
 -- Default plugin property expectations for boilerplate suppression
 local DEFAULT_SETTINGS = {
@@ -341,7 +328,7 @@ local function get_arrangement_markers()
     return #arrangement > 0 and arrangement or nil
 end
 
-local function get_all_connections(compact, keep, ptrs) -- compact (task 4e): keep only the "sidechain" label (the other purposes were guesses); keep (task 4f.7b): only sends from or to these tracks; ptrs (task 4g.3): ptrs[conn] = { source, destination track }
+local function get_all_connections(keep, ptrs) -- only the "sidechain" label is kept (task 4e: the other purposes were guesses); keep (task 4f.7b): only sends from or to these tracks; ptrs (task 4g.3): ptrs[conn] = { source, destination track }
     local connections = {}
     local num_tracks = reaper.CountTracks(0)
     local track_lookup = {}
@@ -353,7 +340,6 @@ local function get_all_connections(compact, keep, ptrs) -- compact (task 4e): ke
 
     for i = 0, num_tracks - 1 do
         local src_track = reaper.GetTrack(0, i)
-        local main_send = reaper.GetMediaTrackInfo_Value(src_track, "B_MAINSEND")
 
         for s = 0, reaper.GetTrackNumSends(src_track, 0) - 1 do
             local dest_track = reaper.GetTrackSendInfo_Value(src_track, 0, s, "P_DESTTRACK")
@@ -366,15 +352,7 @@ local function get_all_connections(compact, keep, ptrs) -- compact (task 4e): ke
                 local mono = (dst_chan & 1024) ~= 0 or (math.floor(reaper.GetTrackSendInfo_Value(src_track, 0, s, "I_SRCCHAN")) >> 10) == 1
                 local dst_ch_str = mono and tostring(chan_index + 1) or string.format("%d/%d", chan_index + 1, chan_index + 2)
 
-                if chan_index >= 2 then
-                    conn.purpose = "sidechain"
-                elseif main_send == 0 then
-                    conn.purpose = "bus_summing"
-                elseif main_send == 1 and (type(dest_track) ~= "userdata" or reaper.CountTrackMediaItems(dest_track) == 0) then
-                    -- Main send still active and the destination holds no media: a parallel split
-                    conn.purpose = "parallel_split"
-                end
-                if compact and conn.purpose ~= "sidechain" then conn.purpose = nil end
+                if chan_index >= 2 then conn.purpose = "sidechain" end
 
                 local mode_val = math.floor(reaper.GetTrackSendInfo_Value(src_track, 0, s, "I_SENDMODE"))
                 if mode_val == 1 then conn.type = "prefx" elseif mode_val == 3 or mode_val == 2 then conn.type = "pre" end
@@ -669,7 +647,7 @@ local function process_track_data(track, is_master, current_depth, any_soloed, h
     return track_data
 end
 
--- opts (task 4e compact YAML, nil = old full output): full = { [track GUID] = true }: these tracks, their folders and the master keep
+-- opts (task 4e compact YAML): full = { [track GUID] = true }: these tracks, their folders and the master keep
 -- their full plugin settings, every other track lists plugin names only; connections keep only the "sidechain" label.
 local function extract_full_project_yaml(opts)
     -- task 4g.3 snapshot: opts.take = read every setting the compact YAML can use (every track in every fx mode) and return that table;
@@ -689,7 +667,7 @@ local function extract_full_project_yaml(opts)
         S = { meta = { bpm = reaper.Master_GetTempo(), time_sig = string.format("%d/%d", num, den), sample_rate = sr > 0 and math.floor(sr) or "Default" },
             notes = trim_string(reaper.GetSetProjectNotes(0, false, "")), arr = get_arrangement_markers(), any_soloed = reaper.AnyTrackSolo(0),
             list = {}, parent = {}, guid = {}, has_children = {}, td = {}, cptr = {}, master = reaper.GetMasterTrack(0) }
-        S.conns = get_all_connections(true, nil, S.cptr)
+        S.conns = get_all_connections(nil, S.cptr)
         for i = 0, reaper.CountTracks(0) - 1 do
             local tr = reaper.GetTrack(0, i)
             S.list[i + 1], S.guid[tr], S.parent[tr] = tr, reaper.GetTrackGUID(tr), reaper.GetParentTrack(tr)
@@ -733,13 +711,12 @@ local function extract_full_project_yaml(opts)
     local project_data = {
         meta = meta,
         arr = arr,
-        connections = S and conns(nil) or (not S and get_all_connections(opts ~= nil)) or nil,
+        connections = S and conns(nil) or (not S and get_all_connections()) or nil,
         tracks = {}
     }
 
-    if not opts then project_data.notes = "- any routing send volume omitted is at 0.0 dB unity gain." end -- task 5e2: the compact YAML's intro says it
     if proj_notes and proj_notes ~= "" then project_data.notes = (project_data.notes and (project_data.notes .. '\n') or "") .. proj_notes end
-    if opts and arr then -- task 5e2: the region lines of the data have the regions; only markers stay
+    if arr then -- task 5e2: the region lines of the data have the regions; only markers stay
         local marks = {}
         for _, e in ipairs(arr) do
             if e.type ~= "region" then marks[#marks + 1] = e end
@@ -781,7 +758,7 @@ local function extract_full_project_yaml(opts)
                 while tr do shown[tr] = true; tr = par(tr) end
             end
         end
-        project_data.connections = S and conns(keep) or (not S and get_all_connections(true, keep)) or nil
+        project_data.connections = S and conns(keep) or (not S and get_all_connections(keep)) or nil
     end
     -- task 5e2: tracks muted (also by a folder) that made no sound in the measurement (S.silent, AI.collect) are left out with their sends,
     -- except a track the data names and a folder that still holds a kept track
@@ -800,13 +777,13 @@ local function extract_full_project_yaml(opts)
 
     -- 1. Master Track
     if not (opts and opts.only) then
-        table.insert(project_data.tracks, S and cp(S.td[S.master].full) or process_track_data(reaper.GetMasterTrack(0), true, 0, any_soloed, has_children, opts and "full" or nil))
+        table.insert(project_data.tracks, S and cp(S.td[S.master].full) or process_track_data(reaper.GetMasterTrack(0), true, 0, any_soloed, has_children, "full"))
     end
 
     -- 2. Child Tracks & Folders
     local current_depth = 0
     for _, track in ipairs(list) do
-        local mode = opts and (keep[track] and "full" or ((shown and not shown[track]) and "bare" or "names")) or nil
+        local mode = keep[track] and "full" or ((shown and not shown[track]) and "bare" or "names")
         if S then
             if (not opts.only or opts.only[track]) and not gone[track] then table.insert(project_data.tracks, cp(S.td[track][mode])) end
         else
@@ -931,77 +908,17 @@ local function extract_full_project_yaml(opts)
 end
 
 -- ==============================================================================
--- 5. MIX STATE MANAGER (TARGET SOLOING & MUTING)
+-- 5. TRACK NAME AND MUTE HELPERS
 -- ==============================================================================
 
-local saved_mix_state = { tracks = {}, master_fx = {} }
-
--- Track names repeat constantly (every child of a folder is classified through its parents),
--- so each name is pattern-matched only once.
-local track_category_cache = {}
-
--- Keyword lists for the track-name classifier (plain substring match, checked in this order)
--- 99 = Parallel / Rear / NYC Busses
+-- Keyword list for parallel / rear / NYC busses (plain substring match)
 local PARALLEL_WORDS = { "nyc", "rear", "parallel" }
--- 1 = Drums & Bass (Drums, Percussion, Kicks, Snares, 808s, Basses - excluding Brass, see below)
-local DRUM_BASS_WORDS = { "drum", "kick", "snare", "hat", "perc", "cymbal", "808", "sub" }
--- 3 = Vocals (Lead Vox, Harmonies, BGV, Choirs, Acapellas - plurals and "lead/backing vocal" are covered by the short forms)
-local VOCAL_WORDS = { "vox", "vocal", "choir", "bgv", "bv", "acap", "harmony", "harmonies" }
 
 local function name_has_any(name, words)
     for _, word in ipairs(words) do
         if name:find(word, 1, true) then return true end
     end
     return false
-end
-
-local function get_track_category(name)
-    if type(name) ~= "string" then
-        name = ""
-    else
-        name = trim_string(name):lower()
-    end
-
-    local category = track_category_cache[name]
-    if category then return category end
-
-    if name_has_any(name, PARALLEL_WORDS) then
-        category = 99
-    elseif name_has_any(name, DRUM_BASS_WORDS) or (name:find("bass", 1, true) and not name:find("brass", 1, true)) then
-        category = 1
-    elseif name_has_any(name, VOCAL_WORDS) then
-        category = 3
-    else
-        -- 2 = Instruments (Everything else: Guitars, Keys, Synths, Strings, Horns, FX, Pads)
-        category = 2
-    end
-
-    track_category_cache[name] = category
-    return category
-end
-
---- Determines track category by inspecting parent folder hierarchy first.
--- Children inside Drums, Vocals, or Parallel folders inherit their parent's category.
-local function get_effective_track_category(track)
-    if not track then return 2 end
-
-    -- 1. Check parent folder hierarchy (Parents strictly override children)
-    local current_parent = reaper.GetParentTrack(track)
-    while current_parent do
-        local _, parent_name = reaper.GetSetMediaTrackInfo_String(current_parent, "P_NAME", "", false)
-        local parent_cat = get_track_category(parent_name)
-
-        -- If parent folder is explicitly Drums, Vocals, or Parallel, children inherit it
-        if parent_cat == 1 or parent_cat == 3 or parent_cat == 99 then
-            return parent_cat
-        end
-
-        current_parent = reaper.GetParentTrack(current_parent)
-    end
-
-    -- 2. Fall back to track's own name if not inside an explicit category folder
-    local _, track_name = reaper.GetSetMediaTrackInfo_String(track, "P_NAME", "", false)
-    return get_track_category(track_name)
 end
 
 local function is_track_hierarchy_muted(track)
@@ -1015,261 +932,9 @@ local function is_track_hierarchy_muted(track)
     return false
 end
 
-local function set_track_info_delta(track, param, target_val)
-    if reaper.GetMediaTrackInfo_Value(track, param) ~= target_val then
-        reaper.SetMediaTrackInfo_Value(track, param, target_val)
-    end
-end
-
-local function save_and_apply_mix_state(target_mode, mute_parallels, bypass_master_fx)
-    -- Freeze UI and routing graph updates during mass solo/mute operations
-    reaper.PreventUIRefresh(1)
-
-    saved_mix_state = { tracks = {}, master_fx_enabled = 1 }
-    local master_track = reaper.GetMasterTrack(0)
-    local target_track_names = {}
-
-    -- 1. Atomic Master FX Bypass (Single PDC recalculation)
-    if master_track then
-        saved_mix_state.master_fx_enabled = reaper.GetMediaTrackInfo_Value(master_track, "I_FXEN")
-        if bypass_master_fx and saved_mix_state.master_fx_enabled == 1 then
-            reaper.SetMediaTrackInfo_Value(master_track, "I_FXEN", 0)
-        end
-    end
-
-    -- 2. Delta-checked track isolation
-    for i = 0, reaper.CountTracks(0) - 1 do
-        local track = reaper.GetTrack(0, i)
-        if track then
-            local track_guid = reaper.GetTrackGUID(track)
-            local _, track_name = reaper.GetSetMediaTrackInfo_String(track, "P_NAME", "", false)
-
-            local category = get_effective_track_category(track)
-            local display_name = (trim_string(track_name) ~= "") and trim_string(track_name) or ("Track " .. (i + 1))
-
-            local orig_solo = reaper.GetMediaTrackInfo_Value(track, "I_SOLO")
-            local orig_mute = reaper.GetMediaTrackInfo_Value(track, "B_MUTE")
-
-            saved_mix_state.tracks[track_guid] = { solo = orig_solo, mute = orig_mute }
-
-            -- FIX: Check that the track is NOT muted (or inside a muted folder hierarchy) before targeting/soloing it
-            local is_muted = is_track_hierarchy_muted(track)
-
-            -- Mode 4 (Full Mix) targets nothing: every solo is cleared and the whole project renders
-            local is_target = false
-            if target_mode == 5 then
-                is_target = (orig_solo > 0) and not is_muted
-            elseif target_mode ~= 4 then
-                is_target = (category == target_mode) and not is_muted
-            end
-
-            set_track_info_delta(track, "I_SOLO", is_target and 1 or 0)
-            if is_target then table.insert(target_track_names, display_name) end
-
-            if mute_parallels and category == 99 then
-                set_track_info_delta(track, "B_MUTE", 1)
-            end
-        end
-    end
-
-    -- Unfreeze and commit audio routing changes all at once
-    reaper.PreventUIRefresh(-1)
-    reaper.TrackList_AdjustWindows(false)
-    return target_track_names
-end
-
-local function restore_mix_state()
-    -- Freeze UI and routing graph updates during mass restoration
-    reaper.PreventUIRefresh(1)
-
-    -- 1. Restore Master FX in one atomic call
-    local master_track = reaper.GetMasterTrack(0)
-    if master_track and saved_mix_state and saved_mix_state.master_fx_enabled ~= nil then
-        set_track_info_delta(master_track, "I_FXEN", saved_mix_state.master_fx_enabled)
-    end
-
-    -- 2. Restore only modified tracks
-    if saved_mix_state and saved_mix_state.tracks then
-        for i = 0, reaper.CountTracks(0) - 1 do
-            local track = reaper.GetTrack(0, i)
-            if track then
-                local state = saved_mix_state.tracks[reaper.GetTrackGUID(track)]
-                if state then
-                    set_track_info_delta(track, "I_SOLO", state.solo)
-                    set_track_info_delta(track, "B_MUTE", state.mute)
-                end
-            end
-        end
-    end
-
-    -- Unfreeze and commit audio routing changes all at once
-    reaper.PreventUIRefresh(-1)
-    reaper.TrackList_AdjustWindows(false)
-    reaper.UpdateArrange()
-end
-
 -- ==============================================================================
--- 6. ACTIVE TRACK DETECTION (WITH PARENT HIERARCHY MUTE CHECK)
+-- 7. LEVEL MATH
 -- ==============================================================================
-
---- Traverses up folder hierarchy to verify track is audible (checks both Mutes and Solos).
--- `any_solo` may be passed in so the project is only queried once per scan.
-local function is_track_audible(track, any_solo)
-    local current = track
-    while current do
-        if reaper.GetMediaTrackInfo_Value(current, "B_MUTE") == 1 then
-            return false -- A parent or the track itself is muted
-        end
-        current = reaper.GetParentTrack(current)
-    end
-
-    -- If any track is soloed in REAPER, this track must be soloed (or under a soloed folder) to be audible
-    if any_solo == nil then any_solo = reaper.AnyTrackSolo(0) end
-    if any_solo then
-        current = track
-        while current do
-            if reaper.GetMediaTrackInfo_Value(current, "I_SOLO") > 0 then return true end
-            current = reaper.GetParentTrack(current)
-        end
-        return false
-    end
-
-    return true
-end
-
---- Reads every audible track and its un-muted item time ranges from REAPER ONCE per scan.
--- Each region query afterwards is a cheap in-memory overlap test instead of walking
--- every track, folder and item through the REAPER API again for every region.
--- Only tracks that existed BEFORE the render are indexed (max_tracks).
-local function build_active_track_index(max_tracks)
-    local index = {}
-    local any_solo = reaper.AnyTrackSolo(0)
-
-    for i = 0, (max_tracks or reaper.CountTracks(0)) - 1 do
-        local track = reaper.GetTrack(0, i)
-
-        if is_track_audible(track, any_solo) then
-            local items = {}
-            for j = 0, reaper.CountTrackMediaItems(track) - 1 do
-                local item = reaper.GetTrackMediaItem(track, j)
-                if reaper.GetMediaItemInfo_Value(item, "B_MUTE") ~= 1 then
-                    local pos = reaper.GetMediaItemInfo_Value(item, "D_POSITION")
-                    table.insert(items, { pos, pos + reaper.GetMediaItemInfo_Value(item, "D_LENGTH") })
-                end
-            end
-
-            if #items > 0 then
-                local _, name = reaper.GetSetMediaTrackInfo_String(track, "P_NAME", "", false)
-                table.insert(index, { name = name ~= "" and name or ("Track_" .. (i + 1)), items = items })
-            end
-        end
-    end
-
-    return index
-end
-
-local function get_active_tracks(track_index, start_time, end_time)
-    local active_tracks = {}
-
-    -- Threshold: Must play for at least 10% of the section (minimum 2.0 seconds)
-    local MIN_OVERLAP_SECONDS = math.max(2.0, (end_time - start_time) * 0.10)
-
-    for _, entry in ipairs(track_index) do
-        for _, item_range in ipairs(entry.items) do
-            -- Calculate actual overlap duration between item and section
-            local overlap = math.min(item_range[2], end_time) - math.max(item_range[1], start_time)
-            if overlap > MIN_OVERLAP_SECONDS then
-                table.insert(active_tracks, entry.name)
-                break
-            end
-        end
-    end
-
-    return active_tracks
-end
-
--- ==============================================================================
--- 7. 9-BAND MASTERING DSP ENGINE
--- ==============================================================================
-
--- Centre frequencies (Hz) and result keys of the 9 critical bands:
--- sub (60), punch (120), mud (250), boxy (500), core (1k), presence (3k), harsh (6k), sibilance (8k), air (12k)
-local BAND_FREQS = { 60, 120, 250, 500, 1000, 3000, 6000, 8000, 12000 }
-local BAND_KEYS  = { "sub60", "punch120", "mud250", "boxy500", "mid1k", "pres3k", "harsh6k", "sib8k", "air12k" }
-
-local function sinh(x) return (math.exp(x) - math.exp(-x)) / 2 end
-
--- Band widths are derived once from the centre frequencies: each band is exactly as wide (in octaves) as its
--- CLOSEST neighbour allows, so neighbouring bands touch at their edges but never overlap.
--- (60..1k come out 1 octave wide, 6k and 8k ~0.4 octave, 12k ~0.6 octave.)
-local BAND_Q, BAND_OFFSET_DB = {}, {}
-for b, freq in ipairs(BAND_FREQS) do
-    local lower_gap = BAND_FREQS[b - 1] and math.log(freq / BAND_FREQS[b - 1], 2)
-    local upper_gap = BAND_FREQS[b + 1] and math.log(BAND_FREQS[b + 1] / freq, 2)
-    local width_octaves = math.min(lower_gap or upper_gap, upper_gap or lower_gap)
-
-    BAND_Q[b] = 1 / (2 * sinh(math.log(2) / 2 * width_octaves)) -- bandwidth in octaves -> filter Q
-    BAND_OFFSET_DB[b] = NORMALIZE_BANDS_TO_OCTAVE and (-10 * math.log(width_octaves, 10)) or 0
-end
-
--- Audio is streamed through the analyzer in 1-second blocks instead of one giant buffer,
--- so memory stays flat even for "Full Region" scans (a 3-minute song used to need ~16 million Lua numbers at once).
-local DSP_BLOCK_FRAMES = SAMPLE_RATE
-
--- ------------------------------------------------------------------------------
--- Biquad filters (RBJ cookbook, bilinear transform). Unlike the old Chamberlin state-variable filter
--- these keep their exact centre frequency and gain right up to the top bands at 44.1 kHz.
--- ------------------------------------------------------------------------------
-
---- Band-pass with 0 dB gain at the centre frequency (so band energy is the true energy inside the band).
-local function design_bandpass(freq, q)
-    local w0 = 2 * math.pi * freq / SAMPLE_RATE
-    local alpha = math.sin(w0) / (2 * q)
-    local a0 = 1 + alpha
-    return { b0 = alpha / a0, b2 = -alpha / a0, a1 = -2 * math.cos(w0) / a0, a2 = (1 - alpha) / a0, z1 = 0, z2 = 0, energy = 0 }
-end
-
---- 4th-order Linkwitz-Riley low-pass (24 dB/oct, -6 dB at the cutoff): two identical 2nd-order Butterworth
---- stages in series. One set of coefficients, two sets of filter memory (z1/z2 = stage 1, z3/z4 = stage 2).
-local function design_lowpass4(freq)
-    local w0 = 2 * math.pi * freq / SAMPLE_RATE
-    local cos_w0 = math.cos(w0)
-    local alpha = math.sin(w0) / (2 * 0.70710678)
-    local a0 = 1 + alpha
-    local b = (1 - cos_w0) / a0
-    return { b0 = b / 2, b1 = b, b2 = b / 2, a1 = -2 * cos_w0 / a0, a2 = (1 - alpha) / a0, z1 = 0, z2 = 0, z3 = 0, z4 = 0 }
-end
-
---- Runs a band-pass biquad over input[1..n]; the filter state carries from block to block and the output energy keeps accumulating.
-local function run_bandpass(input, n, filter)
-    local b0, b2, a1, a2 = filter.b0, filter.b2, filter.a1, filter.a2
-    local z1, z2, energy = filter.z1, filter.z2, filter.energy
-    for i = 1, n do
-        local x = input[i]
-        local y = b0 * x + z1       -- transposed direct form II (b1 is 0 for a band-pass)
-        z1 = z2 - a1 * y
-        z2 = b2 * x - a2 * y
-        energy = energy + y * y
-    end
-    filter.z1, filter.z2, filter.energy = z1, z2, energy
-end
-
---- Runs the 4th-order low-pass over input[1..n] and stores the result in output (input and output may be the same table).
-local function run_lowpass4(input, output, n, filter)
-    local b0, b1, b2, a1, a2 = filter.b0, filter.b1, filter.b2, filter.a1, filter.a2
-    local z1, z2, z3, z4 = filter.z1, filter.z2, filter.z3, filter.z4
-    for i = 1, n do
-        local x = input[i]
-        local y = b0 * x + z1       -- stage 1
-        z1 = b1 * x - a1 * y + z2
-        z2 = b2 * x - a2 * y
-        local out = b0 * y + z3     -- stage 2 (same coefficients)
-        z3 = b1 * y - a1 * out + z4
-        z4 = b2 * y - a2 * out
-        output[i] = out
-    end
-    filter.z1, filter.z2, filter.z3, filter.z4 = z1, z2, z3, z4
-end
 
 -- Helper to convert any raw band energy accumulation into absolute dBFS (offset_db = optional octave normalization)
 local function convert_energy_to_db(energy_sum, num_samples, offset_db)
@@ -1278,295 +943,9 @@ local function convert_energy_to_db(energy_sum, num_samples, offset_db)
     return round(20 * math.log(band_rms, 10) + (offset_db or 0), 1)
 end
 
-local dsp_debug = {} -- test-only: values the YAML metrics do not carry
-
-local function process_audio_chunk(take, item_pos, analyze_start, analyze_dur)
-    local num_samples = math.floor(analyze_dur * SAMPLE_RATE)
-    if num_samples < 1 then return nil end
-
-    local block_frames = math.min(num_samples, DSP_BLOCK_FRAMES)
-    local buffer = reaper.new_array(block_frames * 2)
-    if not buffer then return nil end
-
-    local accessor = reaper.CreateTakeAudioAccessor(take)
-    if not accessor then return nil end
-
-    local peak_left, peak_right = 0, 0
-    local sum_squared_mid, sum_squared_side = 0, 0
-
-    -- Full-Spectrum Phase Correlation Accumulators: sum(L*R), sum(L^2), sum(R^2)
-    local sum_full_LR, sum_full_LL, sum_full_RR = 0, 0, 0
-    -- Same accumulators for the sub-bass region (below SUB_MONO_CUTOFF_HZ)
-    local sum_sub_LR, sum_sub_LL, sum_sub_RR = 0, 0, 0
-
-    -- One band-pass filter per band (applied to the Mid channel)
-    local bands = {}
-    for b, freq in ipairs(BAND_FREQS) do bands[b] = design_bandpass(freq, BAND_Q[b]) end
-
-    -- Sub-Mono low-pass (24 dB/oct), one for the Mid and one for the Side channel
-    local sub_mid_lp = design_lowpass4(SUB_MONO_CUTOFF_HZ)
-    local sub_side_lp = design_lowpass4(SUB_MONO_CUTOFF_HZ)
-
-    -- Per-block work arrays (allocated once, reused for every block)
-    local mid, side, sub_mid, sub_side = {}, {}, {}, {}
-
-    local frames_done = 0
-    while frames_done < num_samples do
-        local n = math.min(block_frames, num_samples - frames_done)
-
-        buffer.clear() -- a block without audio must read as silence, never as the previous block's samples
-        local ok = reaper.GetAudioAccessorSamples(accessor, SAMPLE_RATE, 2, analyze_start - item_pos + frames_done / SAMPLE_RATE, n, buffer)
-        if not ok then break end
-
-        -- Convert C++ buffer to a native 1-based Lua table
-        local audio_samples = buffer
-        if type(buffer) == "userdata" and buffer.table then
-            audio_samples = buffer.table()
-        end
-        if type(audio_samples) ~= "table" then break end
-
-        -- Fast native table loop (audio_samples[1] = L0, audio_samples[2] = R0, ...)
-        for i = 1, n do
-            local sample_left = audio_samples[2 * i - 1]
-            local sample_right = audio_samples[2 * i]
-
-            if sample_left > peak_left then peak_left = sample_left elseif -sample_left > peak_left then peak_left = -sample_left end
-            if sample_right > peak_right then peak_right = sample_right elseif -sample_right > peak_right then peak_right = -sample_right end
-
-            -- Accumulate full-spectrum stereo cross-correlation metrics
-            sum_full_LR = sum_full_LR + (sample_left * sample_right)
-            sum_full_LL = sum_full_LL + (sample_left * sample_left)
-            sum_full_RR = sum_full_RR + (sample_right * sample_right)
-
-            local m = (sample_left + sample_right) * 0.5
-            local s = (sample_left - sample_right) * 0.5
-            mid[i], side[i] = m, s
-
-            sum_squared_mid = sum_squared_mid + (m * m)
-            sum_squared_side = sum_squared_side + (s * s)
-        end
-
-        -- Band-pass filters on the Mid channel (one tight loop per band keeps the filter state in registers)
-        for b = 1, #bands do
-            run_bandpass(mid, n, bands[b])
-        end
-
-        -- Sub-bass low-pass on Mid and Side (linear, so L/R can be rebuilt afterwards) for the mono compatibility check
-        run_lowpass4(mid, sub_mid, n, sub_mid_lp)
-        run_lowpass4(side, sub_side, n, sub_side_lp)
-
-        -- Accumulate cross-channel correlation of the sub-bass region
-        for i = 1, n do
-            local sub_L = sub_mid[i] + sub_side[i]
-            local sub_R = sub_mid[i] - sub_side[i]
-            sum_sub_LR = sum_sub_LR + (sub_L * sub_R)
-            sum_sub_LL = sum_sub_LL + (sub_L * sub_L)
-            sum_sub_RR = sum_sub_RR + (sub_R * sub_R)
-        end
-
-        frames_done = frames_done + n
-    end
-    reaper.DestroyAudioAccessor(accessor)
-
-    if frames_done < num_samples then return nil end -- the accessor failed part-way through
-
-    local true_peak = math.max(peak_left, peak_right)
-    local peak_db = (true_peak > 0) and (20 * math.log(true_peak, 10)) or -144
-    local rms_db = (sum_squared_mid + sum_squared_side) > 0 and (20 * math.log(math.sqrt((sum_squared_mid + sum_squared_side) / num_samples), 10)) or -144
-    local crest_factor = peak_db - rms_db
-
-    local rms_mid = math.sqrt(sum_squared_mid / num_samples)
-    local rms_side = math.sqrt(sum_squared_side / num_samples)
-    local width_pct = 0
-    if (rms_mid + rms_side) > 0 then
-        width_pct = (rms_side / (rms_mid + rms_side)) * 100
-    end
-
-    -- Feature #1: Full-Spectrum Phase Correlation calculation (-1.0 to +1.0)
-    local full_denom = math.sqrt(sum_full_LL * sum_full_RR)
-    local phase_corr = full_denom > 0 and (sum_full_LR / full_denom) or 1.0
-
-    local denom = math.sqrt(sum_sub_LL * sum_sub_RR)
-    local correlation = denom > 0 and (sum_sub_LR / denom) or 1.0
-    dsp_debug.sub_corr = correlation
-    dsp_debug.peak, dsp_debug.rms, dsp_debug.width, dsp_debug.corr = peak_db, rms_db, width_pct, phase_corr -- task 5c: unrounded
-
-    -- Only flag if there is actual bass AND phase correlation drops below 0 (canceling out)
-    local sub_mono_status = "Safe"
-    if convert_energy_to_db((sum_sub_LL + sum_sub_RR) / 2, num_samples) > -50.0 and correlation < 0.0 then
-        sub_mono_status = "Phase_Risk"
-    end
-
-    local tonal_db = {}
-    for b, key in ipairs(BAND_KEYS) do
-        tonal_db[key] = convert_energy_to_db(bands[b].energy, num_samples, BAND_OFFSET_DB[b])
-    end
-
-    return {
-        dyn = { peak_db = round(peak_db, 1), rms_db = round(rms_db, 1), crest_db = round(crest_factor, 1) },
-        stereo = { width_pct = round(width_pct, 1), sub_mono = sub_mono_status, phase_corr = round(phase_corr, 2) },
-        tonal_db = tonal_db
-    }
-end
-
 -- ==============================================================================
--- 8. MULTI-REGION & MULTI-TRACK GHOST RENDER ANALYZER (FIXED)
+-- 9. PROMPT FILE EXPORTER, JSON, CURL / API, BALANCE
 -- ==============================================================================
-
-local function has_rendered_media_item(media_item)
-    if not media_item then return false end
-    local item_len = reaper.GetMediaItemInfo_Value(media_item, "D_LENGTH")
-    return item_len ~= nil and item_len > 0
-end
-
---- Analyzes the first rendered item that overlaps the region.
--- Returns the metrics plus the overlap window, or nil when nothing could be analyzed.
-local function analyze_region(render_tracks, region, duration_pref)
-    for _, trk in ipairs(render_tracks) do
-        for item_idx = 0, reaper.CountTrackMediaItems(trk) - 1 do
-            local media_item = reaper.GetTrackMediaItem(trk, item_idx)
-            local take = media_item and reaper.GetActiveTake(media_item)
-
-            if take then
-                local item_start = reaper.GetMediaItemInfo_Value(media_item, "D_POSITION")
-                local item_end = item_start + reaper.GetMediaItemInfo_Value(media_item, "D_LENGTH")
-
-                local overlap_start = math.max(item_start, region.start_s)
-                local overlap_end = math.min(item_end, region.end_s)
-                local overlap_duration = overlap_end - overlap_start
-
-                if overlap_duration > 0 then
-                    local safe_start = overlap_start + math.min(1.0, overlap_duration * 0.1)
-                    local analysis_duration = overlap_end - safe_start
-                    if duration_pref > 0 then
-                        analysis_duration = math.min(duration_pref, analysis_duration)
-                    end
-
-                    local metrics = process_audio_chunk(take, item_start, safe_start, analysis_duration)
-                    if metrics then return metrics, overlap_start, overlap_end end
-                end
-            end
-        end
-    end
-    return nil
-end
-
-local function analyze_ghost_render(regions, duration_pref, tracks_before, pre_render_guids)
-    local tracks_after = reaper.CountTracks(0)
-
-    -- Build a real identity set of tracks created by the render by comparing GUIDs before
-    -- and after. This is more reliable than assuming track count/index range alone.
-    local existing_guids = pre_render_guids or {}
-    if not pre_render_guids then
-        for i = 0, tracks_before - 1 do
-            local trk = reaper.GetTrack(0, i)
-            if trk then existing_guids[reaper.GetTrackGUID(trk)] = true end
-        end
-    end
-
-    local render_tracks = {}
-    local seen_render_guids = {}
-    for i = 0, tracks_after - 1 do
-        local trk = reaper.GetTrack(0, i)
-        if trk then
-            local guid = reaper.GetTrackGUID(trk)
-            if not existing_guids[guid] and not seen_render_guids[guid] then
-                seen_render_guids[guid] = true
-                for item_idx = 0, reaper.CountTrackMediaItems(trk) - 1 do
-                    if has_rendered_media_item(reaper.GetTrackMediaItem(trk, item_idx)) then
-                        table.insert(render_tracks, trk)
-                        break
-                    end
-                end
-            end
-        end
-    end
-
-    if #render_tracks == 0 then
-        return nil, nil, "CANCELLED"
-    end
-
-    -- One pass over the original tracks answers "who is playing?" for every region below
-    local track_index = build_active_track_index(tracks_before)
-
-    local regional_metrics = {}
-    local region_counter = 1
-
-    for _, region in ipairs(regions or {}) do
-        -- Markers have no end time, only regions can be analyzed as a section
-        if region.end_s then
-            local metrics, overlap_start, overlap_end = analyze_region(render_tracks, region, duration_pref)
-            if metrics then
-                local clean_name = region.name:gsub("[%s%p]+", "_")
-                local seq_key = string.format("%02d_%s", region_counter, clean_name)
-                metrics.active_trks = get_active_tracks(track_index, overlap_start, overlap_end)
-                regional_metrics[seq_key] = metrics
-                region_counter = region_counter + 1
-            end
-        end
-    end
-
-    -- Fallback if no regions exist: analyze the first valid audio item across the whole timeline.
-    if not next(regional_metrics) then
-        for _, trk in ipairs(render_tracks) do
-            local first_item = reaper.GetTrackMediaItem(trk, 0)
-            local take = first_item and reaper.GetActiveTake(first_item)
-
-            if take then
-                local pos = reaper.GetMediaItemInfo_Value(first_item, "D_POSITION")
-                local dur = reaper.GetMediaItemInfo_Value(first_item, "D_LENGTH")
-                if duration_pref > 0 then dur = math.min(duration_pref, dur) end
-
-                local m = process_audio_chunk(take, pos, pos, dur)
-                if m then
-                    m.active_trks = get_active_tracks(track_index, pos, pos + dur)
-                    regional_metrics["01_Entire_Song"] = m
-                    break
-                end
-            end
-        end
-    end
-
-    if not next(regional_metrics) then
-        return nil, render_tracks, "Render created temporary tracks, but no valid audio items were generated. Check your time selection, mix bounds, and whether 'Render > Add rendered items to new tracks' is enabled."
-    end
-
-    return regional_metrics, render_tracks, nil
-end
-
--- ==============================================================================
--- 9. UNIFIED PROMPT BUILDER & MANDATORY FILE EXPORTER
--- ==============================================================================
-
-local function build_full_prompt(project_yaml, audio_metrics, target_str, target_tracks)
-    local prompt = { "=== MIXING & MASTERING DIRECTIVES ===\nYou are an elite, multi-platinum audio mixing and mastering engineer.\n" }
-    prompt[#prompt + 1] = "Focus Target: " .. target_str .. "\n\n"
-
-    prompt[#prompt + 1] = "=== TARGET TRACKS ===\n"
-    if target_tracks and #target_tracks > 0 then
-        prompt[#prompt + 1] = "The following tracks are currently active for this specific analysis:\n"
-        prompt[#prompt + 1] = table.concat(target_tracks, ", ") .. "\n\n"
-        prompt[#prompt + 1] = "CRITICAL RESTRICTION: Focus YOUR ENTIRE ANALYSIS and plugin recommendations SOLELY on these specific tracks, plus the Master Bus if relevant. Do not critique or suggest parameter changes for any tracks outside this list.\n\n"
-    else
-        prompt[#prompt + 1] = "All active tracks are included in this full mix analysis.\n\n"
-    end
-
-    -- UNIFIED INSTRUCTIONS BLOCK
-    prompt[#prompt + 1] = "=== INSTRUCTIONS FOR ANALYSIS ===\n"
-    prompt[#prompt + 1] = "1. MACRO-DYNAMICS: Compare Crest Factor and RMS across regions. If dynamic contrast is lacking, pinpoint over-compression in the YAML and specify threshold/ratio adjustments.\n"
-    prompt[#prompt + 1] = "2. LOW/MID FREQUENCY BALANCE: Scrutinize Sub (60Hz), Punch (120Hz), Mud (250Hz), and Boxy (500Hz). Locate masking in the project tracks and suggest surgical EQ cuts.\n"
-    prompt[#prompt + 1] = "3. HIGH FREQUENCY INTEGRITY: Differentiate Harshness (6kHz) from Sibilance (8kHz). Look for abrasive saturation or identify tracks requiring a De-Esser.\n"
-    prompt[#prompt + 1] = "4. STEREO & SUB-MONO INTEGRITY: Check 'width_pct', 'phase_corr', and 'sub_mono'. 'phase_corr' is full-spectrum phase correlation (-1.0 to +1.0). If 'phase_corr' is low (< 0.5) or 'Phase_Risk' is flagged on sub-bass, identify phase issues across wide stereo elements or plugins and advise how to fix them.\n"
-    prompt[#prompt + 1] = "Be precise: Quote exact track names, plugin names, and parameter settings as formatted in the project YAML.\n"
-    prompt[#prompt + 1] = "Look closely at 'active_trks' for each region. ONLY critique or suggest changes to tracks that are actively playing in that specific region.\n"
-    prompt[#prompt + 1] = "When suggesting dynamic EQ or compressor settings do not suggest threshold, always suggest gain reduction that we should achieve.\n"
-    prompt[#prompt + 1] = "Be totally honest and give as much information as possible to educate me but also be short.\n\n"
-
-    prompt[#prompt + 1] = "=== REGIONAL AUDIO ANALYSIS METRICS ===\n" .. to_yaml(audio_metrics) .. "\n\n"
-    prompt[#prompt + 1] = "=== REAPER PROJECT CONFIGURATION & FX CHAINS ===\n" .. project_yaml .. "\n"
-
-    return table.concat(prompt)
-end
 
 --- Returns the first "<dir><base>.txt" / "<dir><base>_01.txt" ... that does not exist yet (never overwrites).
 local function find_free_filename(dir, base_filename)
@@ -1632,126 +1011,6 @@ local function save_prompt_to_txt(full_prompt, target_str)
         )
         return nil
     end
-end
-
--- ------------------------------------------------------------------------------
--- RESULT TABLES: one column definition drives BOTH the chat (Markdown) table and the HTML report
--- ------------------------------------------------------------------------------
-
-local TABLE_TITLES = { "1. Macro-Dynamics & Stereo Summary", NORMALIZE_BANDS_TO_OCTAVE and "2. Tonal Balance Summary (dBFS, octave-normalized)" or "2. Tonal Balance Summary (dBFS)" }
-
--- label = chat header, html = report header, fmt = number format, get(m, html) = cell value
-local DYNAMICS_COLUMNS = {
-    { label = "Peak",       html = "Peak (dB)",   fmt = "%.1f",  get = function(m) return m.dyn.peak_db end },
-    { label = "RMS",        html = "RMS (dB)",    fmt = "%.1f",  get = function(m) return m.dyn.rms_db end },
-    { label = "Crest",      html = "Crest (dB)",  fmt = "%.1f",  get = function(m) return m.dyn.crest_db end },
-    { label = "Width",      html = "Width (%)",   fmt = "%.0f%%", get = function(m) return m.stereo.width_pct end },
-    { label = "Phase Corr", html = "Phase Corr",  fmt = "%.2f",  get = function(m) return m.stereo.phase_corr or 1.0 end },
-    { label = "Sub-Mono",   html = "Sub-Mono",    fmt = "%s",    get = function(m, html)
-        if m.stereo.sub_mono == "Phase_Risk" then
-            return html and "<span class='risk'>Risk</span>" or "Risk"
-        end
-        return html and "<span class='safe'>Safe</span>" or "Safe"
-    end },
-}
-
-local TONAL_COLUMNS = {}
-do
-    local tonal_labels = { "Sub", "Punch", "Mud", "Boxy", "Core", "Pres", "Harsh", "Sib", "Air" }
-    local tonal_html   = { "Sub (60Hz)", "Punch (120Hz)", "Mud (250Hz)", "Boxy (500Hz)", "Core (1kHz)", "Pres (3kHz)", "Harsh (6kHz)", "Sib (8kHz)", "Air (12kHz)" }
-    for b, key in ipairs(BAND_KEYS) do
-        TONAL_COLUMNS[b] = { label = tonal_labels[b], html = tonal_html[b], fmt = "%.1f", get = function(m) return m.tonal_db[key] end }
-    end
-end
-
---- Region keys ("01_Verse_1", "02_Chorus", ...) in playing order.
-local function get_sorted_regions(audio_metrics)
-    local sorted_regions = {}
-    for r_key in pairs(audio_metrics) do table.insert(sorted_regions, r_key) end
-    table.sort(sorted_regions)
-    return sorted_regions
-end
-
---- "01_Verse_1" -> "Verse 1"
-local function get_region_display_name(r_key)
-    return (r_key:gsub("^%d+_", ""):gsub("_", " "))
-end
-
---- Builds one Markdown table (header + one row per region) for the chat window.
-local function build_markdown_table(columns, audio_metrics)
-    local labels = {}
-    for i, col in ipairs(columns) do labels[i] = col.label end
-    local lines = {
-        "| Region | " .. table.concat(labels, " | ") .. " |\n",
-        "|---|" .. string.rep("---|", #columns) .. "\n"
-    }
-
-    for _, r_key in ipairs(get_sorted_regions(audio_metrics)) do
-        local m = audio_metrics[r_key]
-        local cells = {}
-        for i, col in ipairs(columns) do cells[i] = string.format(col.fmt, col.get(m, false)) end
-        lines[#lines + 1] = "| " .. get_region_display_name(r_key) .. " | " .. table.concat(cells, " | ") .. " |\n"
-    end
-    return table.concat(lines)
-end
-
---- Builds one HTML <table> (header + one row per region) for the report file.
-local function build_html_table(columns, audio_metrics)
-    local headers = {}
-    for i, col in ipairs(columns) do headers[i] = "<th>" .. col.html .. "</th>" end
-    local lines = {
-        "    <table>\n",
-        "        <tr><th>Region</th>" .. table.concat(headers) .. "</tr>\n"
-    }
-
-    for _, r_key in ipairs(get_sorted_regions(audio_metrics)) do
-        local m = audio_metrics[r_key]
-        local cells = {}
-        for i, col in ipairs(columns) do cells[i] = "<td>" .. string.format(col.fmt, col.get(m, true)) .. "</td>" end
-        lines[#lines + 1] = "<tr><td>" .. get_region_display_name(r_key) .. "</td>" .. table.concat(cells) .. "</tr>\n"
-    end
-    lines[#lines + 1] = "    </table>\n"
-    return table.concat(lines)
-end
-
-local function save_tables_to_html(audio_metrics, txt_file_path, target_str)
-    if not txt_file_path then return end
-
-    -- Swap .txt extension for .html
-    local html_path = txt_file_path:gsub("%.txt$", ".html")
-    local file = io.open(html_path, "w")
-    if not file then return end
-
-    local html = [[
-<!DOCTYPE html>
-<html>
-<head>
-<style>
-    body { background-color: #1e1e1e; color: #d4d4d4; font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; padding: 25px; }
-    h2 { color: #FFD54F; font-weight: normal; margin-bottom: 25px; }
-    h3 { color: #e0e0e0; margin-top: 30px; border-bottom: 1px solid #444; padding-bottom: 5px; }
-    table { border-collapse: collapse; width: 100%; max-width: 1200px; margin-top: 15px; background-color: #252526; box-shadow: 0px 4px 10px rgba(0,0,0,0.5); }
-    th, td { border: 1px solid #333; padding: 12px; text-align: center; }
-    th:first-child, td:first-child { text-align: left; font-weight: bold; }
-    th { background-color: #333; color: #4FC3F7; }
-    .risk { color: #EF5350; font-weight: bold; }
-    .safe { color: #81C784; }
-</style>
-</head>
-<body>
-    <h2>Mix & Master Analysis: <b>]] .. target_str .. [[</b></h2>
-
-    <h3>]] .. TABLE_TITLES[1] .. [[</h3>
-]] .. build_html_table(DYNAMICS_COLUMNS, audio_metrics) .. [[
-
-    <h3>]] .. TABLE_TITLES[2] .. [[</h3>
-]] .. build_html_table(TONAL_COLUMNS, audio_metrics) .. [[
-</body>
-</html>
-]]
-
-    file:write(html)
-    file:close()
 end
 
 local function escape_json_string(str)
@@ -2308,7 +1567,6 @@ options:gmem=MixAssistant
 
 slider1:0<0,4095,1>Track index
 slider2:0<0,2,1{Track,Master,Master input}>Role
-slider3:0<0,1,1{Off,On}>Debug: Lua DSP check (master only)
 
 in_pin:left input
 in_pin:right input
@@ -2346,8 +1604,7 @@ ha1 = 2 * (K * K - 1) / a0;
 ha2 = (1 - K / Q + K * K) / a0;
 
 cur_sec = -1; cur_mb = -1; last_run = -1;
-FBASE = 256; dbg = 0; dw0 = 0; dw1 = 0;
-// local memory: 0 band coefs (15x4), 64 mid states, 128 side states (15x4 each), 192 accumulators (15 mid + 15 side), 224 band edges, 256 debug filters
+// local memory: 0 band coefs (15x4), 64 mid states, 128 side states (15x4 each), 192 accumulators (15 mid + 15 side), 224 band edges
 CBASE = 0; STM = 64; STS = 128; ACC = 192; EDG = 224;
 EDG[0] = 20; EDG[1] = 31.5; EDG[2] = 50; EDG[3] = 80; EDG[4] = 125; EDG[5] = 200; EDG[6] = 315; EDG[7] = 500;
 EDG[8] = 800; EDG[9] = 1250; EDG[10] = 2000; EDG[11] = 3150; EDG[12] = 5000; EDG[13] = 8000; EDG[14] = 12500; EDG[15] = 20000;
@@ -2434,7 +1691,6 @@ function put_master_in() global(cur_mb,mke,mcnt,run,mipk,MIBASE,gmem) local(b) (
 idx = slider1 | 0;
 role = (slider2 | 0) == 1; // master (end of the chain)
 ismin = (slider2 | 0) == 2; // master input (start of the chain)
-dbg = slider3 | 0;
 
 @block
 run = gmem[9];
@@ -2470,30 +1726,6 @@ run != last_run ? (
   lpl.z1 = lpl.z2 = lpl.z3 = lpl.z4 = 0;
   lpr.z1 = lpr.z2 = lpr.z3 = lpr.z4 = 0;
   silcnt = 0;
-  role && dbg ? (
-    dw0 = gmem[160]; dw1 = gmem[161];
-    acN = acPL = acPR = acLL = acRR = acLR = acMM = acSS = bsLL = bsRR = bsLR = 0;
-    memset(FBASE, 0, 72);
-    kb = 0;
-    loop(9,
-      dq = gmem[176 + kb];
-      dwr = 2 * $pi * gmem[164 + kb] / srate;
-      dal = sin(dwr) / (2 * dq);
-      da0 = 1 + dal;
-      dp = FBASE + kb * 8;
-      dp[0] = dal / da0; dp[1] = -dal / da0;
-      dp[2] = -2 * cos(dwr) / da0; dp[3] = (1 - dal) / da0;
-      kb += 1;
-    );
-    dwr = 2 * $pi * gmem[162] / srate;
-    dal = sin(dwr) / 1.41421356;
-    da0 = 1 + dal;
-    lbg = (1 - cos(dwr)) / da0;
-    lb0 = lbg / 2; lb1 = lbg; lb2 = lbg / 2;
-    la1 = -2 * cos(dwr) / da0; la2 = (1 - dal) / da0;
-    dlm.z1 = dlm.z2 = dlm.z3 = dlm.z4 = 0;
-    dls.z1 = dls.z2 = dls.z3 = dls.z4 = 0;
-  );
 );
 // a block starting at the render start (gmem[7]) is accepted only before this run got 1 s past it: after the render, a stopped
 // project with the edit cursor at the start must not count as a new start (it overwrote the master peak with idle noise)
@@ -2506,15 +1738,6 @@ n = 0;
 active ? (
   role ? gmem[10] = run;
   gmem[2] = srate;
-  role && dbg ? (
-    gmem[192] = acN; gmem[193] = acPL; gmem[194] = acPR;
-    gmem[195] = acLL; gmem[196] = acRR; gmem[197] = acLR;
-    gmem[198] = acMM; gmem[199] = acSS;
-    gmem[200] = bsLL; gmem[201] = bsRR; gmem[202] = bsLR;
-    gmem[203] = run;
-    kb = 0;
-    loop(9, dp = FBASE + kb * 8; gmem[204 + kb] = dp[6]; kb += 1;);
-  );
 );
 
 @sample
@@ -2551,27 +1774,6 @@ active ? (
         bandrun(sdx, STS, ACC + 15);
         ylp = lpl.lp4(spl0); yrp = lpr.lp4(spl1);
         m_sll += ylp * ylp; m_srr += yrp * yrp; m_slr += ylp * yrp;
-      );
-      dbg && t >= dw0 && t < dw1 ? (
-        xl = spl0; xr = spl1;
-        xy = abs(xl); xy > acPL ? acPL = xy;
-        xy = abs(xr); xy > acPR ? acPR = xy;
-        acLL += xl * xl; acRR += xr * xr; acLR += xl * xr;
-        xm = (xl + xr) * 0.5; xs = (xl - xr) * 0.5;
-        acMM += xm * xm; acSS += xs * xs;
-        kb = 0;
-        loop(9,
-          dp = FBASE + kb * 8;
-          xy = dp[0] * xm + dp[4];
-          dp[4] = dp[5] - dp[2] * xy;
-          dp[5] = dp[1] * xm - dp[3] * xy;
-          dp[6] += xy * xy;
-          kb += 1;
-        );
-        xsm = dlm.lp4(xm); xsd = dls.lp4(xs);
-        xsl = xsm + xsd; xsr = xsm - xsd;
-        bsLL += xsl * xsl; bsRR += xsr * xsr; bsLR += xsl * xsr;
-        acN += 1;
       );
       n >= samplesblock - 1 ? ( put_master(); gmem[19] = mclipc; gmem[20] = run; gmem[21] = mpeak; );
     ) : ismin ? (
@@ -2706,7 +1908,7 @@ end
 -- analyzer on the phantom) and the analyzers on the master. List entries: idx and name of the original, slot = gmem record index.
 -- Returns list, skipped count | nil, error.
 -- Task 5b: max_tr = how many track slots fit in gmem at this project length; more chosen tracks: nil, nil, message (nothing changed yet).
-local function inject_analyzers(debug_on, max_tr)
+local function inject_analyzers(max_tr)
     local num_tracks = reaper.CountTracks(0)
     local has_children = {}
     for i = 0, num_tracks - 1 do
@@ -2859,7 +2061,6 @@ local function inject_analyzers(debug_on, max_tr)
         else
             reaper.TrackFX_SetParam(master, fx, 0, 0)
             reaper.TrackFX_SetParam(master, fx, 1, 1)
-            reaper.TrackFX_SetParam(master, fx, 2, debug_on and 1 or 0)
             -- Second analyzer at the START of the master chain (role 2 = master input); -1000 = first position
             local fx_in = reaper.TrackFX_AddByName(master, ANALYZER_FX_PATH, false, -1000)
             if fx_in < 0 then
@@ -4011,161 +3212,11 @@ local function build_jsfx_prompt(block, yaml, focus, topic) -- focus (task 4f.7b
     }, "\n")
 end
 
-local DEBUG_DURATION = 20 -- seconds of the region compared against the Lua DSP
-
---- Region under the edit cursor (else first region, else the whole project) plus the analysis window the Lua DSP will use.
-local function pick_debug_region()
-    local region, first
-    local cursor = reaper.GetCursorPosition()
-    for _, r in ipairs(get_arrangement_markers() or {}) do
-        if r.end_s then
-            first = first or r
-            if cursor >= r.start_s and cursor < r.end_s then
-                region = r
-                break
-            end
-        end
-    end
-    region = region or first
-    if not region then region = { name = "Entire project", start_s = 0, end_s = reaper.GetProjectLength(0) } end
-    local win0 = region.start_s + math.min(1.0, (region.end_s - region.start_s) * 0.1)
-    local win1 = math.min(region.end_s, win0 + DEBUG_DURATION)
-    return region, win0, win1
-end
-
-local function find_new_tracks(old_guids)
-    local list = {}
-    for i = 0, reaper.CountTracks(0) - 1 do
-        local trk = reaper.GetTrack(0, i)
-        if not old_guids[reaper.GetTrackGUID(trk)] and reaper.CountTrackMediaItems(trk) > 0 then
-            list[#list + 1] = trk
-        end
-    end
-    return list
-end
-
-local function print_dsp_comparison(out, region, run_id, lua_m, win0, win1, fader_db, render_tracks, max_sec)
-    local function g(i) return reaper.gmem_read(i) end
-    local n = g(192)
-    if g(203) ~= run_id or n < 1 then
-        out[#out + 1] = "\nJSFX debug data missing (master analyzer accumulated nothing)."
-        return
-    end
-    local ll, rr, lr, mm, ss = g(195), g(196), g(197), g(198), g(199)
-    local sll, srr, slr = g(200), g(201), g(202)
-    local rms_m, rms_s = math.sqrt(mm / n), math.sqrt(ss / n)
-    local peak_db = level_db(math.max(g(193), g(194))) + fader_db
-    local rms_db = level_db(math.sqrt((mm + ss) / n)) + fader_db
-    local sub_corr = (sll * srr > 0) and slr / math.sqrt(sll * srr) or 1
-
-    local rows = {
-        { "peak dB",    lua_m.dyn.peak_db,       peak_db },
-        { "rms dB",     lua_m.dyn.rms_db,        rms_db },
-        { "crest dB",   lua_m.dyn.crest_db,      peak_db - rms_db },
-        { "width %",    lua_m.stereo.width_pct,  (rms_m + rms_s) > 0 and rms_s / (rms_m + rms_s) * 100 or 0 },
-        { "phase corr", lua_m.stereo.phase_corr, (ll * rr > 0) and lr / math.sqrt(ll * rr) or 1 },
-        { "sub corr",   dsp_debug.sub_corr,      sub_corr },
-    }
-    for b, key in ipairs(BAND_KEYS) do
-        rows[#rows + 1] = { key, lua_m.tonal_db[key], convert_energy_to_db(g(203 + b), n, BAND_OFFSET_DB[b]) + fader_db }
-    end
-
-    out[#out + 1] = string.format("\nLua DSP vs JSFX | '%s' window %.2f-%.2f s | JSFX samples %d | master fader %.1f dB",
-        region.name, win0, win1, n, fader_db)
-    out[#out + 1] = "metric            Lua      JSFX     delta"
-    local band_worst = 0 -- task 5c: the 9 old bands of this window, allowed 0.05 dB
-    for i, r in ipairs(rows) do
-        out[#out + 1] = string.format("%-12s %9.2f %9.2f %9.2f", r[1], r[2] or 0, r[3], r[3] - (r[2] or 0))
-        if i > 6 then band_worst = math.max(band_worst, math.abs(r[3] - (r[2] or 0))) end
-    end
-    local jsfx_status = (convert_energy_to_db((sll + srr) / 2, n) > -50.0 and sub_corr < 0.0) and "Phase_Risk" or "Safe"
-    out[#out + 1] = "sub-mono status: Lua " .. tostring(lua_m.stereo.sub_mono) .. " | JSFX " .. jsfx_status
-
-    -- Task 5c: every region, old Lua DSP (reads the rendered file) vs the JSFX master record, over exactly the same 100 ms blocks
-    out[#out + 1] = "\nTASK 5c: Lua DSP vs JSFX master record per region (same 100 ms blocks and samples on both sides; post-fader)"
-    local sr = g(2)
-    if math.abs(sr - SAMPLE_RATE) > 0.5 then
-        out[#out + 1] = string.format("5c verdict: NOT RUN. The JSFX ran at %d Hz, the Lua DSP reads at %d Hz: set the audio device to %d Hz.", sr, SAMPLE_RATE, SAMPLE_RATE)
-        return
-    end
-    -- the project may render a lossy main format plus a WAV second format: read the WAV (lossy files have higher sample peaks)
-    local take, item_pos, src_name
-    for _, trk in ipairs(render_tracks or {}) do
-        local it = reaper.GetTrackMediaItem(trk, 0)
-        local tk = it and reaper.GetActiveTake(it)
-        if tk then
-            local fn = reaper.GetMediaSourceFileName(reaper.GetMediaItemTake_Source(tk), "")
-            if not take or fn:lower():match("%.wav$") then
-                take, item_pos, src_name = tk, reaper.GetMediaItemInfo_Value(it, "D_POSITION"), fn
-            end
-            if fn:lower():match("%.wav$") then break end
-        end
-    end
-    if not take then out[#out + 1] = "5c verdict: NOT RUN. No rendered item found." return end
-    -- REAPER adds only the main format to the project; the WAV second format lies next to it with the same name
-    local wav = not src_name:lower():match("%.wav$") and src_name:gsub("%.[^%.\\/]+$", ".wav")
-    if wav and reaper.file_exists(wav) then
-        local src = reaper.PCM_Source_CreateFromFile(wav)
-        if src and reaper.SetMediaItemTake_Source(take, src) then src_name = wav end
-    end
-    out[#out + 1] = "Lua DSP reads: " .. (src_name:match("[^\\/]+$") or src_name) .. (src_name:lower():match("%.wav$") and "" or "  (NOT WAV: peaks will differ)")
-    local names = { "peak", "rms", "crest", "width", "corr", "sub corr" }
-    local tol = { 0.05, 0.05, 0.05, 0.5, 0.01, 0.02 }
-    local worst, fails, n_ok = { 0, 0, 0, 0, 0, 0 }, {}, 0
-    out[#out + 1] = string.format("%-22s %8s %8s %8s %8s %8s %8s", "", names[1], names[2], names[3], names[4], names[5], names[6])
-    local ri = 0
-    for _, rg in ipairs(get_arrangement_markers() or {}) do
-        if rg.end_s then
-            ri = ri + 1
-            local blk0, blk1 = math.ceil(rg.start_s * 10 - 1e-6), math.floor(rg.end_s * 10 + 1e-6) - 1
-            local mr = blk1 >= blk0 and summarize_master(max_sec, run_id, blk0, blk1) or nil
-            local nblk = blk1 - blk0 + 1
-            local lm = mr and mr.samples > 0 and process_audio_chunk(take, item_pos, blk0 / 10, nblk / 10 + 0.25 / SAMPLE_RATE)
-            local label = string.format("R%d %s", ri, rg.name):sub(1, 22)
-            if not lm then
-                fails[#fails + 1] = label .. ": no data on one side"
-            else
-                local d, x = dsp_debug, MA_A.mstereo(mr, fader_db)
-                local lv = { d.peak, d.rms, d.peak - d.rms, d.width, d.corr, d.sub_corr }
-                local jv = { x.pk, x.rms, x.crest, x.width, x.corr, x.sub_corr }
-                local l1, l2, l3 = string.format("%-22s", label), string.format("%-22s", "  JSFX"), string.format("%-22s", "  delta")
-                local bad = {}
-                for k = 1, 6 do
-                    local dk = jv[k] - lv[k]
-                    l1, l2, l3 = l1 .. string.format(" %8.3f", lv[k]), l2 .. string.format(" %8.3f", jv[k]), l3 .. string.format(" %8.3f", dk)
-                    worst[k] = math.max(worst[k], math.abs(dk))
-                    if math.abs(dk) > tol[k] then bad[#bad + 1] = string.format("%s off by %.3f (allowed %.2f)", names[k], math.abs(dk), tol[k]) end
-                end
-                local ls, js = lm.stereo.sub_mono, x.sub_risk and "Phase_Risk" or "Safe"
-                local l_n = math.floor((nblk / 10 + 0.25 / SAMPLE_RATE) * SAMPLE_RATE)
-                if ls ~= js then bad[#bad + 1] = "sub-mono status " .. ls .. " vs " .. js end
-                if math.abs(l_n - mr.samples) > 1 then bad[#bad + 1] = string.format("sample counts differ (Lua %d, JSFX %d)", l_n, mr.samples) end
-                out[#out + 1] = l1 .. string.format("  (Lua; %.1f-%.1f s, %d samples, sub-mono %s)", blk0 / 10, (blk1 + 1) / 10, l_n, ls)
-                out[#out + 1] = l2 .. string.format("  (%d samples, sub-mono %s)", mr.samples, js)
-                out[#out + 1] = l3
-                if #bad > 0 then fails[#fails + 1] = label .. ": " .. table.concat(bad, ", ") else n_ok = n_ok + 1 end
-            end
-        end
-    end
-    local wl = {}
-    for k = 1, 6 do wl[k] = string.format("%s %.3f", names[k], worst[k]) end
-    out[#out + 1] = "largest differences: " .. table.concat(wl, " | ") .. string.format(" | 9 bands (window above) %.3f dB", band_worst)
-    if band_worst > 0.05 then fails[#fails + 1] = string.format("9 bands in the window off by %.3f dB (allowed 0.05)", band_worst) end
-    if n_ok == 0 and #fails == 0 then fails[1] = "no regions in the project" end
-    if #fails == 0 then
-        out[#out + 1] = string.format("5c verdict: PASSED. All %d regions within tolerance; the old Lua DSP may be deleted (task 5f).", n_ok)
-    else
-        out[#out + 1] = string.format("5c verdict: FAILED (%d problem(s)):", #fails)
-        for _, f in ipairs(fails) do out[#out + 1] = "  " .. f end
-    end
-end
-
 --- JSFX collection test: inject -> render (nothing added to the project) -> read gmem -> print numbers -> clean up.
--- compare = true: also render into the project and compare the Lua DSP with the JSFX master values.
 --- Task 4f.1: one JSFX collection run (analyzers + phantoms, render, read, cleanup that always runs, undo).
 -- Returns nil when the analyzer file cannot be written (a message box says why); otherwise ok, the report lines,
--- and for a normal run (not `compare`) the data block, the GUIDs of the tracks it names and the stored measurements (build_data_block).
-local function collect_jsfx_data(compare)
+-- the data block, the GUIDs of the tracks it names and the stored measurements (build_data_block).
+local function collect_jsfx_data()
     local run_t0 = reaper.time_precise()
     remove_all_analyzers() -- leftovers from an earlier crash
 
@@ -4179,12 +3230,11 @@ local function collect_jsfx_data(compare)
     if close_opt >= 0 and close_opt & 1 == 0 then reaper.SNM_SetIntConfigVar("renderclosewhendone", close_opt | 1) end
     -- Task 4f.9: a normal render into a temporary folder instead of the dry run (the dry run window cannot close by itself and looks
     -- frozen until the cleanup ends). The project's render path and file name are restored and the folder emptied in the cleanup;
-    -- the folder is emptied before the render too (no overwrite question). The Lua DSP comparison keeps the project's own settings.
+    -- the folder is emptied before the render too (no overwrite question).
     local _, r_file = reaper.GetSetProjectInfo_String(0, "RENDER_FILE", "", false)
     local _, r_pat = reaper.GetSetProjectInfo_String(0, "RENDER_PATTERN", "", false)
-    local tmp_dir = not compare and ((os.getenv("TEMP") or os.getenv("TMP") or reaper.GetResourcePath()) .. "/MixAssistant_render") or nil
+    local tmp_dir = (os.getenv("TEMP") or os.getenv("TMP") or reaper.GetResourcePath()) .. "/MixAssistant_render"
     local function clear_tmp()
-        if not tmp_dir then return end
         reaper.EnumerateFiles(tmp_dir, -1) -- rescan, REAPER caches the listing
         local names, k = {}, 0
         while true do
@@ -4196,8 +3246,6 @@ local function collect_jsfx_data(compare)
         for _, f in ipairs(names) do os.remove(tmp_dir .. "/" .. f) end
     end
     local out = {}
-    local old_guids = {}
-    for i = 0, reaper.CountTracks(0) - 1 do old_guids[reaper.GetTrackGUID(reaper.GetTrack(0, i))] = true end
     local data_block, named, coll -- task 4e: the data block and the GUIDs of the tracks it names; 4f.6: the stored measurements
 
     local ok, err = pcall(function()
@@ -4212,12 +3260,11 @@ local function collect_jsfx_data(compare)
         reaper.gmem_write(6, 0)
         local run_id = math.floor(reaper.time_precise() * 1000) % 2000000000 + 1
 
-        reaper.gmem_write(162, SUB_MONO_CUTOFF_HZ)
         reaper.gmem_write(185, B15_C)
         -- task 5b: the layout follows the project: seconds = length + 2 s, then as many track slots as fit (header, tracks, master, master input)
         local nsec = math.ceil(reaper.GetProjectLength(0)) + 2
         local max_tr = math.min(4096, math.floor((MA_A.GMEM_SIZE - MA_HDR - nsec * 10 * (MA_MSTRIDE + MA_A.MISTRIDE)) / (nsec * MA_STRIDE)))
-        local tracks, skipped, inject_err = inject_analyzers(compare, max_tr)
+        local tracks, skipped, inject_err = inject_analyzers(max_tr)
         if not tracks then error(inject_err, 0) end
         MA_MAXSEC, MA_MAXTR = nsec, math.max(#tracks, 1)
         MA_MBASE = MA_HDR + MA_MAXTR * MA_MAXSEC * MA_STRIDE
@@ -4231,20 +3278,8 @@ local function collect_jsfx_data(compare)
             tm.total, tm.ins, tm.set, tm.hide, tm.send, tm.fx, tm.master, tm.check, tm.fixed, #tracks)
         out[#out + 1] = "JSFX handshake after injection: " .. (reaper.gmem_read(0) == MA_MAGIC and "yes" or "no (advisory only)")
 
-        local region, win0, win1
-        if compare then
-            region, win0, win1 = pick_debug_region()
-            reaper.gmem_write(160, win0)
-            reaper.gmem_write(161, win1)
-            reaper.gmem_write(162, SUB_MONO_CUTOFF_HZ)
-            for b = 1, #BAND_FREQS do
-                reaper.gmem_write(163 + b, BAND_FREQS[b])
-                reaper.gmem_write(175 + b, BAND_Q[b])
-            end
-        end
-
-        -- Comparison needs the rendered file in the project; the normal test renders without adding it
-        reaper.GetSetProjectInfo(0, "RENDER_ADDTOPROJ", compare and (render_opts | 1) or (render_opts & ~1), true)
+        -- The rendered file is not added to the project
+        reaper.GetSetProjectInfo(0, "RENDER_ADDTOPROJ", render_opts & ~1, true)
         -- Stage 3 thresholds (the JSFX reads them when the run id changes, so they go in before slot 9)
         local master_vol = reaper.GetMediaTrackInfo_Value(reaper.GetMasterTrack(0), "D_VOL")
         if master_vol < 1e-9 then master_vol = 1e9 end
@@ -4262,13 +3297,11 @@ local function collect_jsfx_data(compare)
         local render_t0 = reaper.time_precise()
         out[#out + 1] = string.format("Script work before the render command: %.1f s (the wait before the render window beyond this is REAPER's own)", render_t0 - run_t0)
         -- 42230 = render with the most recent settings and close the render window; task 4f.9: into the temporary folder (was the
-        -- dry run 43349); the Lua DSP comparison renders into the project's own render path and adds the file to the project
-        if tmp_dir then
-            reaper.RecursiveCreateDirectory(tmp_dir, 0)
-            clear_tmp()
-            reaper.GetSetProjectInfo_String(0, "RENDER_FILE", tmp_dir, true)
-            reaper.GetSetProjectInfo_String(0, "RENDER_PATTERN", "MixAssistant_temp", true)
-        end
+        -- dry run 43349)
+        reaper.RecursiveCreateDirectory(tmp_dir, 0)
+        clear_tmp()
+        reaper.GetSetProjectInfo_String(0, "RENDER_FILE", tmp_dir, true)
+        reaper.GetSetProjectInfo_String(0, "RENDER_PATTERN", "MixAssistant_temp", true)
         reaper.Main_OnCommand(42230, 0)
         local render_s = reaper.time_precise() - render_t0
         reaper.gmem_write(6, 0)
@@ -4279,7 +3312,7 @@ local function collect_jsfx_data(compare)
         out[#out + 1] = string.format("Project length %.1f s | project SR %d | JSFX reported SR %d | master seen: %s",
             proj_len, project_sr, reaper.gmem_read(2), reaper.gmem_read(10) == run_id and "yes" or "NO")
         out[#out + 1] = string.format("Render time %.1f s (%.1fx realtime, %s)", render_s, proj_len / math.max(render_s, 0.001),
-            compare and "normal render" or "render to a temporary file")
+            "render to a temporary file")
 
         local jsfx_sr = reaper.gmem_read(2)
         if jsfx_sr < 8000 then jsfx_sr = project_sr end
@@ -4390,7 +3423,7 @@ local function collect_jsfx_data(compare)
                 pk_ok and "yes" or "NO", cl_ok and "yes" or "NO")
         end
 
-        if not compare then
+        do
             data_block, named, coll = print_region_summary(out, tracks, max_sec, run_id, offsets)
             if coll then -- task 5a: the new master values per region
                 out[#out + 1] = "\nMASTER PER REGION (task 5a, report only): corr | sub corr | balance | width (broadband / bands) | peak | rms | crest | clips"
@@ -4404,13 +3437,6 @@ local function collect_jsfx_data(compare)
             end
         end
 
-        if compare then
-            local new_tracks = find_new_tracks(old_guids)
-            local lua_m = analyze_region(new_tracks, region, DEBUG_DURATION)
-            if not lua_m then error("Lua DSP found no rendered item for the region", 0) end
-            local fader_db = level_db(reaper.GetMediaTrackInfo_Value(reaper.GetMasterTrack(0), "D_VOL"))
-            print_dsp_comparison(out, region, run_id, lua_m, win0, win1, fader_db, new_tracks, max_sec)
-        end
     end)
 
     -- Cleanup ALWAYS runs (success, error or cancelled render)
@@ -4419,14 +3445,9 @@ local function collect_jsfx_data(compare)
     remove_analyzer_file()
     reaper.GetSetProjectInfo(0, "RENDER_ADDTOPROJ", render_opts, true)
     if close_opt >= 0 and close_opt & 1 == 0 then reaper.SNM_SetIntConfigVar("renderclosewhendone", close_opt) end
-    if tmp_dir then
-        reaper.GetSetProjectInfo_String(0, "RENDER_FILE", r_file, true)
-        reaper.GetSetProjectInfo_String(0, "RENDER_PATTERN", r_pat, true)
-        clear_tmp()
-    end
-    if compare then
-        for _, trk in ipairs(find_new_tracks(old_guids)) do reaper.DeleteTrack(trk) end
-    end
+    reaper.GetSetProjectInfo_String(0, "RENDER_FILE", r_file, true)
+    reaper.GetSetProjectInfo_String(0, "RENDER_PATTERN", r_pat, true)
+    clear_tmp()
     reaper.UpdateArrange()
 
 	local block_name = "Mix Assistant temp collection"
@@ -4445,20 +3466,13 @@ local function build_collected_prompt(data_block, named, listed, topic, snap) --
     return build_jsfx_prompt(data_block, cyaml, listed ~= nil and not topic, topic), cyaml
 end
 
---- The two JSFX test buttons: one collection, then the report (MixAssistant_report.txt) and the prompt (MixAssistant_prompt.txt) next to the script.
-local function run_collection_test(compare)
+--- The JSFX test button: one collection, then the report (MixAssistant_report.txt) and the prompt (MixAssistant_prompt.txt) next to the script.
+local function run_collection_test()
     reaper.ClearConsole()
-    local ok, out, data_block, named = collect_jsfx_data(compare)
+    local ok, out, data_block, named = collect_jsfx_data()
     if not out then return end
     local prompt_text
-    if ok and not compare then
-        -- Size of the project-structure YAML (read-only; measured after the cleanup so the analyzers are not in it)
-        local yok, yaml = pcall(extract_full_project_yaml)
-        if yok and type(yaml) == "string" then
-            out[#out + 1] = string.format("YAML (old scan, full, estimate): %d chars = about %d tokens", #yaml, MA_A.tokens(#yaml))
-        else
-            out[#out + 1] = "YAML size estimate failed: " .. tostring(yaml)
-        end
+    if ok then
         -- Task 4e: compact YAML and the whole prompt (saved next to the report)
         if data_block then
             local cyaml
@@ -4698,118 +3712,7 @@ end
 
 local chat_history = {}
 local chat_input_text = ""
-local report_saved_path = nil
 local scroll_to_bottom = false
-
-local TARGET_DESCRIPTIONS = {
-    [1] = "Drums & Bass",
-    [2] = "Instruments",
-    [3] = "Vocals",
-    [4] = "Full Mix",
-    [5] = "Soloed Tracks Only"
-}
-
-local function run_fresh_scan(target_mode, model_choice, mute_parallels, bypass_master_fx, duration_pref, output_api)
-    local target_name = TARGET_DESCRIPTIONS[target_mode] or "Full Mix"
-    local selected_model = get_model_name(model_choice)
-
-    chat_history = {}
-    local target_tracks = save_and_apply_mix_state(target_mode, mute_parallels, bypass_master_fx)
-
-    -- OPTIMIZATION: Only grab arrangement markers before render (instantaneous)
-    local song_regions = get_arrangement_markers()
-
-    local tracks_before = reaper.CountTracks(0)
-    local pre_render_guids = {}
-    for i = 0, tracks_before - 1 do
-        local trk = reaper.GetTrack(0, i)
-        if trk then pre_render_guids[reaper.GetTrackGUID(trk)] = true end
-    end
-
-    -- Automatically turn ON "Add rendered items to new tracks" in REAPER
-    local current_opts = math.floor(reaper.GetSetProjectInfo(0, "RENDER_ADDTOPROJ", 0, false))
-    reaper.GetSetProjectInfo(0, "RENDER_ADDTOPROJ", current_opts | 1, true)
-
-    reaper.Main_OnCommand(42230, 0)
-
-    -- 1. Receive dsp_error as the 3rd return value
-    local audio_metrics, rendered_tracks, dsp_error = analyze_ghost_render(song_regions, duration_pref, tracks_before, pre_render_guids)
-
-    -- 2. If analysis failed, evaluate dsp_error to decide what to show the user
-    if not audio_metrics then
-        if rendered_tracks then
-            for _, trk in ipairs(rendered_tracks) do reaper.DeleteTrack(trk) end
-        end
-
-        -- Restore tracks, but keep Master FX intact if already active
-        restore_mix_state()
-
-        -- CASE A: User aborted the render
-        if dsp_error == "CANCELLED" or (dsp_error and dsp_error:lower():find("cancel")) then
-            table.insert(chat_history, {
-                role = "alert",
-                content = "⚠️ Scan aborted: Render was cancelled by user. Mix state restored."
-            })
-
-        -- CASE B: Real error (e.g. checkbox missing, empty bounds, silent audio)
-        else
-            table.insert(chat_history, {
-                role = "alert",
-                content = "❌ " .. tostring(dsp_error or "DSP Processing failed.")
-            })
-        end
-
-        scroll_to_bottom = true
-        return false
-    end
-
-    -- Render succeeded! Extract YAML now while target tracks are still isolated
-    local project_yaml = extract_full_project_yaml()
-
-    -- Automatically undo the render to purge the track AND clear the undo stack
-    local last_undo = reaper.Undo_CanUndo2(0)
-    if last_undo and (last_undo:lower():find("render") or last_undo:lower():find("media")) then
-        reaper.Undo_DoUndo2(0)
-    else
-        if rendered_tracks then
-            for _, trk in ipairs(rendered_tracks) do reaper.DeleteTrack(trk) end
-        end
-    end
-
-    restore_mix_state()
-
-    -- Stage 6: Build prompt & export
-    local full_prompt = build_full_prompt(project_yaml, audio_metrics, target_name, target_tracks)
-    report_saved_path = save_prompt_to_txt(full_prompt, target_name)
-    save_tables_to_html(audio_metrics, report_saved_path, target_name)
-
-    -- Populate UI Tables
-    local initial_ui_msg = "Please analyze the mix for: **" .. target_name .. "**.\n"
-    if target_mode ~= 4 and target_tracks and #target_tracks > 0 then
-        initial_ui_msg = initial_ui_msg .. "\n**Active Tracks:**\n" .. table.concat(target_tracks, ", ") .. "\n"
-    elseif target_mode == 4 then
-        initial_ui_msg = initial_ui_msg .. " *(All tracks included).* \n"
-    end
-
-    -- =====================================================================
-    -- DYNAMIC METRICS TABLES FOR GUI (Splitting into 2 tables for neatness)
-    -- =====================================================================
-    initial_ui_msg = initial_ui_msg .. "\n### " .. TABLE_TITLES[1] .. "\n" .. build_markdown_table(DYNAMICS_COLUMNS, audio_metrics)
-    initial_ui_msg = initial_ui_msg .. "\n### " .. TABLE_TITLES[2] .. "\n" .. build_markdown_table(TONAL_COLUMNS, audio_metrics)
-
-    table.insert(chat_history, { role = "user", content = full_prompt, display_content = initial_ui_msg })
-
-    if output_api then
-        local reply = ask_deep_seek(chat_history, selected_model)
-        table.insert(chat_history, { role = "assistant", content = reply })
-        fetch_deep_seek_balance()
-    else
-        table.insert(chat_history, { role = "assistant", content = "Analysis saved to file:\n" .. (report_saved_path or "") })
-    end
-
-    scroll_to_bottom = true
-    return true
-end
 
 -- Task 4f: the JSFX path's session state and actions (one table, to save top-level locals)
 local AI = { collected = nil, sent = false, status = "" }
@@ -4882,7 +3785,7 @@ function AI.snapshot()
 end
 
 function AI.collect()
-    local ok, out, block, named, D = collect_jsfx_data(false)
+    local ok, out, block, named, D = collect_jsfx_data()
     if not out then AI.status = "Collection failed: the analyzer file could not be written." return end
     local script_dir = (debug.getinfo(1, "S").source or ""):match("^@(.*[\\/])") or (reaper.GetResourcePath() .. PATH_SEPARATOR)
     write_lines(script_dir .. "MixAssistant_report.txt", out)
@@ -5090,7 +3993,7 @@ AI.FOCUS = { { "Whole Song" }, { "Vocals", g = { vocals = true } }, { "Drums & B
     { "Stereo Image", tp = "stereo", text = "the stereo image: width, panning, side energy, mono compatibility" },
     { "Master & Loudness", tp = "master", text = "the master chain and the whole mix's loudness, dynamics and tonal balance (mastering)" } }
 
--- Task 4f.7a: focus name matching, a new classifier (get_track_category stays as it is for the old scan). A key matches the start of a
+-- Task 4f.7a: focus name matching, a new classifier. A key matches the start of a
 -- word, a WHOLE key only a whole word. Groups are checked in this order; the first that matches wins.
 AI.GROUP_KEYS = {
     { "drums", "drum kick snare tom toms clap rim ride crash splash china cymbal hat hats hihat hh oh ohs overhead perc shaker tamb conga bongo cajon kit bd sd 808 909" },
@@ -5348,24 +4251,7 @@ function AI.detail_send(model_choice, think, text, info)
     AI.ask(model_choice, think)
 end
 
-local function send_followup_message(user_text, model_choice)
-    if trim_string(user_text) == "" then return end
-    local selected_model = get_model_name(model_choice)
-
-    table.insert(chat_history, { role = "user", content = user_text })
-    scroll_to_bottom = true
-
-    local reply = ask_deep_seek(chat_history, selected_model)
-    table.insert(chat_history, { role = "assistant", content = reply })
-    fetch_deep_seek_balance()
-    scroll_to_bottom = true
-end
-
--- Combo-box item lists and the "Duration" -> seconds map (0 = analyze the full region)
-local TARGET_ITEMS = "Drums & Bass\0Instruments (No Drums/Bass/Vox)\0Vocals\0Full Mix\0Soloed Tracks Only\0\0"
 local MODEL_ITEMS = "DeepSeek V4 Pro (Flagship Reasoning)\0DeepSeek Flash (Fast / Low-Cost)\0\0"
-local DURATION_ITEMS = "10 Seconds\0" .. "20 Seconds\0" .. "Full Region\0\0"
-local DURATION_SECONDS = { [0] = 10, [1] = 20, [2] = 0 }
 
 local function main()
     -- Query live balance immediately upon launching the script
@@ -5428,7 +4314,7 @@ local function main()
 
             local _ -- throw-away for ImGui's 'changed' return values (keeps them out of the global scope)
 
-            -- COLLECT (task 4f; the old scan's button and options are out of the window, its code stays until task 4h)
+            -- COLLECT (task 4f)
             render_section_header(ctx, "  COLLECT AND MANAGE PROJECT INFORMATION")
             local is_busy = (scan_state and scan_state > 0)
             local bh, bpad = 26, 12 -- every button: the same height, horizontal padding inside
@@ -5535,10 +4421,6 @@ local function main()
 
 			if reaper.ImGui_SmallButton(ctx, "JSFX Collection Test") and not is_busy then
                 AI.keep(run_collection_test)
-            end
-            reaper.ImGui_SameLine(ctx)
-            if reaper.ImGui_SmallButton(ctx, "JSFX vs Lua DSP check") and not is_busy then
-                AI.keep(function() run_collection_test(true) end)
             end
 
 			-- 2. Strict Frame Delay & Click-Absorption Cooldown
