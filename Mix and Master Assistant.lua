@@ -661,10 +661,14 @@ local function extract_full_project_yaml(opts)
     end
     local function par(tr) if S then return S.parent[tr] end return reaper.GetParentTrack(tr) end
     local function gid(tr) if S then return S.guid[tr] end return reaper.GetTrackGUID(tr) end
+    -- task 5g.4: the project's rate only while its setting is switched on (otherwise the stored number is stale); else the rate the analyzers ran at
+    local function proj_rate()
+        local sr = reaper.GetSetProjectInfo(0, "PROJECT_SRATE_USE", 0, false) > 0 and reaper.GetSetProjectInfo(0, "PROJECT_SRATE", 0, false) or reaper.gmem_read(2)
+        return sr >= 8000 and math.floor(sr) or "Default"
+    end
     if opts and opts.take then
         local num, den = reaper.TimeMap_GetTimeSigAtTime(0, 0)
-        local sr = reaper.GetSetProjectInfo(0, "PROJECT_SRATE", 0, false)
-        S = { meta = { bpm = reaper.Master_GetTempo(), time_sig = string.format("%d/%d", num, den), sample_rate = sr > 0 and math.floor(sr) or "Default" },
+        S = { meta = { bpm = reaper.Master_GetTempo(), time_sig = string.format("%d/%d", num, den), sample_rate = proj_rate() },
             notes = trim_string(reaper.GetSetProjectNotes(0, false, "")), arr = get_arrangement_markers(), any_soloed = reaper.AnyTrackSolo(0),
             list = {}, parent = {}, guid = {}, has_children = {}, td = {}, cptr = {}, master = reaper.GetMasterTrack(0) }
         S.conns = get_all_connections(nil, S.cptr)
@@ -698,12 +702,11 @@ local function extract_full_project_yaml(opts)
         meta, proj_notes, arr = cp(S.meta), S.notes, cp(S.arr)
     else
         local num, den = reaper.TimeMap_GetTimeSigAtTime(0, 0)
-        local sr = reaper.GetSetProjectInfo(0, "PROJECT_SRATE", 0, false)
         proj_notes = trim_string(reaper.GetSetProjectNotes(0, false, ""))
         meta = {
             bpm = reaper.Master_GetTempo(),
             time_sig = string.format("%d/%d", num, den),
-            sample_rate = sr > 0 and math.floor(sr) or "Default"
+            sample_rate = proj_rate()
         }
         arr = get_arrangement_markers()
     end
@@ -1495,6 +1498,7 @@ local B15_C = 0.6423
 
 -- Stage 4 (feeding the JSFX data to the AI): all constants in ONE table to spare top-level locals.
 local MA_A = {
+    DEV = true, -- task 5g.1: developer switch. On: Collect writes MixAssistant_report.txt next to the script and saves the Whole Song prompt at once. Off: nothing in the script folder; a failed Collect leaves its report next to the project
     MIBASE = MA_MBASE + 18000 * MA_MSTRIDE, MISTRIDE = 4, -- master input records (JSFX role 2): K energy, count, run id, max |sample|
     GMEM_SIZE = 8388608, -- task 5b: REAPER's gmem slots; the layout (MA_MAXSEC, MA_MAXTR, MA_MBASE, MIBASE) is set per run in collect_jsfx_data
     TOP_N = 6, NOTABLE_DB = 3, BAND_RANGE_DB = 30, REGION_DEV_DB = 3, MASK_SHARE = 0.25, MASK_PAN = 100, MASK_OVERLAP = 25,
@@ -3121,7 +3125,7 @@ local function print_region_summary(out, tracks, max_sec, run_id, offsets)
     -- DATA BLOCK (task 4f.6: from the stored measurements, the same builder the send uses)
     D.m_peak, D.m_clips = m_peak, m_clips
     local text, named, omitted = build_data_block(D)
-    out[#out + 1] = "\nDATA BLOCK (the measured part of the prompt; the whole prompt is saved to MixAssistant_prompt.txt):\n" .. text
+    out[#out + 1] = "\nDATA BLOCK (the measured part of the prompt):\n" .. text
 
     -- TOKENS and SELF-CHECK
     local est = MA_A.tokens(#text)
@@ -3212,7 +3216,6 @@ local function build_jsfx_prompt(block, yaml, focus, topic) -- focus (task 4f.7b
     }, "\n")
 end
 
---- JSFX collection test: inject -> render (nothing added to the project) -> read gmem -> print numbers -> clean up.
 --- Task 4f.1: one JSFX collection run (analyzers + phantoms, render, read, cleanup that always runs, undo).
 -- Returns nil when the analyzer file cannot be written (a message box says why); otherwise ok, the report lines,
 -- the data block, the GUIDs of the tracks it names and the stored measurements (build_data_block).
@@ -3233,6 +3236,10 @@ local function collect_jsfx_data()
     -- the folder is emptied before the render too (no overwrite question).
     local _, r_file = reaper.GetSetProjectInfo_String(0, "RENDER_FILE", "", false)
     local _, r_pat = reaper.GetSetProjectInfo_String(0, "RENDER_PATTERN", "", false)
+    -- Task 5g.6: this run renders the master mix over the entire project whatever the Render window says; both restored in the cleanup.
+    -- Cleared bits of RENDER_SETTINGS: 1, 2 stems; 8 render matrix; 32, 64, 128 selected items / tracks; 2048 second pass (would measure twice)
+    local r_src = math.floor(reaper.GetSetProjectInfo(0, "RENDER_SETTINGS", 0, false))
+    local r_bounds = math.floor(reaper.GetSetProjectInfo(0, "RENDER_BOUNDSFLAG", 0, false))
     local tmp_dir = (os.getenv("TEMP") or os.getenv("TMP") or reaper.GetResourcePath()) .. "/MixAssistant_render"
     local function clear_tmp()
         reaper.EnumerateFiles(tmp_dir, -1) -- rescan, REAPER caches the listing
@@ -3247,6 +3254,7 @@ local function collect_jsfx_data()
     end
     local out = {}
     local data_block, named, coll -- task 4e: the data block and the GUIDs of the tracks it names; 4f.6: the stored measurements
+    local rate_warn -- task 5g.3: set when the device rate differs from the project rate; goes to the status line with coll
 
     local ok, err = pcall(function()
         reaper.gmem_attach(GMEM_NAME)
@@ -3302,6 +3310,9 @@ local function collect_jsfx_data()
         clear_tmp()
         reaper.GetSetProjectInfo_String(0, "RENDER_FILE", tmp_dir, true)
         reaper.GetSetProjectInfo_String(0, "RENDER_PATTERN", "MixAssistant_temp", true)
+        reaper.GetSetProjectInfo(0, "RENDER_SETTINGS", r_src & ~(1 | 2 | 8 | 32 | 64 | 128 | 2048), true)
+        reaper.GetSetProjectInfo(0, "RENDER_BOUNDSFLAG", 1, true)
+        out[#out + 1] = string.format("Render for this run: master mix, entire project (the project's own settings, restored afterwards: source flags %d, bounds %d)", r_src, r_bounds)
         reaper.Main_OnCommand(42230, 0)
         local render_s = reaper.time_precise() - render_t0
         reaper.gmem_write(6, 0)
@@ -3315,6 +3326,12 @@ local function collect_jsfx_data()
             "render to a temporary file")
 
         local jsfx_sr = reaper.gmem_read(2)
+        -- task 5g.3: the rate the project works at: its own setting if switched on, else the render rate if one is set (0 = neither, no warning)
+        local want_sr = reaper.GetSetProjectInfo(0, "PROJECT_SRATE_USE", 0, false) > 0 and project_sr or reaper.GetSetProjectInfo(0, "RENDER_SRATE", 0, false)
+        if want_sr > 0 and jsfx_sr >= 8000 and math.abs(jsfx_sr - want_sr) > 0.5 then
+            rate_warn = string.format("Warning: the audio device runs at %d Hz, this project at %d Hz, so the render is slower and the numbers differ slightly. Set the device to %d Hz, then Collect again.", jsfx_sr, want_sr, want_sr)
+            out[#out + 1] = "WARNING: " .. rate_warn:gsub("^Warning: ", "")
+        end
         if jsfx_sr < 8000 then jsfx_sr = project_sr end
         local offsets, edge_lo, edge_hi = band15_calibration(jsfx_sr)
         local edge_min, edge_max = 0, -99
@@ -3447,6 +3464,8 @@ local function collect_jsfx_data()
     if close_opt >= 0 and close_opt & 1 == 0 then reaper.SNM_SetIntConfigVar("renderclosewhendone", close_opt) end
     reaper.GetSetProjectInfo_String(0, "RENDER_FILE", r_file, true)
     reaper.GetSetProjectInfo_String(0, "RENDER_PATTERN", r_pat, true)
+    reaper.GetSetProjectInfo(0, "RENDER_SETTINGS", r_src, true)
+    reaper.GetSetProjectInfo(0, "RENDER_BOUNDSFLAG", r_bounds, true)
     clear_tmp()
     reaper.UpdateArrange()
 
@@ -3455,6 +3474,7 @@ local function collect_jsfx_data()
     if reaper.Undo_CanUndo2(0) == block_name then reaper.Undo_DoUndo2(0) end
 
     if not ok then out[#out + 1] = "ERROR: " .. tostring(err) end
+    if coll then coll.warn = rate_warn end
     return ok, out, data_block, named, coll
 end
 
@@ -3466,42 +3486,6 @@ local function build_collected_prompt(data_block, named, listed, topic, snap) --
     return build_jsfx_prompt(data_block, cyaml, listed ~= nil and not topic, topic), cyaml
 end
 
---- The JSFX test button: one collection, then the report (MixAssistant_report.txt) and the prompt (MixAssistant_prompt.txt) next to the script.
-local function run_collection_test()
-    reaper.ClearConsole()
-    local ok, out, data_block, named = collect_jsfx_data()
-    if not out then return end
-    local prompt_text
-    if ok then
-        -- Task 4e: compact YAML and the whole prompt (saved next to the report)
-        if data_block then
-            local cyaml
-            prompt_text, cyaml = build_collected_prompt(data_block, named)
-            if prompt_text then
-                out[#out + 1] = string.format("PROMPT (task 4e, estimate): compact YAML %d chars = about %d tokens | whole prompt %d chars = about %d tokens",
-                    #cyaml, MA_A.tokens(#cyaml), #prompt_text, MA_A.tokens(#prompt_text))
-            else
-                out[#out + 1] = "PROMPT build failed: " .. tostring(cyaml)
-            end
-        end
-    end
-    -- The console window drops the oldest lines when the text is long, so the full report is also saved to a file next to the script
-    local script_dir = (debug.getinfo(1, "S").source or ""):match("^@(.*[\\/])") or (reaper.GetResourcePath() .. PATH_SEPARATOR)
-    if prompt_text then
-        local pf = io.open(script_dir .. "MixAssistant_prompt.txt", "w")
-        if pf then pf:write(prompt_text, "\n") pf:close() else out[#out + 1] = "Could not save MixAssistant_prompt.txt" end
-    end
-    local report_path = script_dir .. "MixAssistant_report.txt"
-    local rf = io.open(report_path, "w")
-    if rf then
-        rf:write(table.concat(out, "\n"), "\n")
-        rf:close()
-    else
-        out[#out + 1] = "Could not save the report file: " .. report_path
-    end
-    -- The console opens only when something went wrong (error or no file); otherwise the report file is the only output
-    if not (rf and ok) then reaper.ShowConsoleMsg(table.concat(out, "\n") .. "\n") end
-end
 
 -- ==============================================================================
 -- 11. UNIFIED CHATBOX & WORKFLOW CONTROLLER
@@ -3760,7 +3744,6 @@ function AI.ask(model_choice, think, est)
     return u ~= nil, u
 end
 
---- "Collect Data": one collection run (report to MixAssistant_report.txt next to the script), then the prompt, saved next to the project like the old flow.
 --- Task 4g.3: every setting the prompts use, read once at Collect (the project exactly as it sounds in the measurement,
 -- without the analyzers): the YAML parts (extract_full_project_yaml take mode) + per track the automation, the return candidates
 -- (counted sends on channels 1/2), the name group, is_return (non-folder answer), muted along the folder chain and the selection.
@@ -3784,18 +3767,40 @@ function AI.snapshot()
     return S
 end
 
+--- "Collect": one collection run, then the Whole Song prompt. Task 5g.1: with MA_A.DEV the report goes next to the script and the prompt is
+-- saved next to the project at once (Copy / Send then find it saved); without it only a failed run leaves a report, next to the project.
 function AI.collect()
     local ok, out, block, named, D = collect_jsfx_data()
     if not out then AI.status = "Collection failed: the analyzer file could not be written." return end
-    local script_dir = (debug.getinfo(1, "S").source or ""):match("^@(.*[\\/])") or (reaper.GetResourcePath() .. PATH_SEPARATOR)
-    write_lines(script_dir .. "MixAssistant_report.txt", out)
+    local function report_path()
+        local dir
+        if MA_A.DEV then
+            dir = (debug.getinfo(1, "S").source or ""):match("^@(.*[\\/])")
+        else
+            local _, pf = reaper.EnumProjects(-1, "")
+            dir = pf and pf:match("^(.*[\\/])")
+            if not dir then
+                local p = reaper.GetProjectPath("")
+                dir = p and p ~= "" and (p .. PATH_SEPARATOR) or nil
+            end
+        end
+        return (dir or (reaper.GetResourcePath() .. PATH_SEPARATOR)) .. "MixAssistant_report.txt"
+    end
+    local function fail(what, msg)
+        local path = report_path()
+        AI.status = what .. msg .. (write_lines(path, out) and (" (details in " .. path .. ")") or (" (the report could not be saved to " .. path .. ")"))
+    end
     if not (ok and block) then
-        AI.status = "Collection failed: " .. tostring(out[#out]):gsub("^ERROR: ", "") .. " (details in MixAssistant_report.txt)"
+        fail("Collection failed: ", (tostring(out[#out]):gsub("^ERROR: ", "")))
         return
     end
     -- task 4g.3: read after the collection's cleanup (analyzers removed, the run undone; REAPER blocks editing while it renders)
     local sok, S = pcall(AI.snapshot)
-    if not sok then AI.status = "Reading the project settings failed: " .. tostring(S) return end
+    if not sok then
+        out[#out + 1] = "ERROR: reading the project settings failed: " .. tostring(S)
+        fail("Reading the project settings failed: ", tostring(S))
+        return
+    end
     -- task 5e2: muted (also by a folder), no measured sound and no Mute envelope on the way up: see extract_full_project_yaml
     local sound = {}
     for _, d in ipairs(D.over) do
@@ -3813,15 +3818,31 @@ function AI.collect()
             if not envelope then S.silent[tr] = true end
         end
     end
-    local prompt, err = build_collected_prompt(block, named, nil, nil, S)
-    if not prompt then AI.status = "Prompt build failed: " .. tostring(err) return end
+    local prompt, cyaml = build_collected_prompt(block, named, nil, nil, S)
+    if not prompt then
+        out[#out + 1] = "ERROR: the prompt build failed: " .. tostring(cyaml)
+        fail("Prompt build failed: ", tostring(cyaml))
+        return
+    end
     -- Task 4f.6: the measurements are kept (D), prompts are built per focus from them (cache, keyed by the focus name);
-    -- Whole Song is built now so a build error shows at once. The file is saved at send / copy time (AI.full_prompt).
+    -- Whole Song is built now so a build error shows at once. The file is saved at send / copy time (AI.full_prompt), with MA_A.DEV also below.
     -- Task 4g.3: snap = the settings at the measurement; every prompt and the focus lists come from it until the next Collect.
     AI.collected = { D = D, snap = S, cache = { [AI.FOCUS[1][1]] = { prompt = prompt, tokens = MA_A.tokens(#prompt) } },
         when = os.date("%H:%M"), changes = reaper.GetProjectStateChangeCount(0), soloed = reaper.AnyTrackSolo(0),
         undo = reaper.Undo_CanUndo2(0) or "", sel = AI.sel_sig() } -- task 4f.7b: see AI.changed
     AI.sent = false
+    if MA_A.DEV then
+        out[#out + 1] = string.format("PROMPT (task 4e, estimate): compact YAML %d chars = about %d tokens | whole prompt %d chars = about %d tokens",
+            #cyaml, MA_A.tokens(#cyaml), #prompt, MA_A.tokens(#prompt))
+        local pok, text, e = pcall(AI.full_prompt, 1)
+        if pok and text and e.path then
+            out[#out + 1] = "PROMPT FILE: " .. e.path
+        else
+            out[#out + 1] = "Whole Song prompt not saved: " .. tostring(not pok and text or (not text and e) or "the file could not be written")
+        end
+        local path = report_path()
+        if not write_lines(path, out) then reaper.ShowConsoleMsg("Could not save the report file: " .. path .. "\n") end
+    end
 end
 
 --- Task 4f.6: the collected prompt for focus i (without the soloed note and the FOCUS line), built from the stored measurements on
@@ -4129,7 +4150,7 @@ function AI.full_prompt(i)
     return text, e
 end
 
---- Runs a collection run (fn: Collect or a test button) without marking the earlier collection as outdated: every run undoes its own
+--- Runs a collection run (fn: Collect) without marking the earlier collection as outdated: every run undoes its own
 -- changes, so a project that was unchanged before the run is unchanged after it (REAPER's change counter still moves).
 function AI.keep(fn)
     local c, before = AI.collected, reaper.GetProjectStateChangeCount(0)
@@ -4411,6 +4432,7 @@ local function main()
                     st, col = string.format("Project changed since Collect at %s. Prompts describe the project as it was then; Collect again to include your changes (free). %s",
                         c.when, st), 0xFFB74DFF
                 end
+                if c.D.warn then st, col = c.D.warn .. " " .. st, 0xFFB74DFF end -- task 5g.3: device rate differs from the project rate
             else
                 st = "No project info yet. Click Collect Project Info (free)."
             end
@@ -4418,10 +4440,6 @@ local function main()
             reaper.ImGui_TextWrapped(ctx, "Status: " .. st)
             reaper.ImGui_PopStyleColor(ctx, 1)
             reaper.ImGui_Separator(ctx)
-
-			if reaper.ImGui_SmallButton(ctx, "JSFX Collection Test") and not is_busy then
-                AI.keep(run_collection_test)
-            end
 
 			-- 2. Strict Frame Delay & Click-Absorption Cooldown
             -- (the status line is drawn a few frames before the blocking action runs)
