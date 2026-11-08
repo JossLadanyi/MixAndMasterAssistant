@@ -6,63 +6,48 @@
 
 An audio analysis and AI mixing assistant embedded directly inside **Cockos REAPER**.
 
-The script performs a non-destructive render of your mix or isolated stems, extracts mastering-grade DSP metrics across project regions, serializes routing and FX parameter states into compact YAML, and provides feedback either directly via the **DeepSeek API** or through exportable prompts for web-based LLMs.
+One click renders your project once and measures every track and the master while it plays. The script turns the measurements and your routing and plugin settings into a compact prompt, then sends it to the **DeepSeek API** or copies it so you can paste it into a web chat. Keeping the prompt small (few tokens) is the main design goal.
 
 ## 🌟 Features
 
-### 1. 9-Band Mastering DSP Engine
+### 1. One-Render Measurement (JSFX analyzers)
 
-Extracts dynamic and tonal metrics per region using accurate biquad (RBJ) band-pass filters:
+Collect Project Info renders the project **once** into a temporary folder. During the render, small analyzer plugins (JSFX, written by the script itself) measure:
 
-- **Dynamics:** True Peak (dBFS), RMS (dBFS), and Crest Factor (dB).
-- **Stereo Field:** Stereo width percentage (`width_pct`) and full-spectrum phase correlation (`phase_corr`, -1.0 to +1.0).
-- **Gated Sub-Mono Phase Check:** Evaluates stereo phase correlation below 120 Hz using a 24 dB/oct (Linkwitz-Riley) low-pass and a `-50 dBFS` threshold gate, which prevents quiet tails and plugin noise floors from triggering false phase alerts. The cutoff is configurable (`SUB_MONO_CUTOFF_HZ`).
-- **9 Frequency Bands (dBFS):** Sub (60 Hz), Punch (120 Hz), Mud (250 Hz), Boxy (500 Hz), Mid/Core (1 kHz), Presence (3 kHz), Harshness (6 kHz), Sibilance (8 kHz), and Air (12 kHz).
-    - Every band has exact center frequency and 0 dB gain, so levels are true band energy.
-    - Each band is as wide as its closest neighbor allows (1 octave from 60 Hz to 3 kHz, about 0.4 octave for 6 kHz and 8 kHz, about 0.6 octave for 12 kHz), so neighboring bands touch but never overlap.
-    - Levels are **octave-normalized** by default: each value is the level a 1-octave-wide band would have, so narrow and wide bands stay directly comparable. Set `NORMALIZE_BANDS_TO_OCTAVE = false` for raw band-limited RMS.
+- **Per track and second:** level, peak, crest factor, 15 frequency bands, stereo correlation and width, sub-mono check (below 120 Hz), clipped samples, and when the track plays.
+- **Master, every 100 ms:** loudness (integrated, momentary, short-term, LRA), 15 mid and 15 side bands, correlation, sub-mono check, balance, peak and clips, plus the level going into the master chain.
+- **15 frequency bands** from 20 Hz to 20 kHz (rumble, deep sub, sub, bass/punch, body/warmth, mud, boxy, hollow/honk, nasal, bite, presence, harsh, sibilance, sizzle, air). Bands touch at -3 dB, so they add up to the broadband level.
 
-### 2. Mix State Manager & Isolated Target Auditioning
+The analyzers sit on hidden copies of your tracks ("phantom" tracks, measured after the fader), so your own tracks are not changed. Everything is removed again afterwards (one undo step), your render settings are restored and the temporary folder is emptied. A cancelled render or an error cleans up the same way.
 
-- **Targets:** Full Mix, Vocals, Drums & Bass, Instruments, or Soloed Tracks Only.
-- **Routing Awareness:** Understands folder hierarchies and can optionally mute parallel busses or bypass Master FX during stem auditioning.
-- **State Restoration:** Restores track mutes, solos, and Master FX to their exact pre-scan states when finished or if a render is cancelled.
-- **Cancellation Handling:** Detects cancelled renders via REAPER project settings and logs the status directly to the chat interface without modal error dialogs.
+### 2. Compact Project Serializer (YAML)
 
-### 3. Active Track Detection
+- Routing, sends (only sidechains are labelled) and plugin settings as short YAML.
+- Plugin settings only where they matter: full settings for the tracks the question is about, names only for the rest. Default values, bypassed modules, screen-only controls and repeated settings ("same as plugin 2 on Vocal") are left out.
+- Optional `MixAssistant_plugin_notes.txt` next to the script: a short note per plugin (or maker) for the AI, and settings to drop from the YAML.
 
-Cross-references track audio items against project regions. If an instrument does not play during a specific section, the assistant will not critique or recommend changes for that instrument during that region. Only regions are analyzed; markers are ignored for analysis (they still appear in the project YAML).
+### 3. Focus Prompts
 
-### 4. Token-Optimized Project Serializer
+One prompt per focus, built from the same measurements without a new render: **Whole Song**, **Vocals**, **Drums & Bass**, **Guitars**, **Keys & Synths**, **Strings & Brass**, **Instruments**, **Effects & Returns**, **Selected Tracks**, and the topics **Low End**, **Mids**, **High End**, **Stereo Image**, **Master & Loudness**.
 
-- Suppresses default bypass states, inactive EQ bands, and irrelevant UI controls.
-- Abbreviates common audio parameter names (`freq`, `thr`, `rel`, `att`, `gn`) in a fixed, deterministic order to minimize token usage when communicating with language models.
+- The prompt describes the song per region: master numbers (flagged only when notable), the loudest tracks, bands that stand out, and masking between tracks that really play together.
+- The AI answers in a fixed format: overview, areas, and a priority table of at most 12 fixes.
+- The prompt shows the project as it was when you collected; a warning appears when the project changed since.
 
-### 5. ReaImGui Interface
+### 4. Send, Copy, Track Detail
 
-- Fixed-fit tables for regional dynamics and tonal balance metrics.
-- Color-coded role badges for conversation history.
-- Chat messages are parsed once and cached, so long conversations stay responsive.
-- Asynchronous balance query that does not block the UI during startup or manual refreshes.
-
-### 6. File Exporter with Auto-Numbering
-
-Every scan exports:
-
-- **Prompt File (`.txt`):** Full project configuration and DSP metrics ready to copy into web LLMs (ChatGPT, Claude, Gemini).
-- **Visual Summary (`.html`):** Standalone, styled HTML tables for viewing regional metrics in any browser.
-- **Auto-Numbering:** Automatically appends sequential counters (`_01`, `_02`) to prevent overwriting previous reports.
-
-### 7. Low-Memory Streaming Analysis
-
-Audio is analyzed in 1-second blocks instead of one large buffer per region, so memory stays flat (about 6 MB for a 60 s region instead of about 128 MB) and even "Full Region" scans of long sections are safe. Results are identical regardless of block size.
+- **Send Project Info to Agent:** DeepSeek Flash (default, low cost) or Pro, with optional "Think". The estimated cost is shown before sending, the real cost after the answer.
+- **Copy Project Info:** the whole prompt on the clipboard for a web chat (no API key needed). The prompt is also saved as `AI_Mix_Prompt_JSFX_<focus>.txt` next to the project, numbered so nothing is overwritten.
+- **Send Track Detail...:** after a first answer, sends the full settings of the tracks you selected into the same chat (asks before sending).
+- Follow-up questions in the chat box, **Copy Chat**, **Clear Chat**, a live account balance and a colour-coded, cached Markdown conversation view.
 
 ## 📋 Requirements
 
 1. **REAPER** v6.0 or higher (v7.x supported).
 2. **ReaImGui** extension (installed via ReaPack).
-3. **cURL** (standard on Windows 10/11 and macOS/Linux).
-4. **DeepSeek API Key** _(Optional — only required for direct in-app API queries)._
+3. **SWS extension** (recommended: lets the script close the render window by itself).
+4. **cURL** (standard on Windows 10/11 and macOS/Linux).
+5. **DeepSeek API key** _(optional: only for Send; Copy works without it)._
 
 ## 🚀 Installation
 
@@ -81,83 +66,47 @@ Audio is analyzed in 1-second blocks instead of one large buffer per region, so 
 4. Select the downloaded `.lua` file.
 5. (Optional) Assign a keyboard shortcut or toolbar icon to the action.
 
-## ⚙️ Mandatory One-Time Render Setup
+The analyzer plugin needs no installation: the script writes it to REAPER's `Effects/MixAssistant` folder when you collect and removes it afterwards.
 
-The assistant relies on REAPER's native render engine. Set these options once to ensure background analysis functions correctly:
+### 3. API key (only for Send)
+
+Create a text file `apikey.txt` next to the script with your DeepSeek key on the first line. Keep it out of any public repository.
+
+## ⚙️ One-Time Render Setup
 
 1. Open **File > Render...** (`Ctrl+Alt+R` on Windows / `Cmd+Opt+R` on macOS).
-2. Configure the following:
-    - **Source:** `Master mix`
-    - **Bounds:** `Entire project`
-    - **Directory:** Set your project folder or a temp directory (e.g., `C:\temp`).
-    - **File name:** `temp_mix_render`
-    - **Format:** `WAV`, `24-bit PCM`, `44100 Hz`, `Stereo`
-    - **Render Speed:** `Full-speed Offline`
-3. Under **Options**, ensure these three boxes are checked:
-    - [x] **Add rendered items to new tracks in project**
-    - [x] **Silently increment filenames to avoid overwriting**
-    - [x] **Auto-close all render windows when finished**
-4. Click **Save settings** (do not click Render).
+2. Set **Source:** `Master mix` and **Bounds:** `Entire project`.
+3. Click **Save settings** (do not click Render).
+
+The script sets the folder, the file name, "add to project" and "auto-close" itself for its render and restores your settings afterwards. Tip: set the audio device to the project sample rate; the analyzers run at the device rate, and a different rate renders slower.
 
 ## 📖 Usage
 
-1. **Set Regions:** Add standard REAPER regions across your project timeline (`Verse`, `Chorus`, etc.).
-2. **Run the Script:** Open the assistant from your Actions list or toolbar.
-3. **Configure Your Scan:**
-    - **Target:** Choose what to analyze (_Full Mix_, _Vocals_, _Drums & Bass_, _Instruments_, or _Soloed Tracks Only_).
-    - **Duration:** Set analysis window per section (_10s_, _20s_, or _Full Region_).
-    - **AI Model:** Select `DeepSeek V4 Pro` (reasoning/critique) or `DeepSeek Flash` (fast/budget).
-    - **Mute Parallels / Bypass Master FX:** Recommended checked to evaluate clean stem tone.
-4. **Run Analysis:** Click **Run Fresh Scan & Reset Chat**.
-5. **Review Results:**
-    - Review the regional **Macro-Dynamics** and **Tonal Balance** tables directly in the conversation log.
-    - Send follow-up questions in the chat box (e.g., _"How can I fix the harshness in Chorus 1?"_).
-    - Click **Copy Chat** at any time to copy the entire conversation to your clipboard.
+1. **Set regions:** add standard REAPER regions across the timeline (`Intro`, `Verse`, `Chorus`, ...). Regions are what the prompt describes; markers only appear in the project YAML.
+2. **Bypass** any plugin that only colours your monitoring (e.g. a headphone correction) on the master, so the measurements describe the mix.
+3. **Collect Project Info.** The render takes about as long as the project (offline speed). A free step: nothing is sent anywhere.
+4. Pick a **Focus** (the combo shows the track count of each group; hovering lists the tracks) and an **AI Model**.
+5. **Send Project Info to Agent**, or **Copy Project Info** and paste it into a web chat.
+6. Ask follow-up questions, or select tracks and use **Send Track Detail...**.
 
-If you plan to use direct in-DAW chat with DeepSeek:
-
-1. Open `Mix and Master Assistant.lua` in any text editor or inside the REAPER IDE.
-2. Near the top of the file, enter your API key:
-    ```lua
-    local API_KEY = "sk-your-actual-deepseek-api-key-here"
-    ```
+**Limit:** tracks × song length must fit in the analyzer memory (for example 128 tracks for about 30 minutes, or 49 tracks for about 68 minutes, at most 4096 tracks). Collect says so before it changes anything.
 
 ## 🔧 Tuning
 
-These constants are in the configuration block at the top of the script:
-
-| Constant | Default | Purpose |
+| Setting | Default | Purpose |
 | --- | --- | --- |
-| `API_KEY` | placeholder | DeepSeek API key (not needed for `.txt` export mode). |
-| `MAX_PLUGIN_PARAMS` | `128` | Maximum parameters captured per plugin (precision vs. tokens). |
-| `SUB_MONO_CUTOFF_HZ` | `120` | Everything below this frequency is checked for mono compatibility. |
-| `NORMALIZE_BANDS_TO_OCTAVE` | `true` | Report each tonal band as a 1-octave-equivalent level. `false` gives raw band-limited RMS. |
+| `MAX_PLUGIN_PARAMS` (script) | `128` | Maximum parameters read per plugin (precision vs. tokens). |
+| `MixAssistant_plugin_notes.txt` | optional | Notes for the AI and settings to drop, per plugin or maker. |
+| `apikey.txt` | none | DeepSeek key (first line). |
 
 ## 📝 Changelog
 
-### v5.6
+### v6.0
 
-**DSP fixes (results change):**
-
-- Replaced the Chamberlin state-variable band filters with RBJ biquad band-pass filters. The old filters had +6 dB peak gain on every band and strong frequency warping in the upper bands at 44.1 kHz (the 6 kHz, 8 kHz and 12 kHz bands actually peaked at about 6.9 kHz, 10 kHz and 22 kHz).
-- Band widths are now derived from the neighboring bands (no overlap), and levels are octave-normalized.
-- The sub-mono check now uses a 24 dB/oct low-pass at 120 Hz, matching its documented range (it previously low-passed at 60 Hz with a shallow slope).
-- Tonal values, especially in the upper bands, will differ from reports made with earlier versions.
-
-**Performance (output unchanged):**
-
-- Streaming 1-second block analysis (about 20x less memory on long regions).
-- Markdown chat rendering is cached per message instead of re-parsed every frame.
-- Plugin parameter names are read once per plugin and cleaned names are cached.
-- Active-track lookup is built once per scan instead of once per region.
-- Balance polling is throttled; duplicated code was consolidated into shared helpers.
-
-**Bug fixes:**
-
-- Fixed a crash during analysis when the project contained markers in addition to regions.
-- Parameter abbreviations are now applied in a fixed order (previously undefined, e.g. for "bandwidth" vs. "width").
-- JSON parser handles UTF-16 surrogate pairs (emoji in AI replies).
-- Removed a leaked global variable in the GUI loop.
+- **New measurement:** JSFX analyzers replace the Lua analysis of a rendered file. 15 bands instead of 9, per second per track and per 100 ms on the master, from one render that leaves no trace in the project.
+- **New prompt:** focus prompts, compact YAML, per-region lines with flagged values only, masking only between tracks that play together, cost shown before sending.
+- **New buttons:** Collect, Send, Copy, Send Track Detail; DeepSeek Flash is the default model.
+- **Removed:** the old "Run Fresh Scan" (solo / mute isolation, the 9-band Lua DSP, HTML tables). Earlier versions are in the git history.
 
 ## 📄 License
 
