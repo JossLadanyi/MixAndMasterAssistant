@@ -70,10 +70,10 @@ SONG I-12.8 M-8.0 S-9.8 LRA7.5 pk-1.0 clip0 | mid rumble-40.0 deepsub-30.0 ... a
 ### Master chain line
 
 ```
-chain in I-17.5 M-13.0 LRA7.5 > out I-12.8 M-8.0 LRA7.5 gain+4.7
+chain in I-17.5 M-13.0 LRA7.5 gain+4.7
 ```
 
-Shows the master's loudness before and after the master FX. `gain` is the loudness the chain adds (dB).
+Shows the master's loudness before the master FX; the line above gives it after them. `gain` is the loudness the chain adds (dB).
 
 ### Track lines
 
@@ -105,8 +105,8 @@ Tracks with no path to the master are left out.
 A `REGIONS` block follows, with one block per region:
 
 ```
-R2 Verse_1 10.7-53.3 | I-14.5 M-9.7 S-11.8 LRA5.5 W27 | presence-3 sibilance-4
- chain in I-19.5 M-14.7 LRA5.7 > out I-14.5 M-9.7 LRA5.5 gain+5.0
+R2 Verse_1 10.67-53.33 | I-14.5 M-9.7 S-11.8 LRA5.5 W27 | presence-3 sibilance-4
+ chain in I-19.5 M-14.7 LRA5.7 gain+5.0
  Bass s22 L-27.6 pk-9.8 cr13 a75 W16 c.93 pL1 | sub+3 bass+4
  Lead_Vox s21 L-22.8 pk-8.8 cr13 a91 W0 c1.00 pC | mud+4
  R2 also Pad a100, Hi_Hat a31, Reverb a88
@@ -119,7 +119,7 @@ R2 Verse_1 10.7-53.3 | I-14.5 M-9.7 S-11.8 LRA5.5 W27 | presence-3 sibilance-4
 | Chain line | The master chain line for this region |
 | Track lines | The region's top tracks by share, with the same fields as above, measured over this region |
 | `R n also` | Every other track playing in the region; `a` = % of the region it plays |
-| `mask` | Hz ranges where 2 or more of the top tracks each hold at least 25% of the energy. The number is each track's % of all energy in that range |
+| `mask` | Hz ranges where 2 or more of the top tracks each hold at least 25% of the energy, measured over the seconds they play together. The number is each track's % of all energy in that range. A pair counts only if it plays together for at least 25% of the shorter track's playing time |
 
 The master numbers on a region line also include `c`, `pL n` / `pR n`, `sub!` and `clip n`, but only when notable: `c` below 0, balance 12 or more, any clipped samples. No value shown means normal.
 
@@ -129,15 +129,17 @@ A note marked `approx` means those tracks' shares are approximate, because their
 
 Compact YAML. Short lists and settings stay on one line (`{key: value, ...}`), and a value at its default is usually left out.
 
-### Notes, meta and arrangement
+### Notes, meta and markers
 
 ```yaml
 additional_information:
   - the project notes, then one line per plugin note
 meta: {bpm: 120.0, sample_rate: 44100, time_sig: 4/4}
 arr:
-  - {end_s: 53.33, name: Verse 1, start_s: 10.67, type: region}
+  - {name: Drop, start_s: 53.33, type: marker}
 ```
+
+`arr` holds only markers and is left out when there are none. Regions are on the region lines of the measured data.
 
 ### Connections
 
@@ -167,13 +169,9 @@ tracks:
     parent: Vocals
     auto: "Volume (Pre-FX), Send Volume"
     fx:
-      - name: Ducking Comp (ReaComp)
-        wet: 80%
-        params: {att: 5.0 ms, band_1: {freq: 181, gn: 2.0}, out: 0.0 dB}
-      - name: Old EQ
-        bypassed: true
-      - name: Second Comp
-        params: same as plugin 1 on Harmony
+      - Ducking Comp (ReaComp, wet 80%): {att: 5.0 ms, band_1: {freq: 181, gn: 2.0}, out: 0.0 dB}
+      - Old EQ (bypassed)
+      - Second Comp: same as plugin 1 on Harmony
   - track: Pad
     fx: Synth (instrument) > EQ > Chorus
 ```
@@ -188,20 +186,25 @@ tracks:
 | `auto` | Names of the envelopes on the track | Only when it has some |
 | `fx` | The plugin chain, in order | Only when it has plugins |
 
+Muted tracks, and tracks inside a muted folder, that made no sound in the measurement are left out, along with their sends. A track with mute automation stays, and so does a folder that still holds a kept track.
+
 Inside `fx`:
 
 | Form | Meaning |
 |---|---|
-| `fx: A > B` | Plugin names only, used for most tracks; `(instrument)` marks an instrument |
-| `fx:` with a list | Full settings, used for the master and the tracks named under Regions, with their folders |
-| `name` | Plugin name; a renamed plugin shows the original in brackets |
-| `type: instrument` | The plugin is an instrument |
-| `bypassed: true` | The plugin is switched off |
-| `wet` | REAPER's mix knob for the plugin |
-| `params: {...}` | The settings, as the plugin reports them |
+| `fx: A > B` | Plugin names only, used for most tracks |
+| `fx:` with a list | Full settings, one line per plugin, used for the master and the tracks named under Regions, with their folders |
+| `Name: {...}` | The plugin and its settings, as the plugin reports them |
+| `Name: same as plugin N on TRACK` | Exactly the settings of the Nth plugin in that track's chain |
+| `Name` alone | A plugin with no settings to show, such as one that is bypassed |
+| `(...)` after a name | Any of: the original name of a renamed plugin, `instrument`, `bypassed`, `wet NN%` (REAPER's mix knob for the plugin) |
 | `band_1: {freq: 181}` | Grouped shorthand: settings with a common name start, here `band_1_freq` |
 | `low_shelf_3: off` | A module that is switched off |
-| `params: same as plugin N on TRACK` | Exactly the settings of the Nth plugin in that track's chain |
+
+Some settings are left out to save space:
+
+- Any setting whose name contains `solo`, `delta` or `master bypass`, when it is off.
+- A switched-off module's settings and its switch (`active` or `enabled`), when they share a name. If a plugin's settings don't share the switch's name, the switch stays.
 
 The AI can ask for "DETAIL <track name>" to get a track's full plugin settings, sends, automation and measurements per region.
 

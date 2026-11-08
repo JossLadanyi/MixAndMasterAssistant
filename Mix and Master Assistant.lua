@@ -180,6 +180,11 @@ local function is_boilerplate(param_name, param_value)
     if name_lower == "bypass" and (val_clean == "normal" or val_clean == "off" or val_clean == "0") then return true end
     if name_lower == "power" and (val_clean == "on" or val_clean == "1") then return true end
     if name_lower == "delta" and val_clean == DEFAULT_SETTINGS.plugin.delta then return true end -- REAPER's own delta solo switch, off
+    -- task 5e2: solo, delta and master bypass switches that are off say nothing; one that is on stays visible
+    if val_clean == "off" then
+        local squeezed = name_lower:gsub("[%s_]+", "")
+        if squeezed:find("solo", 1, true) or squeezed:find("delta", 1, true) or squeezed:find("masterbypass", 1, true) then return true end
+    end
 
     -- Filter out default 100% wet / 0% dry states
     local num_val = val_clean:gsub("db$", ""):gsub("%%$", "")
@@ -272,7 +277,9 @@ local function to_yaml(tbl, indent, parent_key)
     if is_array then
         for i = 1, max_key do
             local v = tbl[i]
-            if INLINE_ARRAY_PARENTS[parent_key] and type(v) == "table" then
+            if type(v) == "table" and v.__line then -- task 5e2: an already formatted one-line plugin entry
+                out[#out + 1] = pad .. "- " .. v.__line .. "\n"
+            elseif INLINE_ARRAY_PARENTS[parent_key] and type(v) == "table" then
                 out[#out + 1] = pad .. "- " .. to_inline_yaml(v) .. "\n"
             elseif type(v) == "table" then
                 local child = to_yaml(v, indent + 1, parent_key)
@@ -426,7 +433,20 @@ local function extract_fx_params(track, fx_idx)
                         local prefix = clean_k:match(pattern)
                         if prefix then
                             disabled_prefixes[prefix] = true
+                            is_off = false -- handled by the numbered rule
                             break
+                        end
+                    end
+                    -- task 5e2: any module name ("lp_active: Off"), but only when another setting shares the name; otherwise the
+                    -- switch stays ("compressor_enabled: Off" with settings named comp_...), so nothing looks active that is not
+                    local pre = is_off and (clean_k:match("^(.+_)active$") or clean_k:match("^(.+_)enabled$"))
+                    if pre then
+                        for j = 0, math.min(num_params - 1, max_inspect) do
+                            local other = param_names[j] and param_names[j] ~= "" and clean_param_key(param_names[j])
+                            if other and other ~= clean_k and other:sub(1, #pre) == pre then
+                                disabled_prefixes[pre] = true
+                                break
+                            end
                         end
                     end
                 end
@@ -686,11 +706,12 @@ local function extract_full_project_yaml(opts)
         end
         return S
     end
+    local gone = {} -- task 5e2: tracks left out of the YAML (muted and silent, see below), with their sends
     local function conns(keep) -- the snapshot's connections, filtered like get_all_connections(true, keep)
         local l = {}
         for _, c in ipairs(S.conns or {}) do
             local p = S.cptr[c]
-            if not keep or keep[p[1]] or keep[p[2]] then l[#l + 1] = cp(c) end
+            if (not keep or keep[p[1]] or keep[p[2]]) and not gone[p[1]] and not gone[p[2]] then l[#l + 1] = cp(c) end
         end
         return #l > 0 and l or nil
     end
@@ -716,8 +737,15 @@ local function extract_full_project_yaml(opts)
         tracks = {}
     }
 
-    project_data.notes = "- any routing send volume omitted is at 0.0 dB unity gain."
-    if proj_notes and proj_notes ~= "" then project_data.notes = project_data.notes .. '\n' .. proj_notes end
+    if not opts then project_data.notes = "- any routing send volume omitted is at 0.0 dB unity gain." end -- task 5e2: the compact YAML's intro says it
+    if proj_notes and proj_notes ~= "" then project_data.notes = (project_data.notes and (project_data.notes .. '\n') or "") .. proj_notes end
+    if opts and arr then -- task 5e2: the region lines of the data have the regions; only markers stay
+        local marks = {}
+        for _, e in ipairs(arr) do
+            if e.type ~= "region" then marks[#marks + 1] = e end
+        end
+        project_data.arr = #marks > 0 and marks or nil
+    end
 
     local any_soloed, list, has_children
     if S then
@@ -755,6 +783,20 @@ local function extract_full_project_yaml(opts)
         end
         project_data.connections = S and conns(keep) or (not S and get_all_connections(true, keep)) or nil
     end
+    -- task 5e2: tracks muted (also by a folder) that made no sound in the measurement (S.silent, AI.collect) are left out with their sends,
+    -- except a track the data names and a folder that still holds a kept track
+    if S and S.silent and not opts.only then
+        for _, tr in ipairs(list) do
+            if S.silent[tr] and not opts.full[gid(tr)] and not (opts.listed and opts.listed[gid(tr)]) then gone[tr] = true end
+        end
+        for _, tr in ipairs(list) do
+            if not gone[tr] then
+                local p = par(tr)
+                while p do gone[p] = nil; p = par(p) end
+            end
+        end
+        if next(gone) ~= nil then project_data.connections = conns(opts.listed and keep or nil) end
+    end
 
     -- 1. Master Track
     if not (opts and opts.only) then
@@ -766,7 +808,7 @@ local function extract_full_project_yaml(opts)
     for _, track in ipairs(list) do
         local mode = opts and (keep[track] and "full" or ((shown and not shown[track]) and "bare" or "names")) or nil
         if S then
-            if not opts.only or opts.only[track] then table.insert(project_data.tracks, cp(S.td[track][mode])) end
+            if (not opts.only or opts.only[track]) and not gone[track] then table.insert(project_data.tracks, cp(S.td[track][mode])) end
         else
             table.insert(project_data.tracks, process_track_data(track, false, current_depth, any_soloed, has_children, mode))
             local folder_delta = reaper.GetMediaTrackInfo_Value(track, "I_FOLDERDEPTH")
@@ -864,6 +906,25 @@ local function extract_full_project_yaml(opts)
         end
         table.sort(nl)
         if #nl > 0 then project_data.notes = (project_data.notes and (project_data.notes .. "\n") or "") .. table.concat(nl, "\n") end
+        -- task 5e2: one line per plugin: "- Name (tags): {settings}", "- Name (tags): same as plugin n on TRACK" or "- Name (tags)"
+        for _, td in ipairs(project_data.tracks) do
+            if type(td.fx) == "table" then
+                for n, pl in ipairs(td.fx) do
+                    local tags = {}
+                    if pl.type then tags[#tags + 1] = pl.type end
+                    if pl.bypassed then tags[#tags + 1] = "bypassed" end
+                    if pl.wet then tags[#tags + 1] = "wet " .. pl.wet end
+                    local label = pl.name
+                    if #tags > 0 then
+                        local t = table.concat(tags, ", ")
+                        label = label:sub(-1) == ")" and (label:sub(1, -2) .. ", " .. t .. ")") or (label .. " (" .. t .. ")")
+                    end
+                    label = escape_yaml_string(label)
+                    local v = pl.params
+                    td.fx[n] = { __line = type(v) == "table" and (label .. ": " .. to_inline_yaml(v)) or (v and (label .. ": " .. escape_yaml_string(v)) or label) }
+                end
+            end
+        end
     end
 
     return to_yaml(project_data), project_data.arr
@@ -3385,8 +3446,7 @@ function MA_A.fmt()
     -- Master chain effect: input (before the master FX) against output (after them), per song or region. Whole spans only, never per block.
     local function chain(mi, mo)
         if not (mi and mi.samples > 0 and mi.integrated > -70 and mo.integrated > -70) then return nil end
-        return string.format("chain in I%s M%s LRA%s > out I%s M%s LRA%s gain%+.1f", f1(mi.integrated), f1(mi.max_m), f1(mi.lra),
-            f1(mo.integrated), f1(mo.max_m), f1(mo.lra), mo.integrated - mi.integrated)
+        return string.format("chain in I%s M%s LRA%s gain%+.1f", f1(mi.integrated), f1(mi.max_m), f1(mi.lra), mo.integrated - mi.integrated) -- task 5e2: "out" = the line above
     end
     local function pan_label(p) return p == 0 and "pC" or (p < 0 and ("pL" .. -p) or ("pR" .. p)) end
     local function devs(list, int)
@@ -3551,14 +3611,14 @@ local function build_data_block(D, focus, fs)
     end
     for i, reg in ipairs(D.regions) do
         if reg.na or not reg.mr then
-            draft[#draft + 1] = string.format("R%d %s %s-%s | n/a", i, nm(reg.name), f1(reg.start_s), f1(reg.end_s))
+            draft[#draft + 1] = string.format("R%d %s %s-%s | n/a", i, nm(reg.name), string.format("%.2f", reg.start_s), string.format("%.2f", reg.end_s))
         elseif fs and not freg[i] then -- task 4f.7b: the header only
             local mr = reg.mr
-            draft[#draft + 1] = string.format("R%d %s %s-%s | I%s M%s S%s LRA%s W%s%s | no focus track plays", i, nm(reg.name), f1(reg.start_s),
-                f1(reg.end_s), f1(mr.integrated), f1(mr.max_m), f1(mr.max_s), f1(mr.lra), i0(reg.width), mnotable(mr))
+            draft[#draft + 1] = string.format("R%d %s %s-%s | I%s M%s S%s LRA%s W%s%s | no focus track plays", i, nm(reg.name), string.format("%.2f", reg.start_s),
+                string.format("%.2f", reg.end_s), f1(mr.integrated), f1(mr.max_m), f1(mr.max_s), f1(mr.lra), i0(reg.width), mnotable(mr))
         else
             local mr, rd = reg.mr, devs_in(reg.dev)
-            draft[#draft + 1] = string.format("R%d %s %s-%s | I%s M%s S%s LRA%s W%s%s%s", i, nm(reg.name), f1(reg.start_s), f1(reg.end_s),
+            draft[#draft + 1] = string.format("R%d %s %s-%s | I%s M%s S%s LRA%s W%s%s%s", i, nm(reg.name), string.format("%.2f", reg.start_s), string.format("%.2f", reg.end_s),
                 f1(mr.integrated), f1(mr.max_m), f1(mr.max_s), f1(mr.lra), i0(reg.width), mnotable(mr),
                 #rd > 0 and (" | " .. devs(rd, true)) or "")
             local rc = chain(reg.mi, mr)
@@ -3905,7 +3965,7 @@ local function build_jsfx_prompt(block, yaml, focus, topic) -- focus (task 4f.7b
         "One render of the whole song. Each track is measured after its own fader, pan and automation, before its folder and the master FX. \"_\" in a name = a space (match names to the YAML).",
         "Bands (Hz): " .. table.concat(bands, ", ") .. ".",
         "SONG = the master after its FX: I integrated, M max momentary, S max short-term loudness (LUFS), LRA loudness range (LU), pk sample peak (dBFS), clip clipped samples; mid / side = song-average master band levels (dB) of the mid and side signal.",
-        "chain in > out: master loudness before vs after the master FX; gain = loudness the chain adds (dB).",
+        "chain in: master loudness before the master FX, after it is the line above; gain = loudness the chain adds (dB).",
         "TRACKS (whole song), one line per playing track:",
         "- s = % share of the mix (loudness-weighted energy; all counted tracks add up to 100). Folder buses have no s (their children carry it). Tracks with no path to the master are left out; what they send is measured on the receiving tracks.",
         "- L = average loudness including pauses (LUFS, ungated; a track that plays more often gets a higher L at the same level, compare pk), pk = sample peak (dBFS), cr = crest factor (dB, median per second of peak minus RMS; low = dense or heavily compressed), a = % of the time the track plays.",
@@ -3923,7 +3983,7 @@ local function build_jsfx_prompt(block, yaml, focus, topic) -- focus (task 4f.7b
             "- YAML: tracks left out of the data show only name, parent and flags." }, "\n") or "") .. tl,
         "",
         "=== PROJECT YAML ===",
-        "Routing and settings: folders (parent, flags: folder), sends (connections; sidechain = feeds a side-chain input; send volume 0 dB when omitted), faders (vol_db), pan, envelopes (auto), plugins in chain order. The master and the tracks named under REGIONS, with their folders, list full plugin settings. All other tracks list plugin names only (fx: \"A > B\"); when you need their settings, ask for \"DETAIL <track name>\" and I will send that track's full plugin settings, sends, automation and measurements per region. Settings with a common name start are grouped: band_1: {freq: 181} means the setting band_1_freq. A renamed plugin shows its original in brackets, e.g. Ducking Comp (ReaComp). \"params: same as plugin 3 on Lead Vox\" = exactly the settings of the 3rd plugin in Lead Vox's chain. Plugin values are shown as each plugin reports them; some plugins label units or on/off states wrongly (e.g. a reverb time of 2.5 ms that means 2.5 s), so judge by plausibility.",
+        "Routing and settings: folders (parent, flags: folder), sends (connections; sidechain = feeds a side-chain input; send volume 0 dB when omitted), faders (vol_db), pan, envelopes (auto), plugins in chain order. The master and the tracks named under REGIONS, with their folders, list full plugin settings. All other tracks list plugin names only (fx: \"A > B\"); when you need their settings, ask for \"DETAIL <track name>\" and I will send that track's full plugin settings, sends, automation and measurements per region. Settings with a common name start are grouped: band_1: {freq: 181} means the setting band_1_freq. A renamed plugin shows its original in brackets, e.g. Ducking Comp (ReaComp). Muted tracks that make no sound are left out. \"Name: same as plugin 3 on Lead Vox\" = exactly the settings of the 3rd plugin in Lead Vox's chain. Plugin values are shown as each plugin reports them; some plugins label units or on/off states wrongly (e.g. a reverb time of 2.5 ms that means 2.5 s), so judge by plausibility.",
         "",
         "=== INSTRUCTIONS ===",
         "Answer in three parts.",
@@ -4833,6 +4893,23 @@ function AI.collect()
     -- task 4g.3: read after the collection's cleanup (analyzers removed, the run undone; REAPER blocks editing while it renders)
     local sok, S = pcall(AI.snapshot)
     if not sok then AI.status = "Reading the project settings failed: " .. tostring(S) return end
+    -- task 5e2: muted (also by a folder), no measured sound and no Mute envelope on the way up: see extract_full_project_yaml
+    local sound = {}
+    for _, d in ipairs(D.over) do
+        if d.s.peak > 0 then sound[d.t.guid] = true end
+    end
+    S.silent = {}
+    for _, tr in ipairs(S.list) do
+        if S.muted[tr] and not sound[S.guid[tr]] then
+            local p, envelope = tr, false
+            while p do
+                local a = S.td[p].full.auto
+                if a and a:find("Mute", 1, true) then envelope = true end
+                p = S.parent[p]
+            end
+            if not envelope then S.silent[tr] = true end
+        end
+    end
     local prompt, err = build_collected_prompt(block, named, nil, nil, S)
     if not prompt then AI.status = "Prompt build failed: " .. tostring(err) return end
     -- Task 4f.6: the measurements are kept (D), prompts are built per focus from them (cache, keyed by the focus name);

@@ -17,7 +17,7 @@ drop: bank
 note: every *mute setting (hallmute, roommute, platemute, crowdmute ...) is reversed: On = that section is active, Off = muted. Reverb times (hallrt, platert ...) are in seconds although shown as ms (2.5 ms = 2.5 s).
 
 [ReaComp, ReaGate]
-note: their own wet and dry settings are levels in dB (0.0 = full level, -inf = silent), not percentages. A plugin-level "wet: NN%" is REAPER's separate mix knob.
+note: their own wet and dry settings are levels in dB (0.0 = full level, -inf = silent), not percentages. A "wet NN%" in brackets after the plugin's name is REAPER's separate mix knob.
 # resvd = unused placeholder; deprecated_broken_anti_alias = compatibility switch for very old projects
 drop: resvd, deprecated_*
 
