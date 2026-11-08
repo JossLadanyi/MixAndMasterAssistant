@@ -1,6 +1,7 @@
 apikey.txt
 *.txt
 *.docx
-# every Markdown file in any folder, except README.md
+# every Markdown file in any folder, except README.md and PROMPT_STRUCTURE.md
 *.md
 !README.md
+!PROMPT_STRUCTURE.md
