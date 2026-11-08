@@ -1,5 +1,6 @@
 apikey.txt
 *.txt
+!MixAssistant_plugin_notes.txt
 *.docx
 # every Markdown file in any folder, except README.md and PROMPT_STRUCTURE.md
 *.md

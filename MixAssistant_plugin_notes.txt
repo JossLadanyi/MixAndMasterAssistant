@@ -1,0 +1,43 @@
+# Mix Assistant plugin notes: true in every project. Read at each prompt build (Collect Data, Copy Project Info, the test button).
+# [plugin name]  = the original plugin name as the prompt shows it (a renamed plugin: the name in brackets, e.g. ReaComp)
+# [name, name]   = one block for several plugins; its notes are sent once, as "plugins A, B: ...", listing those shown in the prompt
+# note: text     = sent to the AI whenever this plugin's settings are in the prompt (several note lines are joined)
+# drop: a, b_*   = settings left out of the prompt, named as the prompt shows them with groups joined by "_"
+#                  (band_1: {selected: On} = band_1_selected); * = any text; comma separated
+# [vendor: name] = note and drop lines for every plugin of that maker (the name REAPER shows in brackets, e.g. "VST3: Vocal Rider Mono (Waves)");
+#                  only for what is true for ALL its plugins; the note line lists that maker's plugins shown in the prompt
+# A plugin name belongs in one block only (a later block replaces an earlier one).
+# Lines starting with # are ignored. "selected" and "visible" settings are always left out.
+
+[vendor: Waves]
+# bank = the preset bank name ("Full Reset"), not a sound setting
+drop: bank
+
+[CLA Epic Mono/Stereo]
+note: every *mute setting (hallmute, roommute, platemute, crowdmute ...) is reversed: On = that section is active, Off = muted. Reverb times (hallrt, platert ...) are in seconds although shown as ms (2.5 ms = 2.5 s).
+
+[ReaComp, ReaGate]
+note: their own wet and dry settings are levels in dB (0.0 = full level, -inf = silent), not percentages. A plugin-level "wet: NN%" is REAPER's separate mix knob.
+# resvd = unused placeholder; deprecated_broken_anti_alias = compatibility switch for very old projects
+drop: resvd, deprecated_*
+
+[ANINA]
+drop: toggle_overlay
+
+[PanCake2]
+drop: visible_wave
+
+[Wider]
+note: it goes up to 200%; the amount it reports is half of the width it actually sets.
+
+[Silk Vocal Mono, Silk Vocal Stereo]
+note: attenuates harsh frequencies; the higher the threshold, the more it attenuates.
+
+[TDR Limiter 6 GE]
+note: each module's gn is its input drive, not its gain reduction; the real gain reductions are in the project notes (additional_information) when given.
+
+[TDR Nova]
+note: eq_auto_gn On = static band (dyn Off) gain changes are loudness-compensated: they change the tone, not the level.
+
+[IMPusher Stereo]
+note: in_out lists each module's switch: Out = that module is switched off, so its knob (e.g. body) has no effect; In = active.
