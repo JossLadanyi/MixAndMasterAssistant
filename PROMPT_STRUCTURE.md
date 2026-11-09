@@ -11,7 +11,7 @@ The script sends the AI one plain-text prompt built from one render of the whole
 | 5 | `MEASURED DATA` | The numbers from the analyzers |
 | 6 | `REAPER PROJECT (YAML)` | Notes, routing, faders and plugin settings |
 
-If a focus is chosen, the prompt ends with a `FOCUS:` line.
+If a track was soloed during the measurement, a `NOTE:` line follows, saying the numbers describe the soloed tracks and not the whole mix. If a focus is chosen, the prompt ends with a `FOCUS:` line.
 
 The names and values in the examples below are made up.
 
@@ -89,7 +89,7 @@ Bass s20 L-26.0 pk-8.0 cr14 a80 W15 c.93 pL1 | sub+3 bass+4
 | `s` | Share of the mix (%, loudness-weighted energy; all counted tracks add up to 100) | Not on folder buses, whose children carry it |
 | `L` | Average loudness including pauses (LUFS, ungated) | Always |
 | `pk` | Sample peak (dBFS) | Always |
-| `cr` | Crest factor (dB; low = dense or heavily compressed) | Always |
+| `cr` | Crest factor (dB; low = dense or heavily compressed) | When it can be measured |
 | `a` | Time the track plays (%) | Always |
 | `W` | Width (0 mono, about 50 wide and uncorrelated, above 50 more side than mid) | Always |
 | `c` | Left/right correlation (1 mono, 0 unrelated, below 0 out of phase) | Always |
@@ -210,6 +210,13 @@ The AI can ask for "DETAIL <track name>" to get a track's full plugin settings, 
 
 ## When a focus is chosen
 
+Whole Song has no focus: it is the prompt described above. The other choices are of two kinds:
+
+- **Track groups:** Vocals, Drums & Bass, Guitars, Keys & Synths, Strings & Brass, Instruments, Effects & Returns, Selected Tracks.
+- **Topics:** Low End (20-315 Hz), Mids (315-5000 Hz), High End (5000-20000 Hz), Stereo Image, Master & Loudness.
+
+### Track groups
+
 The prompt adds a `FOCUS DATA` part to the legend, and `FOCUS: <name>. Give advice only about these tracks: ...` at the end. The measured data changes like this:
 
 | Part | Change |
@@ -233,3 +240,31 @@ compete Lead_Vox 1250-2000Hz: Bass +0 o76; 200-315Hz: Pad -1, Bass -2 o76
 | Hz range | One of the focus track's main bands, within 10 dB of its loudest band |
 | Track name and `+n` | A competitor's level against the focus track in that range (dB; `+` = louder). It is at most 3 dB quieter and not panned to the opposite side |
 | `oN` | % of the focus track's playing seconds when the competitor plays too. No `o` = all of them |
+
+### Topics
+
+The prompt adds a `TOPIC DATA` part to the legend, and `FOCUS: <name>. Give advice only about <the topic>.` at the end. What changes depends on the topic.
+
+**Low End, Mids and High End** keep only the data of their frequency range:
+
+```
+Bass s20 rs48 L-26.0 pk-8.0 cr14 a80 W15 c.93 pL1 | sub+3 bass+4 | levels rumble-60 deepsub-40 sub-27 bass-26 body-35 mud-44
+```
+
+| Part | Change |
+|---|---|
+| `TRACKS` | Only tracks with at least 2% of the range's energy in some region. New field `rs`: the track's % of the range's energy (all counted tracks add up to 100; `s` stays the share of the whole mix). `levels`: the track's band levels in the range (dB) |
+| Band data | The song's mid and side levels, the bumps and the region deviations stay only inside the range |
+| Track lines | Every track with `rs` 2 or more in that region, highest `rs` first. No `R n also` line |
+| `mask` | The usual rule, over these tracks and inside the range only |
+| `sub!` | Only in Low End |
+| YAML | Tracks left out of the data show only name, parent and flags |
+
+**Stereo Image** leaves out the band data: bumps, region band deviations and `mask` lines. The song line keeps the master's mid and side levels.
+
+**Master & Loudness** shortens the regions:
+
+| Part | Change |
+|---|---|
+| Track lines | The loudest tracks until they cover 85% of the region: 3 to 10 lines, none under 1%. No `R n also` and `mask` lines |
+| YAML | Only the master lists full plugin settings. Every track lists plugin names only |
