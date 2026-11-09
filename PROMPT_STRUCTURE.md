@@ -19,24 +19,24 @@ The names and values in the examples below are made up.
 
 The AI must answer in three parts:
 
-1. **Overview:** 3 to 5 short lines on what works and 3 to 5 on the main problems, each with the number that shows it.
-2. **Eight areas, in this order:** dynamics and loudness, low end, low mids, mids, highs, stereo and mono, arrangement, master. Each covers what the data shows, the cause and the fixes.
-3. **To-do table:** at most 12 fixes, biggest effect first, with priority, track, plugin and parameter, the change (current -> new) and why.
+1. **Overview.** 3 to 5 short lines on what works and 3 to 5 on the main problems, each with the number that shows it.
+2. **Eight areas.** In this order: dynamics and loudness, low end, low mids, mids, highs, stereo and mono, arrangement, master. Each covers what the data shows, the cause and the fixes.
+3. **To-do table.** At most 12 fixes, biggest effect first, with priority, track, plugin and parameter, the change (current -> new) and why.
 
 The main rules for the advice:
 
 - Quote exact track, plugin and parameter names from the YAML.
 - A setting in a module that is switched off has no effect.
-- Never give a threshold, because the levels going into a plugin are not measured. Give the gain reduction or cut to aim for instead. The Track Detail message repeats this rule.
-- Band levels fall towards the highs in nearly every mix, so a mix is not called dark from that alone.
+- Never give a threshold, because the script does not measure the levels going into a plugin. Give the gain reduction or cut to aim for instead. The Track Detail message repeats this rule.
+- Band levels fall towards the highs in nearly every mix, so that alone does not make a mix dark.
 - Never compute values the data does not give. When the data does not support a claim, say so.
 - Write in plain studio words. The short data keys are for the AI only and must not appear in the answer.
 
 ## Measured data
 
-Each track is measured after its own fader, pan and automation, and before its folder and the master FX.
+The analyzers measure each track after its own fader, pan and automation, and before its folder and the master FX.
 
-Compact number format, used throughout:
+All numbers use a compact format:
 
 - A key and its value have no space between them: `L-26.0`.
 - A number below 1 has no leading zero: `c.93`, `c-.01`.
@@ -71,10 +71,16 @@ SONG I-12.8 M-8.0 S-9.8 LRA7.5 pk-1.0 clip0 | mid rumble-40.0 deepsub-30.0 ... a
 ### Master chain line
 
 ```
-chain in I-17.5 M-13.0 LRA7.5 gain+4.7
+chain in I-17.5 M-13.0 LRA7.5 cr12.4 >> gain+4.7 cr-2.1 tone sub+1.3 air-1.1
 ```
 
-Shows the master's loudness before the master FX; the line above gives it after them. `gain` is the loudness the chain adds (dB).
+The part before `>>` gives the loudness and crest (peak minus rms over the whole span) of the master before the master FX. The song line above gives the master after them. The part after `>>` gives what the chain changes, in dB:
+
+| Key | Meaning | Shown |
+| --- | --- | --- |
+| `gain` | The loudness the chain adds | Always |
+| `cr` | The change in crest factor | When it can be measured |
+| `tone` | Mid bands the chain changes more or less than the other bands, by at least 1 dB | Only when a band qualifies; region lines list only bands that also differ by 1 dB from the song line |
 
 ### Track lines
 
@@ -99,7 +105,33 @@ Bass s20 L-26.0 pk-8.0 cr14 a80 W15 c.93 pL1 | sub+3 bass+4
 | `clip n` | Clipped samples | Only when clipping |
 | After `\|` | Bands that stand out from their neighbours in the same track (dB; `+` bump, `-` dip) | Only when a band stands out |
 
-Tracks with no path to the master are left out.
+The data leaves out tracks with no path to the master.
+
+### Sidechain block
+
+Whole Song and track-group focuses add this block after the track lines, when a plugin has something to show:
+
+```
+SIDECHAIN (gain reduction in dB of plugins with a side-chain input; avg, max = while the key track plays, off = avg while it is silent; then the bands whose cut jumps when the key starts; closed n% = a gate cutting 20 dB or more that share of the time)
+Verse_Vocal, Chorus_Vocal > Instruments / Curves_Resolve_Stereo: avg 1.2 max 3.1 off 0.1; presence-2.8 bite-2.1
+S:_Kick > Basses / Curves_Resolve_Stereo: avg 2.4 max 5.0 off 0.3; sub-3.9 bass-3.1
+S:_Claps_&_Snares > S:_Gated_Snare / ReaGate: closed 62%
+key only Ghost_Kick L-20.1 pk-6.0
+```
+
+The **key** is the track that tells the plugin when to act. Each line reads: key tracks > track / plugin: numbers. The script decides every 100 ms whether the key plays.
+
+A plugin gets a line only when the key really drives it. The script looks at the moments when the key starts while the plugin's input stays about equally loud (within 1 dB of the 100 ms before). A real ducker cuts more right then; a plugin that only reacts to its own track does not, even if the key mostly plays in the louder parts of the song. A line needs a gate, or at least 10 such key starts with a cut that jumps by 0.5 dB on average, or a band that jumps by 1 dB.
+
+| Part | Meaning | Shown |
+| --- | --- | --- |
+| `avg`, `max` | Gain reduction while the key plays, measured from the plugin's least-reduced moments, so make-up gain does not count | Always |
+| `off` | Average reduction while the key is silent | Always |
+| Band names | How much more (`-`) or less (`+`) that band is cut right after the key starts than just before, at least 1 dB, at most two | Only when the bands change differently from each other, so a reduction that is the same everywhere shows none |
+| `closed n%` | A gate: the share of the time it cuts 20 dB or more. Replaces avg, max and off | When the plugin cuts fully at least once |
+| `key only` | A track that feeds only a side-chain input: its level and peak. It is in no mix total | When its plugin has a line |
+
+A plugin gets a line only if its key is silent for at least 5 s in total. With less silence, the script cannot tell the key's effect apart from what the plugin always does. The plugin must also be a gate, reduce at least 0.5 dB more or less with the key, or change a band. The Track Detail message gives the same numbers for the chosen tracks, whole song and per region.
 
 ### Region blocks
 
@@ -107,7 +139,7 @@ A `REGIONS` block follows, with one block per region:
 
 ```
 R2 Verse_1 10.67-53.33 | I-14.5 M-9.7 S-11.8 LRA5.5 W27 | presence-3 sibilance-4
- chain in I-19.5 M-14.7 LRA5.7 gain+5.0
+ chain in I-19.5 M-14.7 LRA5.7 cr12.9 >> gain+5.0 cr-2.3
  Bass s22 L-27.6 pk-9.8 cr13 a75 W16 c.93 pL1 | sub+3 bass+4
  Lead_Vox s21 L-22.8 pk-8.8 cr13 a91 W0 c1.00 pC | mud+4
  R2 also Pad a100, Hi_Hat a31, Reverb a88
@@ -122,13 +154,13 @@ R2 Verse_1 10.67-53.33 | I-14.5 M-9.7 S-11.8 LRA5.5 W27 | presence-3 sibilance-4
 | `R n also` | Every other track playing in the region; `a` = % of the region it plays |
 | `mask` | Hz ranges where 2 or more of the top tracks each hold at least 25% of the energy, measured over the seconds they play together. The number is each track's % of all energy in that range. A pair counts only if it plays together for at least 25% of the shorter track's playing time |
 
-The master numbers on a region line also include `c`, `pL n` / `pR n`, `sub!` and `clip n`, but only when notable: `c` below 0, balance 12 or more, any clipped samples. No value shown means normal.
+A region line also shows the master's `c`, `pL n` / `pR n`, `sub!` and `clip n`, but only when they are notable: `c` below 0, balance 12 or more, or any clipped samples. A missing value means normal.
 
 A note marked `approx` means those tracks' shares are approximate, because their folder also receives sends.
 
 ## Project YAML
 
-Compact YAML. Short lists and settings stay on one line (`{key: value, ...}`), and a value at its default is usually left out.
+The YAML is compact. Short lists and settings stay on one line (`{key: value, ...}`), and a value at its default is usually left out.
 
 ### Notes, meta and markers
 
@@ -187,7 +219,7 @@ tracks:
 | `auto` | Names of the envelopes on the track | Only when it has some |
 | `fx` | The plugin chain, in order | Only when it has plugins |
 
-Muted tracks, and tracks inside a muted folder, that made no sound in the measurement are left out, along with their sends. A track with mute automation stays, and so does a folder that still holds a kept track.
+The YAML leaves out a muted track that made no sound in the measurement, and its sends. The same goes for a silent track inside a muted folder. A track with mute automation stays, and so does a folder that still holds a kept track.
 
 Inside `fx`:
 
@@ -203,16 +235,16 @@ Inside `fx`:
 | `low_shelf_3: off` | A module that is switched off |
 | `sat: 0.5-1.2` | An automated setting shows its range over the song (not the value at the edit cursor); its envelope is listed under `auto` |
 
-Some settings are left out to save space:
+To save space, the YAML leaves out some settings:
 
 - Any setting whose name contains `solo`, `delta` or `master bypass`, when it is off.
 - A switched-off module's settings and its switch (`active` or `enabled`), when they share a name. If a plugin's settings don't share the switch's name, the switch stays.
 
-The AI can ask for "DETAIL <track name>" to get a track's full plugin settings, sends, automation and measurements per region. In the detail, each region line says when the track plays inside the region (`on 12-98,120-150`, song seconds, pauses under 3 s ignored); no `on` means the whole region.
+The AI can ask for "DETAIL <track name>" to get a track's full plugin settings, sends, automation and measurements per region. In the detail, each region line says when the track plays inside the region, in song seconds, for example `on 12-98,120-150`. Pauses under 3 s do not count. A line without `on` means the track plays the whole region.
 
 ## When a focus is chosen
 
-Whole Song has no focus: it is the prompt described above. The other choices are of two kinds:
+Whole Song has no focus and is the prompt described above. The other choices are of two kinds:
 
 - **Track groups:** Vocals, Drums & Bass, Guitars, Keys & Synths, Strings & Brass, Instruments, Effects & Returns, Selected Tracks.
 - **Topics:** Low End (20-315 Hz), Mids (315-5000 Hz), High End (5000-20000 Hz), Stereo Image, Master & Loudness.
@@ -223,7 +255,7 @@ The prompt adds a `FOCUS DATA` part to the legend, and `FOCUS: <name>. Give advi
 
 | Part | Change |
 |---|---|
-| `TRACKS` | Focus tracks and returns also show `clip n`, `prepk` (sample peak before their own fader) and `levels` (all 15 band levels). Tracks that never play together with a focus track are left out |
+| `TRACKS` | Focus tracks and returns also show `clip n`, `prepk` (sample peak before their own fader) and `levels` (all 15 band levels). The data leaves out tracks that never play together with a focus track |
 | `auto` line | Under a track line: each moving envelope with its points, as `ENVELOPE unit: value@seconds ...` |
 | Region line | `no focus track plays` replaces the band list when none of the focus tracks play, and the region shows only its master numbers |
 | Track lines | The track's role follows its name, for example `Bass (backdrop, competitor)`. Roles: `focus`, `return` (receives audio from a focus track), `backdrop` (one of the 3 loudest other tracks), `competitor` |
