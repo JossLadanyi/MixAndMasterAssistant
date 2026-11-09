@@ -27,7 +27,8 @@ The main rules for the advice:
 
 - Quote exact track, plugin and parameter names from the YAML.
 - A setting in a module that is switched off has no effect.
-- Never give a threshold, because the levels going into a plugin are not measured. Give the gain reduction or cut to aim for instead.
+- Never give a threshold, because the levels going into a plugin are not measured. Give the gain reduction or cut to aim for instead. The Track Detail message repeats this rule.
+- Band levels fall towards the highs in nearly every mix, so a mix is not called dark from that alone.
 - Never compute values the data does not give. When the data does not support a claim, say so.
 - Write in plain studio words. The short data keys are for the AI only and must not appear in the answer.
 
@@ -200,13 +201,14 @@ Inside `fx`:
 | `(...)` after a name | Any of: the original name of a renamed plugin, `instrument`, `bypassed`, `wet NN%` (REAPER's mix knob for the plugin) |
 | `band_1: {freq: 181}` | Grouped shorthand: settings with a common name start, here `band_1_freq` |
 | `low_shelf_3: off` | A module that is switched off |
+| `sat: 0.5-1.2` | An automated setting shows its range over the song (not the value at the edit cursor); its envelope is listed under `auto` |
 
 Some settings are left out to save space:
 
 - Any setting whose name contains `solo`, `delta` or `master bypass`, when it is off.
 - A switched-off module's settings and its switch (`active` or `enabled`), when they share a name. If a plugin's settings don't share the switch's name, the switch stays.
 
-The AI can ask for "DETAIL <track name>" to get a track's full plugin settings, sends, automation and measurements per region.
+The AI can ask for "DETAIL <track name>" to get a track's full plugin settings, sends, automation and measurements per region. In the detail, each region line says when the track plays inside the region (`on 12-98,120-150`, song seconds, pauses under 3 s ignored); no `on` means the whole region.
 
 ## When a focus is chosen
 

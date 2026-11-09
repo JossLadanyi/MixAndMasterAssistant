@@ -435,6 +435,29 @@ local function extract_fx_params(track, fx_idx)
     -- -------------------------------------------------------------
     local params_table = {}
     local count = 0
+    -- Open item: an automated setting (active envelope that moves more than 1% of the setting's range) shows its range over the song,
+    -- "0.5-1.2" (" to " with a negative end), not the value at the edit cursor. Sampled every 100 ms (at most 20000 samples).
+    local proj_len = reaper.GetProjectLength(0)
+    local function auto_range(k)
+        local env = reaper.GetFXEnvelope(track, fx_idx, k, false)
+        if not env then return nil end
+        local ok, act = reaper.GetSetEnvelopeInfo_String(env, "ACTIVE", "", false)
+        if ok and act == "0" then return nil end
+        local _, pmin, pmax = reaper.TrackFX_GetParam(track, fx_idx, k)
+        local step = math.max(0.1, proj_len / 20000)
+        local lo, hi = math.huge, -math.huge
+        for t = 0, proj_len + step, step do
+            local _, v = reaper.Envelope_Evaluate(env, math.min(t, proj_len), 0, 0)
+            lo, hi = math.min(lo, v), math.max(hi, v)
+        end
+        if hi - lo <= 0.01 * ((pmax > pmin) and (pmax - pmin) or 1) then return nil end
+        local a = (reaper.Envelope_FormatValue(env, lo, "") or ""):gsub("%s+", "")
+        local b = (reaper.Envelope_FormatValue(env, hi, "") or ""):gsub("%s+", "")
+        if a == "" or b == "" or a == b then return nil end
+        local unit = b:match("%d(%D+)$")
+        if unit and a:sub(-#unit) == unit then a = a:sub(1, #a - #unit) end
+        return a .. ((a:sub(1, 1) == "-" or b:sub(1, 1) == "-") and " to " or "-") .. b
+    end
     for k = 0, math.min(num_params - 1, max_inspect - 1) do
         local param_name = trim_string(param_names[k])
 
@@ -452,12 +475,13 @@ local function extract_fx_params(track, fx_idx)
 
             -- Only keep parameters from active bands/modules
             if not is_in_disabled_band then
+                local rng = auto_range(k)
                 local _, param_value = reaper.TrackFX_GetFormattedParamValue(track, fx_idx, k)
                 param_value = trim_string(param_value)
 
-                if not is_boilerplate(param_name, param_value) then
+                if rng or not is_boilerplate(param_name, param_value) then
                     if count >= MAX_PLUGIN_PARAMS then break end
-                    params_table[clean_key] = tonumber(param_value) or param_value
+                    params_table[clean_key] = rng or tonumber(param_value) or param_value
                     count = count + 1
                 end
             end
@@ -3243,7 +3267,7 @@ local function build_jsfx_prompt(block, yaml, focus) -- focus: an AI.FOCUS entry
         "Differences under 1 dB are measurement noise. Width, correlation and balance are measured after pan. The LRA of a single region is naturally small (one section changes little in loudness); judge compression by crest, not by region LRA." .. legend,
         "",
         "=== PROJECT YAML ===",
-        "Routing and settings: folders (parent, flags: folder), sends (connections; sidechain = feeds a side-chain input; send volume 0 dB when omitted), faders (vol_db), pan, envelopes (auto), plugins in chain order. The master and the tracks named under REGIONS, with their folders, list full plugin settings. All other tracks list plugin names only (fx: \"A > B\"); when you need their settings, ask for \"DETAIL <track name>\" and I will send that track's full plugin settings, sends, automation and measurements per region. Settings with a common name start are grouped: band_1: {freq: 181} means the setting band_1_freq. A renamed plugin shows its original in brackets, e.g. Ducking Comp (ReaComp). Muted tracks that make no sound are left out. \"Name: same as plugin 3 on Lead Vox\" = exactly the settings of the 3rd plugin in Lead Vox's chain. Plugin values are shown as each plugin reports them; some plugins label units or on/off states wrongly (e.g. a reverb time of 2.5 ms that means 2.5 s), so judge by plausibility.",
+        "Routing and settings: folders (parent, flags: folder), sends (connections; sidechain = feeds a side-chain input; send volume 0 dB when omitted), faders (vol_db), pan, envelopes (auto), plugins in chain order. The master and the tracks named under REGIONS, with their folders, list full plugin settings. All other tracks list plugin names only (fx: \"A > B\"); when you need their settings, ask for \"DETAIL <track name>\" and I will send that track's full plugin settings, sends, automation and measurements per region. Settings with a common name start are grouped: band_1: {freq: 181} means the setting band_1_freq. A renamed plugin shows its original in brackets, e.g. Ducking Comp (ReaComp). Muted tracks that make no sound are left out. \"Name: same as plugin 3 on Lead Vox\" = exactly the settings of the 3rd plugin in Lead Vox's chain. Plugin values are shown as each plugin reports them; some plugins label units or on/off states wrongly (e.g. a reverb time of 2.5 ms that means 2.5 s), so judge by plausibility. An automated setting shows its range over the song (e.g. sat: 0.5-1.2); its envelope is under auto.",
         "",
         "=== INSTRUCTIONS ===",
         "Answer in three parts.",
@@ -3254,7 +3278,7 @@ local function build_jsfx_prompt(block, yaml, focus) -- focus: an AI.FOCUS entry
         "3. Low mids (body, mud, boxy: 125-500 Hz).",
         "4. Mids (honk, nasal, bite: 500-2000 Hz).",
         "5. Highs (presence, harsh, sibilance, sizzle, air: 2000-20000 Hz): tell \"harsh\" apart from \"sibilance\"; a de-esser or a dynamic EQ where needed.",
-        "In areas 2-5 use the track band bumps, the mask ranges and the master band deviations; give frequency, gain and Q. Before cutting a bump, check the track's high-pass and low-pass filters.",
+        "In areas 2-5 use the track band bumps, the mask ranges and the master band deviations; give frequency, gain and Q. Before cutting a bump, check the track's high-pass and low-pass filters. Band levels fall towards the highs in nearly every mix: do not call a mix dark from that alone.",
         "6. Stereo and mono: W, c, the balance and sub!; phase or width problems and how to fix them.",
         "7. Arrangement: two regions of the same kind that differ (e.g. Verse 1 and Verse 2): compare their track lines and also lines and say what changed.",
         "8. Master: the chain gain, the final loudness and the peak.",
@@ -4310,10 +4334,31 @@ function AI.detail_text()
             d.s.clips, f1(d.pk - d.r.fader_db), #d.notable > 0 and (" | " .. devs(d.notable, true)) or "", table.concat(l, " "))
     end
     local plays = MA_A.plays
+    -- when the track plays inside a region: "a-b,c-d" in song seconds (gaps under 3 s ignored); nil = the whole region
+    local function spans(t, reg)
+        local pp = D.ps and D.ps[t.idx]
+        if not pp then return nil end
+        local s0, s1 = MA_A.reg_win(reg.start_s, reg.end_s)
+        local function g1(x) return (string.format("%.1f", x):gsub("%.0$", "")) end
+        local out, a, last = {}, nil, nil
+        local function close() out[#out + 1] = g1(math.max(a, reg.start_s)) .. "-" .. g1(math.min(last + 1, reg.end_s)) end
+        for sec = s0, s1 - 1 do
+            if MA_A.on_sec(pp, sec) then
+                if a and sec - last - 1 >= 3 then close(); a = nil end
+                a, last = a or sec, sec
+            end
+        end
+        if not a then return nil end
+        if #out == 0 and a <= s0 and last + 1 >= s1 then return nil end
+        close()
+        return table.concat(out, ",")
+    end
     local p = { string.format("TRACK DETAIL (settings, sends and automation as they were when measured at %s; same keys as the data block). Per track: "
-        .. "song = the whole-song line, then R n = one line per region where it plays; clip n = clipped samples, prepk = sample peak before its "
+        .. "song = the whole-song line, then R n = one line per region where it plays; on = when it plays inside the region (seconds of the song, "
+        .. "short pauses ignored; no on = the whole region); clip n = clipped samples, prepk = sample peak before its "
         .. "own fader (dB), levels = all 15 band levels (dB); auto = its envelopes over the whole song, ENVELOPE unit: value@seconds (straight "
-        .. "lines between the points; the measured numbers already include the automation). Then the YAML (same format as the project YAML).", c.when) }
+        .. "lines between the points; the measured numbers already include the automation). Then the YAML (same format as the project YAML). "
+        .. "The rules of the first message still hold: never give a threshold, give the gain reduction or cut to aim for (dB) instead.", c.when) }
     for _, tr in ipairs(S.list) do
         if only[tr] then
             local t = by_tr[tr]
@@ -4327,7 +4372,10 @@ function AI.detail_text()
                 if not reg.na and reg.mr then
                     local rd
                     for _, d in ipairs(reg.all) do if d.t == t then rd = d break end end
-                    if plays(rd) then p[#p + 1] = string.format(" R%d %s %s", i, nm(reg.name), line(rd)) else quiet[#quiet + 1] = "R" .. i end
+                    if plays(rd) then
+                        local on = spans(t, reg)
+                        p[#p + 1] = string.format(" R%d %s%s %s", i, nm(reg.name), on and (" on " .. on) or "", line(rd))
+                    else quiet[#quiet + 1] = "R" .. i end
                 end
             end
             if #quiet > 0 then p[#p + 1] = " not playing in " .. table.concat(quiet, ", ") end
