@@ -1539,6 +1539,15 @@ local MA_A = {
     PRICE = { ["deepseek-v4-pro"] = { 0.044, 1.32, 3.96 }, ["deepseek-flash"] = { 0.006, 0.30, 1.20 } },
     PEAK_UTC = { { 1, 4 }, { 6, 10 } },
     CPT = 2.37, -- characters per token: 4f01 prompt 44,071 chars = 18,617 tokens (DeepSeek's count); every "Send Project Info" re-measures it
+    -- stage 8: TAPBASE is set per run in collect_jsfx_data. A plugin's line needs SC_MIN dB more reduction with the key than without, a band or a master
+    -- tone entry SC_BAND_MIN dB. The key on / off comparison needs SC_OFF_MIN_S seconds of key off; a key plays in a 100 ms block within SC_KEY_DB of its
+    -- loudest block. Reduction is measured from the SC_REF_PCT percentile of the gain, capped at SC_CAP dB; a gate is "closed" from SC_CLOSED_DB.
+    -- A plugin is driven by its key when its reduction jumps at SC_ONSET_MIN or more key starts with the input within SC_ONSET_DB.
+    -- The taps' 100 ms records (stride TAPSTRIDE, 15 bands) live in their own gmem name SC_GMEM from TAPBASE = MA_HDR (written to its slot 14); the keys'
+    -- records (stride KEYSTRIDE, level only) in the main one from KEYBASE.
+    TAPSTRIDE = 20, KEYSTRIDE = 4, SC_GMEM = "MixAssistantSC",
+    SC_MIN = 0.5, SC_BAND_MIN = 1, SC_OFF_MIN_S = 5, SC_REF_PCT = 95, SC_CAP = 60, SC_BAND_FLOOR = -70, SC_KEY_DB = 30, SC_CLOSED_DB = 20,
+    SC_ONSET_DB = 1, SC_ONSET_MIN = 10,
 }
 
 --- Token estimate for n characters (the last measured characters-per-token ratio, kept in REAPER's ExtState; MA_A.CPT before the first send)
@@ -1588,11 +1597,13 @@ local MA_MAGIC = 20261103
 
 local ANALYZER_JSFX = [==[
 desc:Mix Assistant Analyzer (temp)
-//MA_JSFX_VERSION=5
+//MA_JSFX_VERSION=6
 options:gmem=MixAssistant
 
 slider1:0<0,4095,1>Track index
-slider2:0<0,2,1{Track,Master,Master input}>Role
+slider2:0<0,3,1{Track,Master,Master input,Tap}>Role
+slider3:0<0,192000,1>Tap delay (samples)
+slider4:0<0,8192,1>Tap record (0 = none)
 
 in_pin:left input
 in_pin:right input
@@ -1601,13 +1612,16 @@ out_pin:right output
 
 @init
 ext_noinit = 1; // keep the state when REAPER restarts the FX after a render (else the idle blocks look like a fresh run)
-MAGIC = 20261103; VERSION = 5;
+MAGIC = 20261103; VERSION = 6;
 HDR = 256; MAXTR = 128; MAXSEC = 1800; STRIDE = 32;
 // master block: 0-2 K energy/count/run, 3-32 mid+side bands, 33-35 LL/RR/LR, 36-38 sub-mono LL/RR/LR, 39-40 peak |L|/|R|, 41 clip frames
 MBASE = HDR + MAXTR * MAXSEC * STRIDE; MSTRIDE = 45;
 // master input records (role 2): MAXSEC x 10 blocks x 4 slots after the master blocks: K energy, count, run id, max |sample|
 // (task 5b: MAXSEC / MAXTR come from Lua per run, gmem[11] / gmem[12]; see @block)
 MIBASE = MBASE + 18000 * MSTRIDE; mipk = 0;
+// stage 8: 100 ms records (slider 4 = record + 1). Role 3 (tap, before / after a sidechain plugin; own gmem name, base from gmem[14]) writes only
+// this record, stride 20: L^2+R^2 sum, count, run id, the 15 mid band energies, two free. A key track's phantom (role 0) writes stride 4: the first three.
+TAPBASE = MIBASE + MAXSEC * 10 * 4; cur_tb = -1; tap_e = 0; tap_c = 0;
 gmem[0] = MAGIC; gmem[1] = VERSION;
 invsr = 1 / srate;
 
@@ -1631,7 +1645,7 @@ ha2 = (1 - K / Q + K * K) / a0;
 
 cur_sec = -1; cur_mb = -1; last_run = -1;
 // local memory: 0 band coefs (15x4), 64 mid states, 128 side states (15x4 each), 192 accumulators (15 mid + 15 side), 224 band edges
-CBASE = 0; STM = 64; STS = 128; ACC = 192; EDG = 224;
+CBASE = 0; STM = 64; STS = 128; ACC = 192; EDG = 224; // stage 8: a tap uses STM and ACC 0-14 per 100 ms
 EDG[0] = 20; EDG[1] = 31.5; EDG[2] = 50; EDG[3] = 80; EDG[4] = 125; EDG[5] = 200; EDG[6] = 315; EDG[7] = 500;
 EDG[8] = 800; EDG[9] = 1250; EDG[10] = 2000; EDG[11] = 3150; EDG[12] = 5000; EDG[13] = 8000; EDG[14] = 12500; EDG[15] = 20000;
 SILN = floor(0.1 * srate); silcnt = 0; skip = 0;
@@ -1713,10 +1727,21 @@ function put_master_in() global(cur_mb,mke,mcnt,run,mipk,MIBASE,gmem) local(b) (
   b = MIBASE + cur_mb * 4;
   gmem[b] = mke; gmem[b+1] = mcnt; gmem[b+2] = run; gmem[b+3] = mipk;
 );
+function put_tap() global(rec,cur_tb,tap_e,tap_c,run,TAPBASE,MAXSEC,ACC,istap,gmem) local(b,i) (
+  b = TAPBASE + (rec * MAXSEC * 10 + cur_tb) * (istap ? 20 : 4);
+  gmem[b] = tap_e; gmem[b+1] = tap_c; gmem[b+2] = run;
+  istap ? (
+    i = 0;
+    loop(15, gmem[b+3+i] = ACC[i]; i += 1;);
+  );
+);
 @slider
 idx = slider1 | 0;
 role = (slider2 | 0) == 1; // master (end of the chain)
 ismin = (slider2 | 0) == 2; // master input (start of the chain)
+istap = (slider2 | 0) == 3; // stage 8: light tap, directly before or after a plugin on a real track
+rec = (slider4 | 0) - 1; // stage 8: the 100 ms tap record (-1 = none)
+tapdelay = (slider3 | 0) * invsr; // the plugin's own delay: the "after" tap files its samples in the 100 ms block they entered the plugin
 
 @block
 run = gmem[9];
@@ -1729,6 +1754,7 @@ run != last_run ? (
   // task 5b: the run's layout from Lua (seconds and track slots that fit in gmem); the @init values are only the fallback
   MAXSEC = gmem[11] > 0 ? gmem[11] : 1800; MAXTR = gmem[12] > 0 ? gmem[12] : 128;
   MBASE = HDR + MAXTR * MAXSEC * STRIDE; MIBASE = MBASE + MAXSEC * 10 * MSTRIDE;
+  TAPBASE = gmem[14] > 0 ? gmem[14] : MIBASE + MAXSEC * 10 * 4; cur_tb = -1; tap_e = 0; tap_c = 0;
   bq =gmem[185] > 0 ? gmem[185] : 0.6423;
   bi = 0;
   loop(15,
@@ -1755,7 +1781,7 @@ run != last_run ? (
 );
 // a block starting at the render start (gmem[7]) is accepted only before this run got 1 s past it: after the render, a stopped
 // project with the edit cursor at the start must not count as a new start (it overwrote the master peak with idle noise)
-ok = (role || ismin) ? 1 : (idx >= 0 && idx < MAXTR); // after the run-id change (task 5b: MAXTR comes with the run)
+ok = (role || ismin) ? 1 : istap ? rec >= 0 : (idx >= 0 && idx < MAXTR); // after the run-id change (task 5b: MAXTR comes with the run)
 synced = (exp_t >= 0 && abs(t0 - exp_t) < 0.004) || (abs(t0 - gmem[7]) < 0.05 && reach < gmem[7] + 1);
 exp_t = t0 + samplesblock * invsr;
 active = (gmem[6] == 1) && (run > 0) && ok && synced;
@@ -1770,6 +1796,17 @@ active ? (
 active ? (
   t = t0 + n * invsr;
   (t >= 0 && t < MAXSEC) ? (
+    istap ? (
+      // stage 8 tap: the 100 ms record only (level + 15 mid bands); the "after" tap files samples where they entered the plugin
+      tb = max(((t - tapdelay) * 10) | 0, 0);
+      tb != cur_tb ? (
+        cur_tb >= 0 ? put_tap();
+        cur_tb = tb; tap_e = 0; tap_c = 0; memset(ACC, 0, 15);
+      );
+      tap_e += spl0 * spl0 + spl1 * spl1; tap_c += 1;
+      bandrun((spl0 + spl1) * 0.5, STM, ACC);
+      n >= samplesblock - 1 ? put_tap();
+    ) : (
     kl = hpl.hpf(shl.shelf(spl0));
     kr = hpr.hpf(shr.shelf(spl1));
     ke = kl * kl + kr * kr;
@@ -1837,8 +1874,19 @@ active ? (
         ylp = lpl.lp4(spl0); yrp = lpr.lp4(spl1);
         sub_ll += ylp * ylp; sub_rr += yrp * yrp; sub_lr += ylp * yrp;
       );
+      rec >= 0 ? (
+        // stage 8: a key track's level per 100 ms (no bands)
+        tb = (t * 10) | 0;
+        tb != cur_tb ? (
+          cur_tb >= 0 ? put_tap();
+          cur_tb = tb; tap_e = 0; tap_c = 0;
+        );
+        tap_e += sb_e; tap_c += 1;
+        n >= samplesblock - 1 ? put_tap();
+      );
       n >= samplesblock - 1 ? put_track();
     );
+    ); // end of the non-tap roles
   );
 );
 n += 1;
@@ -1852,15 +1900,19 @@ local function write_analyzer_file()
     local dir = analyzer_dir()
     reaper.RecursiveCreateDirectory(dir, 0)
     local path = dir .. PATH_SEPARATOR .. "mix_assistant_analyzer"
-    local f, err = io.open(path, "w")
-    if not f then return nil, "Cannot write analyzer file:\n" .. path .. "\n" .. tostring(err) end
-    f:write(ANALYZER_JSFX)
-    f:close()
+    -- stage 8: the same analyzer with its own gmem name for the sidechain taps ("_sc"), so they take no memory from the tracks
+    for _, v in ipairs({ { "", ANALYZER_JSFX }, { "_sc", (ANALYZER_JSFX:gsub("options:gmem=" .. GMEM_NAME, "options:gmem=" .. MA_A.SC_GMEM, 1)) } }) do
+        local f, err = io.open(path .. v[1], "w")
+        if not f then return nil, "Cannot write analyzer file:\n" .. path .. v[1] .. "\n" .. tostring(err) end
+        f:write(v[2])
+        f:close()
+    end
     return path
 end
 
 local function remove_analyzer_file()
     os.remove(analyzer_dir() .. PATH_SEPARATOR .. "mix_assistant_analyzer")
+    os.remove(analyzer_dir() .. PATH_SEPARATOR .. "mix_assistant_analyzer_sc")
     os.remove(analyzer_dir()) -- only succeeds when empty
 end
 
@@ -1930,11 +1982,86 @@ local function should_analyze(track, has_children, memo)
     return can_sound and reaches_master(track, memo)
 end
 
+--- Stage 8: the plugins on the chosen tracks that listen to a channel an unmuted send lands on (channel 3 or above), and the key-only tracks
+-- (they send a key but are not chosen, so no path to the master). Only reads. Returns { taps, keys, skipped }; a key is a list entry or a
+-- key-only entry, each with name and (later) slot.
+function MA_A.sc_find(list)
+    local gi, by_tr, key_of, kseen = reaper.GetTrackSendInfo_Value, {}, {}, {}
+    local sc = { taps = {}, keys = {}, skipped = {}, allkeys = {} } -- allkeys: every key (list entry or key-only), each gets a 100 ms record
+    for _, t in ipairs(list) do by_tr[t.track] = t end
+    local function clean(n)
+        n = n:match(":%s*(.+)") or n
+        return (n:gsub("%s*%(.*%)$", ""))
+    end
+    local function key_for(r)
+        local key = by_tr[r.st] or key_of[r.st]
+        if not key then
+            key = { track = r.st, name = get_track_identity(r.st), only = true, mode = r.mode, vol = r.vol }
+            key_of[r.st] = key
+            sc.keys[#sc.keys + 1] = key
+        elseif key.only and (key.mode ~= r.mode or key.vol ~= r.vol) then
+            key.differs = true -- several sidechain sends with different settings: the phantom copies the first
+        end
+        if not kseen[key] then kseen[key] = true; sc.allkeys[#sc.allkeys + 1] = key end
+        return key
+    end
+    for _, t in ipairs(list) do
+        local recv = {}
+        for k = 0, reaper.GetTrackNumSends(t.track, -1) - 1 do
+            local dst, src = math.floor(gi(t.track, -1, k, "I_DSTCHAN")), math.floor(gi(t.track, -1, k, "I_SRCCHAN"))
+            local st = gi(t.track, -1, k, "P_SRCTRACK")
+            if (dst & 1023) >= 2 and src >= 0 and gi(t.track, -1, k, "B_MUTE") ~= 1 and st and st ~= 0 and not is_track_hierarchy_muted(st) then
+                local w = src >> 10 -- 0 = stereo, 1 = mono, n = 2n channels
+                local n = ((dst & 1024) ~= 0 or w == 1) and 1 or (w == 0 and 2 or w * 2)
+                recv[#recv + 1] = { st = st, first = dst & 1023, n = n, mode = gi(t.track, -1, k, "I_SENDMODE"), vol = gi(t.track, -1, k, "D_VOL") }
+            end
+        end
+        for fx = 0, (#recv > 0 and reaper.TrackFX_GetCount(t.track) or 0) - 1 do
+            local _, np = reaper.TrackFX_GetIOSize(t.track, fx)
+            local heard, seen = {}, {}
+            for p = 0, (np or 0) - 1 do
+                local low, high = reaper.TrackFX_GetPinMappings(t.track, fx, 0, p)
+                low, high = math.floor(low or 0), math.floor(high or 0)
+                for _, r in ipairs(recv) do
+                    for c = r.first, r.first + r.n - 1 do
+                        local hit = c < 32 and ((low >> c) & 1) or ((high >> (c - 32)) & 1)
+                        if hit == 1 and not seen[r] then seen[r] = true; heard[#heard + 1] = r end
+                    end
+                end
+            end
+            if #heard > 0 then
+                local function cfg(key)
+                    if not reaper.TrackFX_GetNamedConfigParm then return nil end
+                    local ok, v = reaper.TrackFX_GetNamedConfigParm(t.track, fx, key)
+                    return ok and v or nil
+                end
+                local _, name = reaper.TrackFX_GetFXName(t.track, fx)
+                name = clean(name)
+                local why = not reaper.TrackFX_GetEnabled(t.track, fx) and "bypassed" or reaper.TrackFX_GetOffline(t.track, fx) and "offline"
+                    or cfg("container_count") and "a container" or (tonumber(cfg("parallel")) or 0) ~= 0 and "parallel" or nil
+                if why then
+                    sc.skipped[#sc.skipped + 1] = t.name .. " / " .. name .. ": " .. why
+                else
+                    local keys, have = {}, {}
+                    for _, r in ipairs(heard) do
+                        local key = key_for(r)
+                        if not have[key] then have[key] = true; keys[#keys + 1] = key end
+                    end
+                    sc.taps[#sc.taps + 1] = { t = t, idx = t.idx, track = t.name, fx = fx, plugin = name, keys = keys, delay = math.floor(tonumber(cfg("pdc")) or 0) }
+                end
+            end
+        end
+    end
+    return sc
+end
+
 --- Picks the qualifying tracks, then adds one phantom track per chosen track (post-fader send from the original, main send off, the
 -- analyzer on the phantom) and the analyzers on the master. List entries: idx and name of the original, slot = gmem record index.
+-- Stage 8: list.sc (see MA_A.sc_find), list.cin_slot (start of the master chain), list.nslots (all slots), list.nkey / list.ntap (100 ms key / tap records);
+-- no_sc = no sidechain measurement (Shift+click on Collect, for timing tests).
 -- Returns list, skipped count | nil, error.
 -- Task 5b: max_tr = how many track slots fit in gmem at this project length; more chosen tracks: nil, nil, message (nothing changed yet).
-local function inject_analyzers(max_tr)
+local function inject_analyzers(max_tr, no_sc)
     local num_tracks = reaper.CountTracks(0)
     local has_children = {}
     for i = 0, num_tracks - 1 do
@@ -1953,16 +2080,30 @@ local function inject_analyzers(max_tr)
             list[#list + 1] = { idx = i, name = get_track_identity(track), slot = #list, track = track }
         end
     end
-    if #list > max_tr then
+    -- Stage 8: slots in order: the chosen tracks, the start of the master chain, key-only tracks. 100 ms records: every key (main memory, after the
+    -- master input records), two taps per sidechain plugin (own memory MA_A.SC_GMEM, so the taps take nothing from the tracks).
+    local sc = no_sc and { taps = {}, keys = {}, skipped = {}, allkeys = {}, off = true } or MA_A.sc_find(list)
+    local nslots, nkey, ntap = #list + 1 + #sc.keys, #sc.allkeys, 2 * #sc.taps
+    local nsec = math.ceil(reaper.GetProjectLength(0)) + 2
+    local tap_fit = math.floor((MA_A.GMEM_SIZE - MA_HDR) / math.max(ntap * 10 * MA_A.TAPSTRIDE, 1)) - 2 -- seconds the taps fit
+    if nslots + nkey * MA_A.KEYSTRIDE * 10 / MA_STRIDE > max_tr or nsec - 2 > tap_fit then
         reaper.PreventUIRefresh(-1)
         local len = reaper.GetProjectLength(0)
-        local fit_s = math.floor((MA_A.GMEM_SIZE - MA_HDR) / (#list * MA_STRIDE + 10 * (MA_MSTRIDE + MA_A.MISTRIDE))) - 2
-        return nil, nil, string.format("This project is too big for the analyzer memory: %d tracks to measure x %.0f s. At this length up to %d tracks fit; with %d tracks up to %.1f min. Shorten the project or mute / remove tracks, then try again. Nothing was changed.",
-            #list, len, math.max(max_tr, 0), #list, math.max(fit_s, 0) / 60)
+        local fit_s = math.floor((MA_A.GMEM_SIZE - MA_HDR) / (nslots * MA_STRIDE + nkey * MA_A.KEYSTRIDE * 10 + 10 * (MA_MSTRIDE + MA_A.MISTRIDE))) - 2
+        if ntap > 0 then fit_s = math.min(fit_s, tap_fit) end
+        return nil, nil, string.format("This project is too big for the analyzer memory: %d tracks and %d sidechain plugins to measure x %.0f s. At this size up to %.1f min fit. Shorten the project or mute / remove tracks, then try again. Nothing was changed.",
+            nslots, #sc.taps, len, math.max(fit_s, 0) / 60)
+    end
+    list.sc, list.cin_slot, list.nslots, list.nkey, list.ntap = sc, #list, nslots, nkey, ntap
+    for i, k in ipairs(sc.keys) do k.slot = list.cin_slot + i end
+    for i, k in ipairs(sc.allkeys) do k.rec = i - 1 end
+    for i, tp in ipairs(sc.taps) do
+        tp.pre = 2 * (i - 1)
+        tp.post = tp.pre + 1
     end
     -- 2. one phantom per chosen track, appended at the end of the project (the original track numbers do not change)
     local clock = reaper.time_precise
-    local tm = { ins = 0, set = 0, hide = 0, send = 0, check = 0, fixed = 0, fx = 0, master = 0, total = clock() } -- seconds spent per phase (printed in the report)
+    local tm = { ins = 0, set = 0, hide = 0, send = 0, check = 0, fixed = 0, fx = 0, master = 0, sc = 0, total = clock() } -- seconds spent per phase (printed in the report)
     -- Post-fader send from src to dst on channels 1/2, 0 dB, centre, MIDI off. REAPER creates sends with the user's own defaults, so every
     -- value is checked and only values that differ are written. Returns false when the send could not be created.
     -- Writes every send value (only the differing ones); returns how many it had to change.
@@ -2094,11 +2235,62 @@ local function inject_analyzers(max_tr)
             else
                 reaper.TrackFX_SetParam(master, fx_in, 0, 0)
                 reaper.TrackFX_SetParam(master, fx_in, 1, 2)
+                -- Stage 8: third analyzer, also at the start, as a normal track record (peak, flat energy, 15 mid bands per second)
+                local fx_cin = reaper.TrackFX_AddByName(master, ANALYZER_FX_PATH, false, -1000)
+                if fx_cin < 0 then
+                    err = "Could not add the master chain start analyzer."
+                else
+                    reaper.TrackFX_SetParam(master, fx_cin, 0, list.cin_slot)
+                    reaper.TrackFX_SetParam(master, fx_cin, 1, 0)
+                end
             end
         end
     end
-    reaper.PreventUIRefresh(-1)
     tm.master = clock() - c_master
+    -- Stage 8: key-only tracks get a phantom whose send copies the sidechain send, so it measures what the plugin receives
+    local c_sc = clock()
+    for _, k in ipairs(err and {} or sc.keys) do
+        local n = reaper.CountTracks(0)
+        reaper.InsertTrackAtIndex(n, false)
+        local ph = reaper.GetTrack(0, n)
+        reaper.GetSetMediaTrackInfo_String(ph, "P_NAME", "__MA_PHANTOM " .. k.slot, true)
+        reaper.SetMediaTrackInfo_Value(ph, "B_MAINSEND", 0)
+        reaper.SetMediaTrackInfo_Value(ph, "B_SHOWINTCP", 0)
+        reaper.SetMediaTrackInfo_Value(ph, "B_SHOWINMIXER", 0)
+        if not make_send(k.track, ph) then
+            err = "Could not create the send to the phantom track of '" .. k.name .. "'."
+            break
+        end
+        local s = reaper.GetTrackNumSends(k.track, 0) - 1
+        reaper.SetTrackSendInfo_Value(k.track, 0, s, "I_SENDMODE", k.mode)
+        reaper.SetTrackSendInfo_Value(k.track, 0, s, "D_VOL", k.vol)
+        local fx = reaper.TrackFX_AddByName(ph, ANALYZER_FX_PATH, false, -1)
+        if fx < 0 then err = "TrackFX_AddByName could not find the analyzer JSFX (returned -1)." break end
+        reaper.TrackFX_SetParam(ph, fx, 0, k.slot)
+        reaper.TrackFX_SetParam(ph, fx, 1, 0)
+        reaper.TrackFX_SetParam(ph, fx, 3, k.rec + 1)
+    end
+    -- Stage 8: a key that is a measured track: its phantom's analyzer also writes the 100 ms record (after the check above, which resets slots and roles)
+    for _, k in ipairs(err and {} or sc.allkeys) do
+        if not k.only then reaper.TrackFX_SetParam(k.phantom, 0, 3, k.rec + 1) end
+    end
+    -- Stage 8: a pair of taps around each sidechain plugin; from the last plugin to the first, so the chain positions stay valid (-1000 - n = position n)
+    for i = err and 0 or #sc.taps, 1, -1 do
+        local tp = sc.taps[i]
+        local tr = tp.t.track
+        local after = reaper.TrackFX_AddByName(tr, ANALYZER_FX_PATH .. "_sc", false, -1000 - (tp.fx + 1))
+        local before = after >= 0 and reaper.TrackFX_AddByName(tr, ANALYZER_FX_PATH .. "_sc", false, -1000 - tp.fx) or -1
+        if before < 0 then err = "Could not add the sidechain analyzers on '" .. tp.track .. "'." break end
+        after = before + 2 -- the "before" tap pushed it one further
+        reaper.TrackFX_SetParam(tr, before, 1, 3)
+        reaper.TrackFX_SetParam(tr, before, 2, 0)
+        reaper.TrackFX_SetParam(tr, before, 3, tp.pre + 1)
+        reaper.TrackFX_SetParam(tr, after, 1, 3)
+        reaper.TrackFX_SetParam(tr, after, 2, tp.delay)
+        reaper.TrackFX_SetParam(tr, after, 3, tp.post + 1)
+    end
+    tm.sc = clock() - c_sc
+    reaper.PreventUIRefresh(-1)
     tm.total = clock() - tm.total
 
     if err then return nil, nil, err end
@@ -2290,6 +2482,202 @@ function MA_A.mstereo(m, fader_db)
     return r
 end
 
+--- Stage 8: what the master chain changes over a span. mi = its summarize_master input result, mo = the output result, s = the summarize_track
+-- result of the chain-start analyzer. Sets mi.cr_in (crest in), mi.cr_d (crest change), mi.dev[b] (band change minus the median of all bands, so a
+-- plain gain change gives 0) and mi.tone (the bands at least SC_BAND_MIN away). A region (base = the song's mi) lists only the bands that also
+-- differ that much from the song.
+function MA_A.chain_diff(mi, mo, s, offsets, base)
+    if not (mi and s and s.samples > 0 and mo.samples > 0) then return end
+    mi.cr_in = level_db(s.peak) - level_db(math.sqrt((s.ll + s.rr) / (2 * s.samples)))
+    mi.cr_d = MA_A.mstereo(mo, 0).crest - mi.cr_in
+    local g, list = {}, {}
+    for b = 1, 15 do
+        if convert_energy_to_db(s.bands[b], s.samples, offsets[b]) > MA_A.SC_BAND_FLOOR and mo.mid[b] > 0 then
+            g[b] = 10 * math.log((mo.mid[b] / mo.samples) / (s.bands[b] / s.samples), 10)
+            list[#list + 1] = g[b]
+        end
+    end
+    local med = median(list)
+    mi.dev, mi.tone = {}, {}
+    for b = 1, 15 do
+        if g[b] then
+            local dev = g[b] - med
+            mi.dev[b] = dev
+            local against = base and base.dev and base.dev[b] and dev - base.dev[b] or dev
+            if math.abs(dev) >= MA_A.SC_BAND_MIN and math.abs(against) >= MA_A.SC_BAND_MIN then
+                mi.tone[#mi.tone + 1] = { key = MA_A.KEYS[b], dev = dev }
+            end
+        end
+    end
+end
+
+--- Stage 8: runs fn with the sidechain memory attached, then attaches the main memory again (also after an error, which it passes on).
+function MA_A.sc_mem(fn)
+    reaper.gmem_attach(MA_A.SC_GMEM)
+    local ok, err = pcall(fn)
+    reaper.gmem_attach(GMEM_NAME)
+    if not ok then error(err, 0) end
+end
+
+--- Stage 8: reads the sidechain measurements into D.sc (taps, keys, allkeys, skipped). Every 100 ms block: the plugin's gain (after / before) and
+-- whether a key plays (any of its keys within SC_KEY_DB of that key's loudest block). tp.ref = the gain in the plugin's least-reduced moments (dB).
+-- tp.song and tp.reg[i] = { avg, max (reduction while the key plays), off (while it is silent; nil without SC_OFF_MIN_S s of it), closed (% of the
+-- time at SC_CLOSED_DB or more), gate (reaches SC_CAP), bands (bands whose cut jumps at key starts, differing from the others), jn, jump,
+-- bjump (key starts, reduction jump, band jumps), drive (the key drives the plugin) }; reductions positive.
+-- The keys' records are in the main memory, the taps' in the sidechain memory (MA_A.sc_mem).
+function MA_A.sc_read(D, tracks, max_sec, run_id)
+    local A, sc, rd = MA_A, tracks.sc, reaper.gmem_read
+    local nblk = math.min(MA_MAXSEC, max_sec) * 10
+    local thr, min_cnt = 2 * 10 ^ (MA_ACTIVE_DB / 10), 0.05 * rd(2) -- the "before" level must be above the active threshold; half a block at least
+    local function rec(base, stride, r, k) -- mean energy of record r in block k and the block's gmem base; nil when not valid
+        local b = base + (r * MA_MAXSEC * 10 + k) * stride
+        local c = rd(b + 1)
+        if rd(b + 2) ~= run_id or c < min_cnt then return nil end
+        return rd(b) / c, b
+    end
+    for _, key in ipairs(sc.allkeys) do
+        local e, top = {}, 0
+        for k = 0, nblk - 1 do
+            e[k] = rec(A.KEYBASE, A.KEYSTRIDE, key.rec, k) or 0
+            top = math.max(top, e[k])
+        end
+        local lim = math.max(thr, top * 10 ^ (-A.SC_KEY_DB / 10))
+        key.on = {}
+        for k = 0, nblk - 1 do key.on[k] = e[k] > lim end
+    end
+    MA_A.sc_mem(function() for _, tp in ipairs(sc.taps) do
+        local gain, list, on = {}, {}, {}
+        local lv, bl, bc = {}, {}, {} -- per block: input level, band input levels and band changes (dB; a band only within BAND_RANGE_DB of
+        for k = 0, nblk - 1 do         -- the block's loudest band)
+            local e0, b0 = rec(A.TAPBASE, A.TAPSTRIDE, tp.pre, k)
+            local e1, b1 = rec(A.TAPBASE, A.TAPSTRIDE, tp.post, k)
+            if e0 and e1 and e0 > thr then
+                local g = e1 > 0 and 10 * math.log(e1 / e0, 10) or -A.SC_CAP
+                gain[k] = g
+                list[#list + 1] = g
+                local c0, c1, e, lb = rd(b0 + 1), rd(b1 + 1), {}, 0
+                lv[k], bl[k], bc[k] = 10 * math.log(e0, 10), {}, {}
+                for j = 1, 15 do
+                    e[j] = rd(b0 + 2 + j) / c0
+                    lb = math.max(lb, e[j])
+                end
+                for j = 1, 15 do
+                    if e[j] > 0 and e[j] >= lb * 10 ^ (-A.BAND_RANGE_DB / 10) then
+                        local f = rd(b1 + 2 + j) / c1
+                        bl[k][j] = 10 * math.log(e[j], 10)
+                        bc[k][j] = f > 0 and math.max(10 * math.log(f / e[j], 10), -A.SC_CAP) or -A.SC_CAP
+                    end
+                end
+                for _, key in ipairs(tp.keys) do
+                    if key.on[k] then on[k] = true break end
+                end
+            end
+        end
+        tp.ref = percentile(list, A.SC_REF_PCT)
+        local function stats(blk0, blk1)
+            local n, sum, mx, top, closed = { [true] = 0, [false] = 0 }, { [true] = 0, [false] = 0 }, 0, 0, 0
+            local jn, js, bj = 0, 0, {} -- key starts: count, reduction jump sum, per band { count, jump sum }
+            for j = 1, 15 do bj[j] = { 0, 0 } end
+            for k = blk0, math.min(blk1, nblk - 1) do
+                if gain[k] then
+                    local red, o = math.min(math.max(tp.ref - gain[k], 0), A.SC_CAP), on[k] == true
+                    n[o], sum[o], top = n[o] + 1, sum[o] + red, math.max(top, red)
+                    if o then mx = math.max(mx, red) end
+                    if red >= A.SC_CLOSED_DB then closed = closed + 1 end
+                    -- key start: the key plays in this block but not in the one before, with the input level within SC_ONSET_DB of it
+                    local q = k - 1
+                    if o and gain[q] and not on[q] then
+                        if math.abs(lv[k] - lv[q]) <= A.SC_ONSET_DB then
+                            jn, js = jn + 1, js + red - math.min(math.max(tp.ref - gain[q], 0), A.SC_CAP)
+                        end
+                        for j = 1, 15 do
+                            if bl[k][j] and bl[q][j] and math.abs(bl[k][j] - bl[q][j]) <= A.SC_ONSET_DB then
+                                bj[j][1], bj[j][2] = bj[j][1] + 1, bj[j][2] + bc[k][j] - bc[q][j]
+                            end
+                        end
+                    end
+                end
+            end
+            local x = { bands = {}, jn = jn, bjump = {} }
+            local all = n[true] + n[false]
+            if all == 0 then return x end
+            -- does the key drive the plugin? the reduction (or a band's change) jumps at key starts by SC_MIN (SC_BAND_MIN), over SC_ONSET_MIN starts
+            if jn >= A.SC_ONSET_MIN then x.jump = js / jn end
+            for j = 1, 15 do
+                if bj[j][1] >= A.SC_ONSET_MIN then x.bjump[#x.bjump + 1] = { key = A.KEYS[j], dev = bj[j][2] / bj[j][1] } end
+            end
+            table.sort(x.bjump, function(a, b) return math.abs(a.dev) > math.abs(b.dev) end)
+            x.drive = (x.jump and math.abs(x.jump) >= A.SC_MIN) or (x.bjump[1] and math.abs(x.bjump[1].dev) >= A.SC_BAND_MIN) or false
+            x.closed, x.gate = 100 * closed / all, top >= A.SC_CAP - 1e-6
+            if n[true] > 0 then x.avg, x.max = sum[true] / n[true], mx end
+            if n[false] >= A.SC_OFF_MIN_S * 10 then x.off = sum[false] / n[false] end
+            -- bands: the jump of the band's change at key starts; shown only when the bands differ from each other (a reduction that is the
+            -- same everywhere shows no band), at least SC_BAND_MIN, at most two
+            if x.avg and x.off then
+                local lo, hi = math.huge, -math.huge
+                for _, e in ipairs(x.bjump) do lo, hi = math.min(lo, e.dev), math.max(hi, e.dev) end
+                if hi - lo >= A.SC_BAND_MIN then
+                    for _, e in ipairs(x.bjump) do
+                        if math.abs(e.dev) >= A.SC_BAND_MIN and #x.bands < 2 then x.bands[#x.bands + 1] = e end
+                    end
+                end
+            end
+            return x
+        end
+        tp.reg = {}
+        if tp.ref then
+            tp.song = stats(0, nblk - 1)
+            for i, reg in ipairs(D.regions) do
+                if not reg.na and reg.mr then
+                    tp.reg[i] = stats(math.ceil(reg.start_s * 10 - 1e-6), math.floor(reg.end_s * 10 + 1e-6) - 1)
+                end
+            end
+        end
+    end end)
+    for _, k in ipairs(sc.keys) do
+        local s = summarize_track(k.slot, max_sec, run_id)
+        if s.samples > 0 then k.L, k.pk = lufs(s.ke / s.samples), level_db(s.peak) end
+    end
+    D.sc = sc
+end
+
+--- Stage 8: does this result go into the prompt? Only with key-silent time to compare with, and then for a gate, a reduction that jumps
+-- by SC_MIN when the key starts while the input stays level, or a band that jumps by SC_BAND_MIN (x.drive).
+function MA_A.sc_say(x)
+    if not (x and x.avg and x.off) then return false end
+    return x.gate or x.drive
+end
+
+--- Stage 8: the numbers of one result as text
+function MA_A.sc_text(x)
+    if x.gate then return string.format("closed %d%%", math.floor(x.closed + 0.5)) end
+    local b = {}
+    for _, e in ipairs(x.bands) do b[#b + 1] = e.key .. string.format("%+.1f", e.dev) end
+    return string.format("avg %.1f max %.1f %s%s", x.avg or 0, x.max or 0, x.off and string.format("off %.1f", x.off) or "off n/a (key never silent)",
+        #b > 0 and ("; " .. table.concat(b, " ")) or "")
+end
+
+--- Stage 8: the SIDECHAIN lines of the data block. keep(tp) = this plugin may be shown; nm = the name format. Nothing to show: an empty list.
+function MA_A.sc_lines(D, keep, nm, f1)
+    local l, seen = {}, {}
+    for _, tp in ipairs(D.sc and D.sc.taps or {}) do
+        if keep(tp) and MA_A.sc_say(tp.song) then
+            local ks = {}
+            for i, k in ipairs(tp.keys) do ks[i] = nm(k.name) end
+            l[#l + 1] = string.format("%s > %s / %s: %s", table.concat(ks, ", "), nm(tp.track), nm(tp.plugin), MA_A.sc_text(tp.song))
+            for _, k in ipairs(tp.keys) do
+                if k.only and not seen[k] then seen[k] = true end
+            end
+        end
+    end
+    if #l == 0 then return l end
+    table.insert(l, 1, "SIDECHAIN (gain reduction in dB of plugins with a side-chain input; avg, max = while the key track plays, off = avg while it is silent; then the bands whose cut jumps when the key starts; closed n% = a gate cutting 20 dB or more that share of the time)")
+    for _, k in ipairs(D.sc.keys) do
+        if seen[k] and k.L then l[#l + 1] = string.format("key only %s L%s pk%s", nm(k.name), f1(k.L), f1(k.pk)) end
+    end
+    return l
+end
+
 -- ------------------------------------------------------------------------------
 -- Stage 4, task 4a: routing, region aggregation, contribution model (console output only, no AI yet)
 -- ------------------------------------------------------------------------------
@@ -2375,6 +2763,7 @@ local function collect_region_data(tracks, max_sec, run_id, offsets)
     local song = summarize_master(max_sec, run_id)
     if song.samples <= 0 then return nil, "the master has no valid data" end
     song.mi = summarize_master(max_sec, run_id, nil, nil, true) -- master input (before the master FX)
+    MA_A.chain_diff(song.mi, song, summarize_track(tracks.cin_slot, max_sec, run_id), offsets)
     song.mid_db, song.side_db = {}, {}
     for b = 1, 15 do
         song.mid_db[b] = convert_energy_to_db(song.mid[b], song.samples, offsets[b])
@@ -2535,6 +2924,7 @@ local function collect_region_data(tracks, max_sec, run_id, offsets)
             if mr and mr.samples > 0 then
                 reg.mr = mr
                 reg.mi = summarize_master(max_sec, run_id, blk0, blk1, true)
+                MA_A.chain_diff(reg.mi, mr, summarize_track(tracks.cin_slot, s1, run_id, s0, { weight = w, tie_sec = s0 }), offsets, song.mi)
                 -- width from the calibrated mid and side band energies
                 local em, es = 0, 0
                 for b = 1, 15 do
@@ -2582,6 +2972,7 @@ local function collect_region_data(tracks, max_sec, run_id, offsets)
         end
     end
     D.check = { weights = total_w, gaps = proj_len - covered, n_na = n_na }
+    MA_A.sc_read(D, tracks, max_sec, run_id)
     for _, t in ipairs(tracks) do t.guid = reaper.GetTrackGUID(t.track) end -- task 4f.6: tracks are found by GUID at send time
     local stamped = reaper.gmem_read(MA_H_MSTAMP) == run_id
     D.m_peak = stamped and (level_db(reaper.gmem_read(MA_H_MPEAK)) + level_db(reaper.GetMediaTrackInfo_Value(reaper.GetMasterTrack(0), "D_VOL"))) or nil
@@ -2688,7 +3079,14 @@ function MA_A.fmt()
     -- Master chain effect: input (before the master FX) against output (after them), per song or region. Whole spans only, never per block.
     local function chain(mi, mo)
         if not (mi and mi.samples > 0 and mi.integrated > -70 and mo.integrated > -70) then return nil end
-        return string.format("chain in I%s M%s LRA%s gain%+.1f", f1(mi.integrated), f1(mi.max_m), f1(mi.lra), mo.integrated - mi.integrated) -- task 5e2: "out" = the line above
+        local tone = {}
+        local function z(v) return v and (math.abs(v) < 0.05 and 0 or v) end -- no "-0.0"
+        mi = setmetatable({ cr_d = z(mi.cr_d) }, { __index = mi })
+        mo = { integrated = mi.integrated + z(mo.integrated - mi.integrated) }
+        for _, e in ipairs(mi.tone or {}) do tone[#tone + 1] = e.key .. string.format("%+.1f", e.dev) end
+        -- task 5e2: "out" = the line above; stage 8: before >> = going into the chain, after it = what the chain changes
+        return string.format("chain in I%s M%s LRA%s%s >> gain%+.1f%s%s", f1(mi.integrated), f1(mi.max_m), f1(mi.lra), mi.cr_in and (" cr" .. f1(mi.cr_in)) or "",
+            mo.integrated - mi.integrated, mi.cr_d and string.format(" cr%+.1f", mi.cr_d) or "", #tone > 0 and (" tone " .. table.concat(tone, " ")) or "")
     end
     local function pan_label(p) return p == 0 and "pC" or (p < 0 and ("pL" .. -p) or ("pR" .. p)) end
     local function devs(list, int)
@@ -2748,7 +3146,10 @@ end
 --   quiet_region(B, i): header-only region; region(B, i, reg): returns the full lines, the approx tracks, the mask holder, role[d], extra text lines
 --   all_lines: no minimum share for a region line; also: add the "R n also" line
 --   finish(B, named): at the end; may return a new named list; legend(focus): the legend lines of this mode
-MA_A.PARTS = { song = { also = true }, group = { all_lines = true }, band = { all_lines = true }, stereo = { also = true }, master = {} }
+--   sc(B, tp): stage 8, the SIDECHAIN block shows this plugin (a mode without it has no block)
+MA_A.PARTS = { song = { also = true, sc = function() return true end }, group = { all_lines = true }, band = { all_lines = true }, stereo = { also = true }, master = {} }
+
+function MA_A.PARTS.group.sc(B, tp) return B.inF[tp.idx] or B.inR[tp.idx] end
 
 function MA_A.PARTS.group.start(B)
     local D, plays = B.D, MA_A.plays
@@ -3090,6 +3491,9 @@ local function build_data_block(D, focus, fs)
             omitted = omitted + 1
         end
     end
+    if part.sc then
+        for _, s in ipairs(MA_A.sc_lines(D, function(tp) return part.sc(B, tp) end, nm, f1)) do draft[#draft + 1] = s end
+    end
     draft[#draft + 1] = "REGIONS"
     local function mnotable(mr) -- task 5d: a region's master stereo values and clips, only when they say something
         local x, s = MA_A.mstereo(mr, 0), ""
@@ -3191,6 +3595,32 @@ local function print_region_summary(out, tracks, max_sec, run_id, offsets)
     out[#out + 1] = string.format("  phantom check: top-level tracks against the master input %s dB (expect about -3 to 0)",
         D.song_chk and string.format("%+.1f", D.song_chk) or "n/a")
 
+    -- SIDECHAIN (stage 8): everything measured; the data block shows only what says something
+    out[#out + 1] = "\nSIDECHAIN (ref = the plugin's gain in its least-reduced moments, delay = samples the after tap is shifted by; reduction in dB)"
+    for _, tp in ipairs(D.sc.taps) do
+        local ks = {}
+        for i, k in ipairs(tp.keys) do ks[i] = k.name .. (k.only and " (key only)" or "") end
+        out[#out + 1] = string.format("  %s > %s / %s | delay %d | ref %s | in the data block: %s", table.concat(ks, ", "), tp.track, tp.plugin, tp.delay,
+            tp.ref and string.format("%+.1f", tp.ref) or "n/a", MA_A.sc_say(tp.song) and "yes" or "no")
+        out[#out + 1] = "    song: " .. (tp.song and tp.song.avg and (MA_A.sc_text(tp.song) .. (tp.song.gate and "" or string.format(" | closed %.0f%%", tp.song.closed))) or "no data while the key plays")
+        if tp.song and tp.song.avg then
+            local x, b = tp.song, {}
+            for i = 1, math.min(3, #x.bjump) do b[i] = x.bjump[i].key .. string.format("%+.1f", x.bjump[i].dev) end
+            out[#out + 1] = string.format("    key starts with the input level steady: %d, reduction jumps %s%s | driven by the key: %s", x.jn,
+                x.jump and string.format("%+.1f", x.jump) or "n/a (too few)", #b > 0 and (" | largest band jumps " .. table.concat(b, " ")) or "",
+                x.drive and "yes" or "no")
+        end
+        for i, reg in ipairs(D.regions) do
+            local x = tp.reg[i]
+            if x and x.avg then out[#out + 1] = string.format("    R%d %s: %s", i, reg.name, MA_A.sc_text(x)) end
+        end
+    end
+    for _, k in ipairs(D.sc.keys) do
+        out[#out + 1] = string.format("  key only %s: L %s pk %s%s", k.name, f1(k.L), f1(k.pk), k.differs and " (several sends with different settings; measured with the first)" or "")
+    end
+    for _, s in ipairs(D.sc.skipped) do out[#out + 1] = "  skipped " .. s end
+    if D.sc.off then out[#out + 1] = "  OFF for this run (Shift+click on Collect)" elseif #D.sc.taps + #D.sc.skipped == 0 then out[#out + 1] = "  none" end
+
     -- One track line (region or overview)
     local function track_line(d, indent, with_clips)
         local tail = devs(d.notable)
@@ -3255,7 +3685,7 @@ local function build_jsfx_prompt(block, yaml, focus) -- focus: an AI.FOCUS entry
         "One render of the whole song. Each track is measured after its own fader, pan and automation, before its folder and the master FX. \"_\" in a name = a space (match names to the YAML).",
         "Bands (Hz): " .. table.concat(bands, ", ") .. ".",
         "SONG = the master after its FX: I integrated, M max momentary, S max short-term loudness (LUFS), LRA loudness range (LU), pk sample peak (dBFS), clip clipped samples; mid / side = song-average master band levels (dB) of the mid and side signal.",
-        "chain in: master loudness before the master FX, after it is the line above; gain = loudness the chain adds (dB).",
+        "chain in: the master before the master FX (cr = peak minus rms); the line above is after them. After >> = what the chain changes (dB): gain = added loudness, cr = crest change, tone = mid bands changed more or less than the others (region lines: only those differing from the song line).",
         "TRACKS (whole song), one line per playing track:",
         "- s = % share of the mix (loudness-weighted energy; all counted tracks add up to 100). Folder buses have no s (their children carry it). Tracks with no path to the master are left out; what they send is measured on the receiving tracks.",
         "- L = average loudness including pauses (LUFS, ungated; a track that plays more often gets a higher L at the same level, compare pk), pk = sample peak (dBFS), cr = crest factor (dB, median per second of peak minus RMS; low = dense or heavily compressed), a = % of the time the track plays.",
@@ -3281,7 +3711,7 @@ local function build_jsfx_prompt(block, yaml, focus) -- focus: an AI.FOCUS entry
         "In areas 2-5 use the track band bumps, the mask ranges and the master band deviations; give frequency, gain and Q. Before cutting a bump, check the track's high-pass and low-pass filters. Band levels fall towards the highs in nearly every mix: do not call a mix dark from that alone.",
         "6. Stereo and mono: W, c, the balance and sub!; phase or width problems and how to fix them.",
         "7. Arrangement: two regions of the same kind that differ (e.g. Verse 1 and Verse 2): compare their track lines and also lines and say what changed.",
-        "8. Master: the chain gain, the final loudness and the peak.",
+        "8. Master: the chain gain, crest and tone changes, the final loudness and the peak.",
         "Part 3 \"To-do by priority\": a table of the fixes from part 2, biggest effect first, at most 12 rows: priority, track, plugin and parameter, change (current -> new), why (the number).",
         "If the prompt ends with a FOCUS line, keep only the areas that matter for that focus. Do not write a FOCUS line yourself.",
         "A setting inside a module or band that is switched off (Out, Off, bypassed, active: Off) has no effect. Never give a threshold (compressor, limiter, gate, de-esser or dynamic EQ band, also in a new plugin): the levels going into a plugin are not measured, so give the gain reduction or cut to aim for on the loud parts (dB) instead. Only advise on tracks that play in that region. Quote exact track, plugin and parameter names from the YAML. When the data does not support a claim, say so. Be honest and short, and say briefly why, so I learn.",
@@ -3298,7 +3728,7 @@ end
 --- Task 4f.1: one JSFX collection run (analyzers + phantoms, render, read, cleanup that always runs, undo).
 -- Returns nil when the analyzer file cannot be written (a message box says why); otherwise ok, the report lines,
 -- the data block, the GUIDs of the tracks it names and the stored measurements (build_data_block).
-local function collect_jsfx_data()
+local function collect_jsfx_data(no_sc) -- no_sc (stage 8): no sidechain measurement, for timing tests
     local run_t0 = reaper.time_precise()
     remove_all_analyzers() -- leftovers from an earlier crash
 
@@ -3360,18 +3790,21 @@ local function collect_jsfx_data()
             reaper.Audio_Quit()
             times.reopen, times.close = true, reaper.time_precise() - c0
         end
-        local tracks, skipped, inject_err = inject_analyzers(max_tr)
+        local tracks, skipped, inject_err = inject_analyzers(max_tr, no_sc)
         if not tracks then error(inject_err, 0) end
-        MA_MAXSEC, MA_MAXTR = nsec, math.max(#tracks, 1)
+        MA_MAXSEC, MA_MAXTR = nsec, math.max(tracks.nslots, 1)
         MA_MBASE = MA_HDR + MA_MAXTR * MA_MAXSEC * MA_STRIDE
         MA_A.MIBASE = MA_MBASE + MA_MAXSEC * 10 * MA_MSTRIDE
-        out[#out + 1] = string.format("Analyzer memory: %d track slots x %d s, %d of %d gmem slots used (%.1f%%; at this length up to %d tracks fit)",
-            MA_MAXTR, MA_MAXSEC, MA_A.MIBASE + MA_MAXSEC * 10 * MA_A.MISTRIDE, MA_A.GMEM_SIZE,
-            100 * (MA_A.MIBASE + MA_MAXSEC * 10 * MA_A.MISTRIDE) / MA_A.GMEM_SIZE, max_tr)
-        out[#out + 1] = string.format("Analyzers: %d phantom tracks + master (%d tracks skipped)", #tracks, skipped)
+        MA_A.KEYBASE, MA_A.TAPBASE = MA_A.MIBASE + MA_MAXSEC * 10 * MA_A.MISTRIDE, MA_HDR
+        local mem_top = MA_A.KEYBASE + tracks.nkey * MA_MAXSEC * 10 * MA_A.KEYSTRIDE
+        local sc_top = MA_A.TAPBASE + tracks.ntap * MA_MAXSEC * 10 * MA_A.TAPSTRIDE
+        times.ntaps, times.no_sc = #tracks.sc.taps, no_sc
+        out[#out + 1] = string.format("Analyzer memory: %d slots x %d s, %d of %d gmem slots used (%.1f%%; at this length up to %d slots fit) | sidechain memory %d (%.1f%%)",
+            MA_MAXTR, MA_MAXSEC, mem_top, MA_A.GMEM_SIZE, 100 * mem_top / MA_A.GMEM_SIZE, max_tr, sc_top, 100 * sc_top / MA_A.GMEM_SIZE)
+        out[#out + 1] = string.format("Analyzers: %d phantom tracks + %d key-only + master + %d sidechain plugins x 2 (%d tracks skipped)", #tracks, #tracks.sc.keys, #tracks.sc.taps, skipped)
         local tm = tracks.timing
-        out[#out + 1] = string.format("Setup time %.1f s (inserting the phantom tracks %.1f s, copying the first phantom's chunk / naming + main send off %.1f s, hiding %.1f s, creating the sends %.1f s, analyzers %.1f s, master %.1f s, final check %.1f s; phantoms the check had to repair: %d of %d)",
-            tm.total, tm.ins, tm.set, tm.hide, tm.send, tm.fx, tm.master, tm.check, tm.fixed, #tracks)
+        out[#out + 1] = string.format("Setup time %.1f s (inserting the phantom tracks %.1f s, copying the first phantom's chunk / naming + main send off %.1f s, hiding %.1f s, creating the sends %.1f s, analyzers %.1f s, master %.1f s, sidechain %.1f s, final check %.1f s; phantoms the check had to repair: %d of %d)",
+            tm.total, tm.ins, tm.set, tm.hide, tm.send, tm.fx, tm.master, tm.sc, tm.check, tm.fixed, #tracks)
         times.line = #out
         out[#out + 1] = "JSFX handshake after injection: " .. (reaper.gmem_read(0) == MA_MAGIC and "yes" or "no (advisory only)")
 
@@ -3386,6 +3819,13 @@ local function collect_jsfx_data()
         reaper.gmem_write(MA_H_MCLIPS, 0)
         reaper.gmem_write(MA_H_MSTAMP, 0)
         reaper.gmem_write(MA_H_MPEAK, 0)
+        -- stage 8: the sidechain memory gets the same run start (its taps read only these header slots); slot 14 = where its records start
+        MA_A.sc_mem(function()
+            for _, kv in ipairs({ { 6, 0 }, { 185, B15_C }, { 11, MA_MAXSEC }, { 12, MA_MAXTR }, { 14, MA_A.TAPBASE }, { 9, run_id }, { 7, 0 }, { 6, 1 } }) do
+                reaper.gmem_write(kv[1], kv[2])
+            end
+        end)
+        reaper.gmem_write(14, 0) -- main memory: the keys' records start at KEYBASE (the JSFX computes it)
         reaper.gmem_write(11, MA_MAXSEC) -- task 5b: the run's layout, read by the JSFX on the run-id change
         reaper.gmem_write(12, MA_MAXTR)
 		reaper.gmem_write(9, run_id)
@@ -3404,7 +3844,9 @@ local function collect_jsfx_data()
         out[#out + 1] = string.format("Render for this run: master mix, entire project (the project's own settings, restored afterwards: source flags %d, bounds %d)", r_src, r_bounds)
         reaper.Main_OnCommand(42230, 0)
         local render_s = reaper.time_precise() - render_t0
+        times.render, times.setup = render_s, tracks.timing.total
         reaper.gmem_write(6, 0)
+        MA_A.sc_mem(function() reaper.gmem_write(6, 0) end)
         times.render_end = reaper.time_precise()
 
         local proj_len = reaper.GetProjectLength(0)
@@ -3549,7 +3991,9 @@ local function collect_jsfx_data()
 
     -- Cleanup ALWAYS runs (success, error or cancelled render)
     local clean_t0 = reaper.time_precise()
+    reaper.gmem_attach(GMEM_NAME) -- stage 8: an error inside the sidechain memory leaves it attached
     reaper.gmem_write(6, 0)
+    MA_A.sc_mem(function() reaper.gmem_write(6, 0) end)
     remove_all_analyzers()
     remove_analyzer_file()
     reaper.GetSetProjectInfo(0, "RENDER_ADDTOPROJ", render_opts, true)
@@ -3578,6 +4022,18 @@ local function collect_jsfx_data()
         times.close, times.open, times.read and string.format("%.1f", times.read) or "n/a", clean_s, reaper.time_precise() - run_t0, dev_warn and (" | " .. dev_warn) or ""))
 
     if not ok then out[#out + 1] = "ERROR: " .. tostring(err) .. (dev_warn and (" " .. dev_warn) or "") end
+    -- Stage 8: one line per Collect in MixAssistant_timing.txt next to the script (developer switch only), to compare render times across runs
+    if MA_A.DEV and times.render then
+        local dir = (debug.getinfo(1, "S").source or ""):match("^@(.*[\\/])")
+        local _, pf = reaper.EnumProjects(-1, "")
+        local f = dir and io.open(dir .. "MixAssistant_timing.txt", "a")
+        if f then
+            f:write(string.format("%s | %s | sidechain %s (%d plugins) | render %.1f s | setup %.1f s | whole run %.1f s%s\n", os.date("%Y-%m-%d %H:%M:%S"),
+                (pf or ""):match("([^\\/]+)$") or "?", times.no_sc and "OFF" or "on", times.ntaps or 0, times.render, times.setup or 0,
+                reaper.time_precise() - run_t0, ok and "" or " | FAILED"))
+            f:close()
+        end
+    end
     if coll then coll.warn = dev_warn and ((rate_warn and (rate_warn .. " ") or "") .. dev_warn) or rate_warn end
     return ok, out, data_block, named, coll
 end
@@ -3873,8 +4329,8 @@ end
 
 --- "Collect": one collection run, then the Whole Song prompt. Task 5g.1: with MA_A.DEV the report goes next to the script and the prompt is
 -- saved next to the project at once (Copy / Send then find it saved); without it only a failed run leaves a report, next to the project.
-function AI.collect()
-    local ok, out, block, named, D = collect_jsfx_data()
+function AI.collect(no_sc)
+    local ok, out, block, named, D = collect_jsfx_data(no_sc)
     if not out then AI.status = "Collection failed: the analyzer file could not be written." return end
     local function report_path()
         local dir
@@ -4359,6 +4815,7 @@ function AI.detail_text()
         .. "own fader (dB), levels = all 15 band levels (dB); auto = its envelopes over the whole song, ENVELOPE unit: value@seconds (straight "
         .. "lines between the points; the measured numbers already include the automation). Then the YAML (same format as the project YAML). "
         .. "The rules of the first message still hold: never give a threshold, give the gain reduction or cut to aim for (dB) instead.", c.when) }
+    local sc_note = " sidechain = gain reduction of a plugin with a side-chain input (dB): avg, max = while the key track plays, off = avg while it is silent; then the bands whose cut jumps when the key starts; closed n% = a gate cutting 20 dB or more that share of the time."
     for _, tr in ipairs(S.list) do
         if only[tr] then
             local t = by_tr[tr]
@@ -4368,6 +4825,16 @@ function AI.detail_text()
             local od, quiet = nil, {}
             for _, d in ipairs(t and D.over or {}) do if d.t == t then od = d break end end
             p[#p + 1] = plays(od) and (" song " .. line(od)) or " song: not playing or not measured"
+            -- stage 8: this track's sidechain plugins, whole song and per region
+            local tps = {}
+            for _, tp in ipairs(t and D.sc and D.sc.taps or {}) do
+                if tp.t == t and MA_A.sc_say(tp.song) then
+                    tps[#tps + 1] = tp
+                    p[#p + 1] = string.format(" sidechain %s: %s", nm(tp.plugin), MA_A.sc_text(tp.song))
+                    p[1] = sc_note and p[1] .. sc_note or p[1]
+                    sc_note = nil
+                end
+            end
             for i, reg in ipairs(t and D.regions or {}) do
                 if not reg.na and reg.mr then
                     local rd
@@ -4375,6 +4842,9 @@ function AI.detail_text()
                     if plays(rd) then
                         local on = spans(t, reg)
                         p[#p + 1] = string.format(" R%d %s%s %s", i, nm(reg.name), on and (" on " .. on) or "", line(rd))
+                        for _, tp in ipairs(tps) do
+                            if MA_A.sc_say(tp.reg[i]) then p[#p + 1] = string.format("  sidechain %s: %s", nm(tp.plugin), MA_A.sc_text(tp.reg[i])) end
+                        end
                     else quiet[#quiet + 1] = "R" .. i end
                 end
             end
@@ -4468,10 +4938,13 @@ local function main()
             local bh, bpad = 26, 12 -- every button: the same height, horizontal padding inside
             reaper.ImGui_PushStyleVar(ctx, reaper.ImGui_StyleVar_FramePadding(), bpad, 3)
             if is_busy then reaper.ImGui_BeginDisabled(ctx, true) end
+            -- stage 8: Shift+click = Collect without the sidechain measurement (timing tests)
+            local no_sc = reaper.ImGui_GetKeyMods and (reaper.ImGui_GetKeyMods(ctx) & reaper.ImGui_Mod_Shift()) ~= 0 or false
             if reaper.ImGui_Button(ctx, is_busy and "Working..." or "Collect Project Info", -1, bh) and (not reaper.AnyTrackSolo(0) or
                 reaper.ShowMessageBox("Some tracks are soloed. Collect Project Info will measure only the soloed tracks, and the master numbers will describe only them.\n\nContinue?",
                     "Soloed tracks", 1) == 1) then
-                pending, AI.status = function() AI.keep(AI.collect) end, "⏳ Rendering the project and reading the analyzers... please wait."
+                pending, AI.status = function() AI.keep(function() AI.collect(no_sc) end) end,
+                    no_sc and "⏳ Rendering without the sidechain measurement (Shift)... please wait." or "⏳ Rendering the project and reading the analyzers... please wait."
             end
             local c = AI.collected
 
