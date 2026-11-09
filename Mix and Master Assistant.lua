@@ -2344,7 +2344,9 @@ end
 
 --- Region and song aggregation (A1.3-A1.5): master numbers per region, per-track stats, K-energy share, top-N selection,
 -- masking hints and the approx list. Returns D = { song, over = {stats per track, whole song}, regions = {...}, ... } | nil, error.
-local function collect_region_data(tracks, route, max_sec, run_id, offsets)
+local function collect_region_data(tracks, max_sec, run_id, offsets)
+    -- Stage 6: everything the prompts read is in D when this returns: song, over, regions, ps, offsets, tracks (each with t.guid), route, m_peak, m_clips, check, pre_fx
+    local route = track_routing(tracks)
     local proj_len = reaper.GetProjectLength(0)
     local song = summarize_master(max_sec, run_id)
     if song.samples <= 0 then return nil, "the master has no valid data" end
@@ -2354,7 +2356,7 @@ local function collect_region_data(tracks, route, max_sec, run_id, offsets)
         song.mid_db[b] = convert_energy_to_db(song.mid[b], song.samples, offsets[b])
         song.side_db[b] = convert_energy_to_db(song.side[b], song.samples, offsets[b])
     end
-    local D = { song = song, over = {}, regions = {}, proj_len = proj_len, tracks_with_data = 0, dropped = 0 }
+    local D = { song = song, over = {}, regions = {}, proj_len = proj_len, tracks_with_data = 0, dropped = 0, tracks = tracks, route = route }
 
     -- Stats of one track (read from its phantom, so after its own fader, pan and automation) over seconds s0 .. s1 - 1
     -- (w = region weights or nil); nil when the track has no data there
@@ -2489,12 +2491,9 @@ local function collect_region_data(tracks, route, max_sec, run_id, offsets)
 
     local total_w, covered, cover_end, n_na = 0, 0, 0, 0
     for _, rg in ipairs(regs) do
-        local s0, s1 = math.floor(rg.start_s + 1e-9), math.ceil(rg.end_s - 1e-9)
-        local w, wsum = {}, 0
-        for sec = s0, s1 - 1 do
-            w[sec] = math.max(0, math.min(1, math.min(sec + 1, rg.end_s) - math.max(sec, rg.start_s)))
-            wsum = wsum + w[sec]
-        end
+        local s0, s1, w = MA_A.reg_win(rg.start_s, rg.end_s)
+        local wsum = 0
+        for sec = s0, s1 - 1 do wsum = wsum + w[sec] end
         total_w = total_w + wsum
         if rg.end_s > math.max(rg.start_s, cover_end) then
             covered = covered + rg.end_s - math.max(rg.start_s, cover_end)
@@ -2540,7 +2539,7 @@ local function collect_region_data(tracks, route, max_sec, run_id, offsets)
                     local d = window(r, t, s0, s1, w)
                     if d then
                         reg.all[#reg.all + 1] = d
-                        if r.role ~= "bus" and d.act and d.act >= MA_A.ACTIVE_MIN_PCT then cand[#cand + 1] = d end
+                        if r.role ~= "bus" and MA_A.plays(d) then cand[#cand + 1] = d end
                     end
                 end
                 reg.chk = top_check(normalise(reg.all), reg.mi, (pre_g2(rg.start_s, rg.end_s)))
@@ -2559,8 +2558,28 @@ local function collect_region_data(tracks, route, max_sec, run_id, offsets)
         end
     end
     D.check = { weights = total_w, gaps = proj_len - covered, n_na = n_na }
+    for _, t in ipairs(tracks) do t.guid = reaper.GetTrackGUID(t.track) end -- task 4f.6: tracks are found by GUID at send time
+    local stamped = reaper.gmem_read(MA_H_MSTAMP) == run_id
+    D.m_peak = stamped and (level_db(reaper.gmem_read(MA_H_MPEAK)) + level_db(reaper.GetMediaTrackInfo_Value(reaper.GetMasterTrack(0), "D_VOL"))) or nil
+    D.m_clips = stamped and math.floor(reaper.gmem_read(MA_H_MCLIPS) + 0.5) or nil
     return D
 end
+
+--- Stage 6: the whole seconds a region touches (s0 .. s1 - 1) and each second's weight (the part of that second inside the region).
+function MA_A.reg_win(start_s, end_s)
+    local s0, s1, w = math.floor(start_s + 1e-9), math.ceil(end_s - 1e-9), {}
+    for sec = s0, s1 - 1 do w[sec] = math.max(0, math.min(1, math.min(sec + 1, end_s) - math.max(sec, start_s))) end
+    return s0, s1, w
+end
+
+--- Stage 6: the track plays in this second (the act rule per second); p = the track's per-second copy D.ps[idx], see collect_region_data.
+function MA_A.on_sec(p, sec)
+    local k = sec * 18
+    return p ~= nil and (p[k + 18] or 0) > 0 and 100 * p[k + 17] / p[k + 18] >= MA_A.ACTIVE_MIN_PCT
+end
+
+--- Stage 6: the track counts as playing in a song or region entry (the act rule over the whole span).
+function MA_A.plays(d) return d and d.act and d.act >= MA_A.ACTIVE_MIN_PCT end
 
 --- Task 5e: masking in band b of a region among the tracks of pool. A pair counts when it is not on opposite sides, plays together for at
 --- least MASK_OVERLAP % of the shorter track's playing seconds, and over those seconds each holds >= MASK_SHARE of the band energy of all
@@ -2568,12 +2587,9 @@ end
 --- under MASK_SHARE) and cen (the calibrated band energy over the seconds of those pairs: the weight when a merged range's shares are combined), or nil.
 function MA_A.mask_band(D, reg, b, pool)
     local A, P = MA_A, D.ps
-    local s0, s1 = math.floor(reg.start_s + 1e-9), math.ceil(reg.end_s - 1e-9)
-    local w, tot = {}, {}
-    for sec = s0, s1 - 1 do
-        w[sec] = math.max(0, math.min(1, math.min(sec + 1, reg.end_s) - math.max(sec, reg.start_s)))
-        tot[sec] = 0
-    end
+    local s0, s1, w = MA_A.reg_win(reg.start_s, reg.end_s)
+    local tot = {}
+    for sec = s0, s1 - 1 do tot[sec] = 0 end
     for _, d in ipairs(reg.all) do
         local p = P[d.t.idx]
         if p and d.r.role ~= "bus" then
@@ -2600,8 +2616,7 @@ function MA_A.mask_band(D, reg, b, pool)
     for _, d in ipairs(pool) do
         local p, o, t = P[d.t.idx], {}, 0
         for sec = s0, s1 - 1 do
-            local k = sec * 18
-            if p and (p[k + 18] or 0) > 0 and 100 * p[k + 17] / p[k + 18] >= A.ACTIVE_MIN_PCT then
+            if A.on_sec(p, sec) then
                 o[sec] = true
                 t = t + w[sec]
             end
@@ -2693,42 +2708,222 @@ function MA_A.fmt()
         flush()
         return res
     end
-    return f1, n1, i0, c2, nm, chain, pan_label, devs, mask_ranges
+    -- Stage 6: the data keys of one track line, the same in the data block and Track Detail (the legend explains them)
+    local function track_keys(d, show_sub)
+        return string.format("L%s pk%s%s a%s W%s c%s %s%s", f1(d.L), f1(d.pk), d.crest and (" cr" .. i0(d.crest)) or "", i0(d.act),
+            i0(d.width), c2(d.corr), pan_label(d.pan100), (d.sub_risk and show_sub) and " sub!" or "")
+    end
+    return f1, n1, i0, c2, nm, chain, pan_label, devs, mask_ranges, track_keys
 end
 
---- Task 4f.6: the data block of the prompt from the stored measurements (D = the collect_region_data result plus m_peak, m_clips;
--- t.guid on every track), so it can be rebuilt at send time without reading gmem. focus = an AI.FOCUS entry; nil or Whole Song gives
--- the 4e text. Returns the text, the GUIDs of the tracks it names (they keep full plugin settings in the YAML) and the number of
--- tracks left out of TRACKS. Task 4f.7b: fs = { F = {[idx] = true}, R = {[idx] = true} } for a group focus (F = focus tracks,
--- R = their returns), nil otherwise; then a 4th value: the GUIDs of every track the data mentions (the others get a bare YAML line).
-local function build_data_block(D, focus, fs)
-    local f1, _, i0, c2, nm, chain, pan_label, devs, mask_ranges = MA_A.fmt()
-    local song, KEYS, m_peak, m_clips = D.song, MA_A.KEYS, D.m_peak, D.m_clips
-    local song_chain = chain(song.mi, song)
-    local inF, inR = fs and fs.F or {}, fs and fs.R or {}
-    local function plays(d) return d.act and d.act >= MA_A.ACTIVE_MIN_PCT end
+--- Stage 6: what differs per focus mode (AI.FOCUS[i].mode; no focus = song). build_data_block runs the common flow (SONG, TRACKS, REGIONS, mask,
+-- approx) and asks the mode's part. All fields are optional. B = what the parts share (see build_data_block).
+--   start(B): prepare; may set B.bl, B.bh (band range), B.rs (share of the range), B.rlev (range levels text), B.listed (see the return values below)
+--   keep(B, d): TRACKS, does this playing track get a line; devs(B, list): the band deviations to show
+--   track_extra(B, d, clip): TRACKS, returns the clip text, the levels text and the automation text
+--   quiet_region(B, i): header-only region; region(B, i, reg): returns the full lines, the approx tracks, the mask holder, role[d], extra text lines
+--   all_lines: no minimum share for a region line; also: add the "R n also" line
+--   finish(B, named): at the end; may return a new named list; legend(focus): the legend lines of this mode
+MA_A.PARTS = { song = { also = true }, group = { all_lines = true }, band = { all_lines = true }, stereo = { also = true }, master = {} }
+
+function MA_A.PARTS.group.start(B)
+    local D, plays = B.D, MA_A.plays
+    local inF, inR, freg, played, listed = B.fs.F, B.fs.R, {}, {}, {}
     -- focus regions (an F track plays there) and the tracks that play in at least one of them
-    local freg, played, listed = {}, {}, nil
-    if fs then
-        for i, reg in ipairs(D.regions) do
-            if not reg.na and reg.mr then
-                for _, d in ipairs(reg.all) do
-                    if inF[d.t.idx] and plays(d) then freg[i] = true break end
-                end
-                if freg[i] then
-                    for _, d in ipairs(reg.all) do if plays(d) then played[d.t.idx] = true end end
-                end
+    for i, reg in ipairs(D.regions) do
+        if not reg.na and reg.mr then
+            for _, d in ipairs(reg.all) do
+                if inF[d.t.idx] and plays(d) then freg[i] = true break end
+            end
+            if freg[i] then
+                for _, d in ipairs(reg.all) do if plays(d) then played[d.t.idx] = true end end
             end
         end
-        listed = {}
-        for _, t in ipairs(D.tracks) do
-            if played[t.idx] or inF[t.idx] or inR[t.idx] then listed[t.guid] = true end
+    end
+    for _, t in ipairs(D.tracks) do
+        if played[t.idx] or inF[t.idx] or inR[t.idx] then listed[t.guid] = true end
+    end
+    B.inF, B.inR, B.freg, B.played, B.listed = inF, inR, freg, played, listed
+end
+
+function MA_A.PARTS.group.keep(B, d)
+    local x = d.t.idx
+    return B.played[x] or B.inF[x] or B.inR[x]
+end
+
+function MA_A.PARTS.group.quiet_region(B, i) return not B.freg[i] end
+
+-- task 4f.7b: a focus track (4f.8: and a return) also gets its clips, the peak before its fader and all 15 band levels; 4f.9: its automation points
+function MA_A.PARTS.group.track_extra(B, d, clip)
+    if not (B.inF[d.t.idx] or B.inR[d.t.idx]) then return clip, "" end
+    local l, KEYS, i0 = {}, MA_A.KEYS, B.i0
+    for b = 1, 15 do l[b] = KEYS[b] .. i0(d.bands[b]) end
+    return string.format(" clip%.0f prepk%s", d.s.clips, B.f1(d.pk - d.r.fader_db)), " | levels " .. table.concat(l, " "), B.fs.auto and B.fs.auto[d.t.idx]
+end
+
+-- task 4f.8: time-gated roles and the compete lines. w = region weight per second; on(d, sec) = d plays in that second
+function MA_A.PARTS.group.region(B, i, reg)
+    local D, inF, inR, nm, i0, plays = B.D, B.inF, B.inR, B.nm, B.i0, MA_A.plays
+    local P, OFF, A = D.ps, D.offsets, MA_A
+    local s0, s1, w = A.reg_win(reg.start_s, reg.end_s)
+    local function on(d, sec) return A.on_sec(P[d.t.idx], sec) end
+    local role, comp_lines = {}, {} -- role[d] = { "focus", "competitor", ... }
+    -- weighted sum over the seconds of g (g[sec] = weight): k = record slot (1 K energy, 1 + b band b); nil k = play time
+    local function sum(d, g, k)
+        local p, s = P[d.t.idx], 0
+        if not p then return 0 end
+        for sec = s0, s1 - 1 do
+            local wt = g[sec]
+            if wt then
+                if k then s = s + (p[sec * 18 + k] or 0) * wt elseif on(d, sec) then s = s + wt end
+            end
+        end
+        return s
+    end
+    local function addrole(d, r)
+        local l = role[d]
+        if not l then l = {}; role[d] = l end
+        for _, x in ipairs(l) do if x == r then return end end
+        l[#l + 1] = r
+    end
+    -- focus tracks and returns that play here; gate = the seconds where at least one focus track plays
+    local cand, fl, gate, gw = {}, {}, {}, 0
+    for _, d in ipairs(reg.all) do
+        if (inF[d.t.idx] or inR[d.t.idx]) and plays(d) then addrole(d, inF[d.t.idx] and "focus" or "return") end
+        if d.r.role ~= "bus" then
+            cand[#cand + 1] = d
+            if inF[d.t.idx] and plays(d) then fl[#fl + 1] = d end
         end
     end
-    -- task 4f.10: topic focus. tp = "band" (only bands focus.lo..focus.hi), "stereo" (no band data) or "master"; nil for Whole Song and groups
-    local tp = not fs and focus and focus.tp or nil
-    local bl, bh = tp == "band" and focus.lo or 1, tp == "band" and focus.hi or 15
-    local rs, inB = {}, {} -- band topic: rs[d] = % of the range energy among the counted tracks of d's list; inB[idx] = >= TOPIC_PCT in a region
+    for sec = s0, s1 - 1 do
+        if w[sec] > 0 then
+            for _, d in ipairs(reg.all) do
+                if inF[d.t.idx] and plays(d) and on(d, sec) then gate[sec] = w[sec]; gw = gw + w[sec] break end
+            end
+        end
+    end
+    -- backdrop: the BACKDROP_N other tracks with the most energy (scaled like the shares) while a focus track plays
+    local bd, ge = {}, {}
+    for _, d in ipairs(cand) do
+        if not inF[d.t.idx] and not inR[d.t.idx] and gw > 0 and 100 * sum(d, gate) / gw >= A.ACTIVE_MIN_PCT then
+            ge[d] = sum(d, gate, 1) * d.gain_lin
+            bd[#bd + 1] = d
+        end
+    end
+    table.sort(bd, function(a, b) return ge[a] > ge[b] end)
+    for k = 1, math.min(A.BACKDROP_N, #bd) do addrole(bd[k], "backdrop") end
+    -- competitors of each focus track f, over the seconds where f plays (gf): its main bands are within COMP_MAIN_DB of its
+    -- loudest band; a competitor is another track, not on the opposite side, at least f - COMP_DB in such a band
+    for _, f in ipairs(fl) do
+        local gf, nf = {}, 0
+        for sec = s0, s1 - 1 do
+            if w[sec] > 0 and on(f, sec) then gf[sec] = w[sec]; nf = nf + w[sec] end
+        end
+        if nf > 0 then
+            local ef, top, cs = {}, 0, {}
+            for b = 1, 15 do
+                ef[b] = sum(f, gf, 1 + b) * f.gain_lin * 10 ^ (OFF[b] / 10)
+                top = math.max(top, ef[b])
+            end
+            for _, o in ipairs(cand) do
+                if o ~= f and math.abs(o.pan100 - f.pan100) <= A.MASK_PAN then
+                    local ov = 100 * sum(o, gf) / nf -- o = % of f's playing seconds where the competitor plays too
+                    if ov >= A.ACTIVE_MIN_PCT then
+                        local e = {}
+                        for b = 1, 15 do e[b] = sum(o, gf, 1 + b) * o.gain_lin * 10 ^ (OFF[b] / 10) end
+                        cs[#cs + 1] = { d = o, e = e, ov = ov }
+                    end
+                end
+            end
+            -- neighbouring main bands with the same competitor set merge into one range (b = 16 closes the last one)
+            local ranges, g = {}, nil
+            for b = 1, 16 do
+                local key, set = nil, {}
+                if b <= 15 and top > 0 and ef[b] > 0 and ef[b] >= top * 10 ^ (-A.COMP_MAIN_DB / 10) then
+                    local ids = {}
+                    for _, c in ipairs(cs) do
+                        if c.e[b] >= ef[b] * 10 ^ (-A.COMP_DB / 10) then set[#set + 1] = c; ids[#ids + 1] = c.d.t.idx end
+                    end
+                    if #set > 0 then key = table.concat(ids, ",") end
+                end
+                if g and key == g.key then
+                    g.hi = b
+                else
+                    if g then ranges[#ranges + 1] = g end
+                    g = key and { lo = b, hi = b, key = key, set = set } or nil
+                end
+            end
+            for _, r in ipairs(ranges) do
+                local sf = 0
+                for b = r.lo, r.hi do sf = sf + ef[b] end
+                r.items = {}
+                for _, c in ipairs(r.set) do
+                    local so = 0
+                    for b = r.lo, r.hi do so = so + c.e[b] end
+                    r.items[#r.items + 1] = { c = c, db = 10 * math.log(so / sf, 10) }
+                end
+                table.sort(r.items, function(x, y) return x.db > y.db end)
+                r.top = r.items[1].db
+            end
+            table.sort(ranges, function(x, y) return x.top > y.top end)
+            local parts = {}
+            for k = 1, math.min(A.COMP_N, #ranges) do
+                local r, it = ranges[k], {}
+                for j = 1, math.min(A.COMP_N, #r.items) do
+                    local x = r.items[j]
+                    addrole(x.c.d, "competitor")
+                    it[#it + 1] = string.format("%s %+d%s", nm(x.c.d.t.name), math.floor(x.db + 0.5),
+                        x.c.ov >= 99.5 and "" or (" o" .. i0(x.c.ov))) -- no o = plays the whole time
+                end
+                parts[#parts + 1] = string.format("%g-%gHz: %s", B15_EDGES[r.lo], B15_EDGES[r.hi + 1], table.concat(it, ", "))
+            end
+            if #parts > 0 then comp_lines[#comp_lines + 1] = string.format(" compete %s %s", nm(f.t.name), table.concat(parts, "; ")) end
+        end
+    end
+    -- full lines: focus tracks and returns in track order, then backdrop and competitors by share; the rest on the "others" line
+    local lines, rest, apx = {}, {}, {}
+    local extra = {}
+    for _, d in ipairs(reg.all) do
+        if role[d] then
+            if inF[d.t.idx] or inR[d.t.idx] then lines[#lines + 1] = d else extra[#extra + 1] = d end
+        elseif d.r.role ~= "bus" and plays(d) then rest[#rest + 1] = d end
+    end
+    table.sort(extra, function(a, b) return (a.share or 0) > (b.share or 0) end)
+    for _, d in ipairs(extra) do lines[#lines + 1] = d end
+    table.sort(rest, function(a, b) return a.share > b.share end)
+    for _, d in ipairs(lines) do if #d.reasons > 0 then apx[#apx + 1] = d end end
+    local tail, o = {}, {}
+    for _, d in ipairs(rest) do
+        if d.share >= A.MIN_SHARE then o[#o + 1] = nm(d.t.name) .. " s" .. i0(d.share) end
+    end
+    if #o > 0 then tail[#tail + 1] = string.format(" R%d others %s", i, table.concat(o, ", ")) end
+    for _, s in ipairs(comp_lines) do tail[#tail + 1] = s end
+    return lines, apx, { mask = {} }, role, tail -- the compete lines replace the mask line
+end
+
+function MA_A.PARTS.group.finish(B, named) -- task 4f.7b: focus tracks and returns keep full plugin settings even where they do not play
+    for _, t in ipairs(B.D.tracks) do
+        if B.inF[t.idx] or B.inR[t.idx] then named[t.guid] = true end
+    end
+    for g in pairs(named) do B.listed[g] = true end -- task 4f.8: a competitor never gets a bare YAML line
+end
+
+function MA_A.PARTS.group.legend()
+    local A = MA_A
+    return { "",
+            "FOCUS DATA (see FOCUS at the end):",
+            "- TRACKS: focus tracks and returns also show clip n, prepk = sample peak before their own fader (dB) and \"levels\" = all 15 band levels (dB). Tracks that never play while a focus track plays are left out.",
+            "- auto (under a TRACKS line): the track's envelopes over the whole song, ENVELOPE unit: value@seconds ...; the curve follows straight lines between the points within " .. string.format("%g", A.AUTO_TOL_DB) .. " dB (volume), " .. string.format("%g", A.AUTO_TOL_PCT) .. "% (pan, width) or " .. string.format("%g", A.AUTO_TOL_FX_PCT) .. "% of a plugin parameter's range; ~ = over " .. MA_A.AUTO_MAX .. " points, drawn coarser; envelopes that never move are left out; Mute lists the switching points. Send_Volume>NAME = the send to NAME, PLUGIN/PARAM = a plugin parameter. The measured numbers already include the automation.",
+            "- REGIONS: \"no focus track plays\" = master numbers only. Otherwise full lines with the track's role in brackets: focus; return = receives audio from a focus track (reverb, delay, parallel bus); backdrop = one of the " .. A.BACKDROP_N .. " loudest other tracks while focus tracks play; competitor = see compete. Focus tracks and returns first (track order), then the rest by share; line numbers cover the whole region. \"R n others\" = the remaining playing tracks with their share (under " .. string.format("%g", A.MIN_SHARE) .. "% left out); replaces \"R n also\".",
+            "- compete NAME range: TRACK +n oN: main bands of NAME = within " .. string.format("%g", A.COMP_MAIN_DB) .. " dB of its loudest band; a competitor is at most " .. string.format("%g", A.COMP_DB) .. " dB quieter than NAME in such a band and not panned to the opposite side. +n = competitor level against NAME in that range (dB, + = louder); o = % of NAME's playing seconds when the competitor plays too (no o = all of them). Over the seconds NAME plays in the region, not moment by moment; at most " .. A.COMP_N .. " ranges, strongest first. Replaces the mask lines.",
+            "- YAML: tracks left out of the data show only name, parent and flags." }
+end
+
+-- task 4f.10: only the bands focus.lo..focus.hi. rs[d] = % of the range energy among the counted tracks of d's list; inB[idx] = >= TOPIC_PCT in a region
+function MA_A.PARTS.band.start(B)
+    local D, focus, rs, plays = B.D, B.focus, B.rs, MA_A.plays
+    local bl, bh, inB, KEYS, i0 = focus.lo, focus.hi, {}, MA_A.KEYS, B.i0
+    B.bl, B.bh, B.inB, B.listed = bl, bh, inB, {}
     local function range_share(list)
         local e, tot = {}, 0
         for _, d in ipairs(list) do
@@ -2740,41 +2935,118 @@ local function build_data_block(D, focus, fs)
         end
         for d, x in pairs(e) do rs[d] = tot > 0 and 100 * x / tot or 0 end
     end
-    if tp == "band" then
-        range_share(D.over)
-        for _, reg in ipairs(D.regions) do
-            if not reg.na and reg.mr then
-                range_share(reg.all)
-                for _, d in ipairs(reg.all) do
-                    if plays(d) and (rs[d] or 0) >= MA_A.TOPIC_PCT then inB[d.t.idx] = true end
-                end
+    range_share(D.over)
+    for _, reg in ipairs(D.regions) do
+        if not reg.na and reg.mr then
+            range_share(reg.all)
+            for _, d in ipairs(reg.all) do
+                if plays(d) and (rs[d] or 0) >= MA_A.TOPIC_PCT then inB[d.t.idx] = true end
             end
         end
-        listed = {}
-        for _, t in ipairs(D.tracks) do if inB[t.idx] then listed[t.guid] = true end end
     end
-    local function devs_in(list) -- task 4f.10: a band topic keeps the deviations inside its range, Stereo Image none
-        if tp == "stereo" then return {} end
-        if tp ~= "band" then return list end
-        local l = {}
-        for _, e in ipairs(list) do if e.band >= bl and e.band <= bh then l[#l + 1] = e end end
-        return l
-    end
-    local function rlev(d) -- task 4f.10: the track's band levels inside the range (whole dB)
+    for _, t in ipairs(D.tracks) do if inB[t.idx] then B.listed[t.guid] = true end end
+    function B.rlev(d) -- the track's band levels inside the range (whole dB)
         local l = {}
         for b = bl, bh do l[#l + 1] = KEYS[b] .. i0(d.bands[b]) end
         return " | levels " .. table.concat(l, " ")
     end
-    -- DRAFT DATA BLOCK (what the prompt would send; final format in task 4e), mixed rounding
+end
+
+function MA_A.PARTS.band.keep(B, d) return B.inB[d.t.idx] end
+
+function MA_A.PARTS.band.devs(B, list) -- the deviations inside the range
+    local l = {}
+    for _, e in ipairs(list) do if e.band >= B.bl and e.band <= B.bh then l[#l + 1] = e end end
+    return l
+end
+
+function MA_A.PARTS.band.track_extra(B, d, clip) return clip, B.rlev(d) end
+
+-- every playing track with >= TOPIC_PCT of the range here, highest rs first, and the masking rule over these tracks inside the range
+function MA_A.PARTS.band.region(B, i, reg)
+    local rs, c, lines, apx, mreg = B.rs, {}, {}, {}, { mask = {} }
+    for _, d in ipairs(reg.all) do
+        if d.r.role ~= "bus" and MA_A.plays(d) then c[#c + 1] = d end
+    end
+    table.sort(c, function(a, b) return rs[a] > rs[b] end)
+    for _, d in ipairs(c) do if rs[d] >= MA_A.TOPIC_PCT then lines[#lines + 1] = d end end
+    for b = B.bl, B.bh do
+        local list, cen = MA_A.mask_band(B.D, reg, b, lines) -- task 5e: only the listed tracks; a brief track off the list can top a quiet band in its few seconds
+        if list then mreg.mask[#mreg.mask + 1] = { band = b, list = list, cen = cen } end
+    end
+    for _, d in ipairs(lines) do if #d.reasons > 0 then apx[#apx + 1] = d end end
+    return lines, apx, mreg
+end
+
+function MA_A.PARTS.band.finish(B, named) -- task 4f.10: a named track never gets a bare YAML line
+    for g in pairs(named) do B.listed[g] = true end
+end
+
+function MA_A.PARTS.band.legend(topic)
+    local A = MA_A
+        local r = string.format("%g-%g Hz", B15_EDGES[topic.lo], B15_EDGES[topic.hi + 1])
+    return { "", "TOPIC DATA (see FOCUS at the end):",
+        "- Only tracks with at least " .. A.TOPIC_PCT .. "% of the " .. r .. " energy in some region. Band data (SONG mid / side, bumps, region deviations) only inside " .. r .. ".",
+                "- rs = % of the " .. r .. " energy (all counted tracks add up to 100; s stays the share of the whole mix); levels = the track's band levels in that range (dB).",
+                "- REGIONS: every track with rs " .. A.TOPIC_PCT .. " or more there, highest rs first; no \"also\" line; mask = the same rule over these tracks, inside the range only.",
+                "- YAML: tracks left out of the data show only name, parent and flags." }
+end
+
+function MA_A.PARTS.stereo.devs() return {} end -- no band deviations
+
+function MA_A.PARTS.stereo.region(B, i, reg) return reg.sel, reg.approx, { mask = {} } end
+
+function MA_A.PARTS.stereo.legend()
+    return { "", "TOPIC DATA (see FOCUS at the end):",
+        "- Band data left out (bumps, region band deviations, mask lines); the SONG line keeps the master mid and side bands." }
+end
+
+-- the loudest tracks until they cover MASTER_PCT (MASTER_MIN to MASTER_MAX lines, none under MIN_SHARE), no mask line
+function MA_A.PARTS.master.region(B, i, reg)
+    local c, lines, apx, sum = {}, {}, {}, 0
+    for _, d in ipairs(reg.all) do
+        if d.r.role ~= "bus" and MA_A.plays(d) then c[#c + 1] = d end
+    end
+    table.sort(c, function(a, b) return a.share > b.share end)
+    for _, d in ipairs(c) do
+        if #lines >= MA_A.MASTER_MAX or d.share < MA_A.MIN_SHARE or (sum >= MA_A.MASTER_PCT and #lines >= MA_A.MASTER_MIN) then break end
+        lines[#lines + 1] = d
+        sum = sum + d.share
+    end
+    for _, d in ipairs(lines) do if #d.reasons > 0 then apx[#apx + 1] = d end end
+    return lines, apx, { mask = {} }
+end
+
+function MA_A.PARTS.master.finish() return {} end -- task 4f.10: only the master keeps full plugin settings (an empty list, not nil = the old YAML)
+
+function MA_A.PARTS.master.legend()
+    local A = MA_A
+    return { "", "TOPIC DATA (see FOCUS at the end):",
+        string.format("- REGIONS: the loudest tracks until they cover %d%% of the region (%d to %d lines, none under %d%%); no \"also\" and mask lines.",
+                A.MASTER_PCT, A.MASTER_MIN, A.MASTER_MAX, A.MIN_SHARE),
+                "- YAML: only the master lists full plugin settings; every track lists plugin names only." }
+end
+
+--- Task 4f.6: the data block of the prompt from the stored measurements (D = the collect_region_data result), so it can be rebuilt at
+-- send time without reading gmem. focus = an AI.FOCUS entry; nil gives the Whole Song text. fs = { F = {[idx] = true}, R = {[idx] = true}, auto }
+-- for a group focus (F = focus tracks, R = their returns), nil otherwise. Returns the text, the GUIDs of the tracks it names (they keep full
+-- plugin settings in the YAML), the number of tracks left out of TRACKS and, for group and band, the GUIDs of every track the data mentions
+-- (the others get a bare YAML line).
+local function build_data_block(D, focus, fs)
+    local f1, _, i0, c2, nm, chain, pan_label, devs, mask_ranges, track_keys = MA_A.fmt()
+    local song, KEYS, m_peak, m_clips = D.song, MA_A.KEYS, D.m_peak, D.m_clips
+    local song_chain = chain(song.mi, song)
+    local plays, part = MA_A.plays, MA_A.PARTS[focus and focus.mode or "song"]
+    local B = { D = D, focus = focus, fs = fs, bl = 1, bh = 15, rs = {}, f1 = f1, i0 = i0, nm = nm }
+    if part.start then part.start(B) end
+    local bl, bh, rs = B.bl, B.bh, B.rs
+    local function devs_in(list) return part.devs and part.devs(B, list) or list end
     local function bandlist(db)
         local l = {}
         for b = bl, bh do l[#l + 1] = KEYS[b] .. f1(db[b]) end
         return table.concat(l, " ")
     end
-    local function tok(d) -- task 4f.10: sub! only when the bands include the low end
-        return string.format("L%s pk%s%s a%s W%s c%s %s%s", f1(d.L), f1(d.pk), d.crest and (" cr" .. i0(d.crest)) or "", i0(d.act),
-            i0(d.width), c2(d.corr), pan_label(d.pan100), (d.sub_risk and bl == 1) and " sub!" or "")
-    end
+    local function tok(d) return track_keys(d, bl == 1) end -- task 4f.10: sub! only when the bands include the low end
     local draft, omitted = {}, 0
     local named = {} -- task 4e: GUIDs of the tracks the region lines and masking hints name (they keep full plugin settings in the YAML)
     draft[1] = string.format("SONG I%s M%s S%s LRA%s pk%s clip%s | mid %s | side %s", f1(song.integrated), f1(song.max_m), f1(song.max_s),
@@ -2782,22 +3054,13 @@ local function build_data_block(D, focus, fs)
     if song_chain then draft[#draft + 1] = song_chain end
     draft[#draft + 1] = "TRACKS (whole song)"
     for _, d in ipairs(D.over) do
-        if d.act and d.act >= MA_A.ACTIVE_MIN_PCT and (not fs or played[d.t.idx] or inF[d.t.idx] or inR[d.t.idx]) and (tp ~= "band" or inB[d.t.idx]) then
+        if plays(d) and (not part.keep or part.keep(B, d)) then
             local dn = devs_in(d.notable)
             local nb = #dn > 0 and (" | " .. devs(dn, true)) or ""
-            -- task 4f.7b: a focus track (4f.8: and a return) also gets its clips, the peak before its fader and all 15 band levels
-            local fo, lv = inF[d.t.idx] or inR[d.t.idx], ""
-            local clip = (fo or d.s.clips > 0) and (" clip" .. string.format("%.0f", d.s.clips)) or ""
-            if fo then
-                clip = clip .. " prepk" .. f1(d.pk - d.r.fader_db)
-                local l = {}
-                for b = 1, 15 do l[b] = KEYS[b] .. i0(d.bands[b]) end
-                lv = " | levels " .. table.concat(l, " ")
-            end
-            if tp == "band" then lv = rlev(d) end
+            local clip, lv, au = d.s.clips > 0 and (" clip" .. string.format("%.0f", d.s.clips)) or "", "", nil
+            if part.track_extra then clip, lv, au = part.track_extra(B, d, clip) end
             draft[#draft + 1] = string.format("%s%s%s %s%s%s%s", nm(d.t.name), d.share and (" s" .. i0(d.share)) or "",
                 rs[d] and (" rs" .. i0(rs[d])) or "", tok(d), clip, nb, lv)
-            local au = fo and fs.auto and fs.auto[d.t.idx] -- task 4f.9: the track's automation points
             if au then draft[#draft + 1] = " auto " .. au end
         else
             omitted = omitted + 1
@@ -2815,7 +3078,7 @@ local function build_data_block(D, focus, fs)
     for i, reg in ipairs(D.regions) do
         if reg.na or not reg.mr then
             draft[#draft + 1] = string.format("R%d %s %s-%s | n/a", i, nm(reg.name), string.format("%.2f", reg.start_s), string.format("%.2f", reg.end_s))
-        elseif fs and not freg[i] then -- task 4f.7b: the header only
+        elseif part.quiet_region and part.quiet_region(B, i) then -- task 4f.7b: the header only
             local mr = reg.mr
             draft[#draft + 1] = string.format("R%d %s %s-%s | I%s M%s S%s LRA%s W%s%s | no focus track plays", i, nm(reg.name), string.format("%.2f", reg.start_s),
                 string.format("%.2f", reg.end_s), f1(mr.integrated), f1(mr.max_m), f1(mr.max_s), f1(mr.lra), i0(reg.width), mnotable(mr))
@@ -2826,195 +3089,26 @@ local function build_data_block(D, focus, fs)
                 #rd > 0 and (" | " .. devs(rd, true)) or "")
             local rc = chain(reg.mi, mr)
             if rc then draft[#draft + 1] = " " .. rc end
-            local shown, lines, rest, mreg, apx = {}, reg.sel, nil, reg, reg.approx
-            local role, comp_lines = {}, {} -- task 4f.8: role[d] = { "focus", "competitor", ... } (focus prompts only); the compete lines
-            if fs then
-                -- task 4f.8: time-gated. w = region weight per second; on(d, sec) = d plays in that second (the act rule per second)
-                local P, OFF, A = D.ps, D.offsets, MA_A
-                local s0, s1 = math.floor(reg.start_s + 1e-9), math.ceil(reg.end_s - 1e-9)
-                local w = {}
-                for sec = s0, s1 - 1 do w[sec] = math.max(0, math.min(1, math.min(sec + 1, reg.end_s) - math.max(sec, reg.start_s))) end
-                local function on(d, sec)
-                    local p, o = P[d.t.idx], sec * 18
-                    return p ~= nil and (p[o + 18] or 0) > 0 and 100 * p[o + 17] / p[o + 18] >= A.ACTIVE_MIN_PCT
-                end
-                -- weighted sum over the seconds of g (g[sec] = weight): k = record slot (1 K energy, 1 + b band b); nil k = play time
-                local function sum(d, g, k)
-                    local p, s = P[d.t.idx], 0
-                    if not p then return 0 end
-                    for sec = s0, s1 - 1 do
-                        local wt = g[sec]
-                        if wt then
-                            if k then s = s + (p[sec * 18 + k] or 0) * wt elseif on(d, sec) then s = s + wt end
-                        end
-                    end
-                    return s
-                end
-                local function addrole(d, r)
-                    local l = role[d]
-                    if not l then l = {}; role[d] = l end
-                    for _, x in ipairs(l) do if x == r then return end end
-                    l[#l + 1] = r
-                end
-                -- focus tracks and returns that play here; gate = the seconds where at least one focus track plays
-                local cand, fl, gate, gw = {}, {}, {}, 0
-                for _, d in ipairs(reg.all) do
-                    if (inF[d.t.idx] or inR[d.t.idx]) and plays(d) then addrole(d, inF[d.t.idx] and "focus" or "return") end
-                    if d.r.role ~= "bus" then
-                        cand[#cand + 1] = d
-                        if inF[d.t.idx] and plays(d) then fl[#fl + 1] = d end
-                    end
-                end
-                for sec = s0, s1 - 1 do
-                    if w[sec] > 0 then
-                        for _, d in ipairs(reg.all) do
-                            if inF[d.t.idx] and plays(d) and on(d, sec) then gate[sec] = w[sec]; gw = gw + w[sec] break end
-                        end
-                    end
-                end
-                -- backdrop: the BACKDROP_N other tracks with the most energy (scaled like the shares) while a focus track plays
-                local bd, ge = {}, {}
-                for _, d in ipairs(cand) do
-                    if not inF[d.t.idx] and not inR[d.t.idx] and gw > 0 and 100 * sum(d, gate) / gw >= A.ACTIVE_MIN_PCT then
-                        ge[d] = sum(d, gate, 1) * d.gain_lin
-                        bd[#bd + 1] = d
-                    end
-                end
-                table.sort(bd, function(a, b) return ge[a] > ge[b] end)
-                for k = 1, math.min(A.BACKDROP_N, #bd) do addrole(bd[k], "backdrop") end
-                -- competitors of each focus track f, over the seconds where f plays (gf): its main bands are within COMP_MAIN_DB of its
-                -- loudest band; a competitor is another track, not on the opposite side, at least f - COMP_DB in such a band
-                for _, f in ipairs(fl) do
-                    local gf, nf = {}, 0
-                    for sec = s0, s1 - 1 do
-                        if w[sec] > 0 and on(f, sec) then gf[sec] = w[sec]; nf = nf + w[sec] end
-                    end
-                    if nf > 0 then
-                        local ef, top, cs = {}, 0, {}
-                        for b = 1, 15 do
-                            ef[b] = sum(f, gf, 1 + b) * f.gain_lin * 10 ^ (OFF[b] / 10)
-                            top = math.max(top, ef[b])
-                        end
-                        for _, o in ipairs(cand) do
-                            if o ~= f and math.abs(o.pan100 - f.pan100) <= A.MASK_PAN then
-                                local ov = 100 * sum(o, gf) / nf -- o = % of f's playing seconds where the competitor plays too
-                                if ov >= A.ACTIVE_MIN_PCT then
-                                    local e = {}
-                                    for b = 1, 15 do e[b] = sum(o, gf, 1 + b) * o.gain_lin * 10 ^ (OFF[b] / 10) end
-                                    cs[#cs + 1] = { d = o, e = e, ov = ov }
-                                end
-                            end
-                        end
-                        -- neighbouring main bands with the same competitor set merge into one range (b = 16 closes the last one)
-                        local ranges, g = {}, nil
-                        for b = 1, 16 do
-                            local key, set = nil, {}
-                            if b <= 15 and top > 0 and ef[b] > 0 and ef[b] >= top * 10 ^ (-A.COMP_MAIN_DB / 10) then
-                                local ids = {}
-                                for _, c in ipairs(cs) do
-                                    if c.e[b] >= ef[b] * 10 ^ (-A.COMP_DB / 10) then set[#set + 1] = c; ids[#ids + 1] = c.d.t.idx end
-                                end
-                                if #set > 0 then key = table.concat(ids, ",") end
-                            end
-                            if g and key == g.key then
-                                g.hi = b
-                            else
-                                if g then ranges[#ranges + 1] = g end
-                                g = key and { lo = b, hi = b, key = key, set = set } or nil
-                            end
-                        end
-                        for _, r in ipairs(ranges) do
-                            local sf = 0
-                            for b = r.lo, r.hi do sf = sf + ef[b] end
-                            r.items = {}
-                            for _, c in ipairs(r.set) do
-                                local so = 0
-                                for b = r.lo, r.hi do so = so + c.e[b] end
-                                r.items[#r.items + 1] = { c = c, db = 10 * math.log(so / sf, 10) }
-                            end
-                            table.sort(r.items, function(x, y) return x.db > y.db end)
-                            r.top = r.items[1].db
-                        end
-                        table.sort(ranges, function(x, y) return x.top > y.top end)
-                        local parts = {}
-                        for k = 1, math.min(A.COMP_N, #ranges) do
-                            local r, it = ranges[k], {}
-                            for j = 1, math.min(A.COMP_N, #r.items) do
-                                local x = r.items[j]
-                                addrole(x.c.d, "competitor")
-                                it[#it + 1] = string.format("%s %+d%s", nm(x.c.d.t.name), math.floor(x.db + 0.5),
-                                    x.c.ov >= 99.5 and "" or (" o" .. i0(x.c.ov))) -- no o = plays the whole time
-                            end
-                            parts[#parts + 1] = string.format("%g-%gHz: %s", B15_EDGES[r.lo], B15_EDGES[r.hi + 1], table.concat(it, ", "))
-                        end
-                        if #parts > 0 then comp_lines[#comp_lines + 1] = string.format(" compete %s %s", nm(f.t.name), table.concat(parts, "; ")) end
-                    end
-                end
-                -- full lines: focus tracks and returns in track order, then backdrop and competitors by share; the rest on the "others" line
-                lines, rest, apx = {}, {}, {}
-                local extra = {}
-                for _, d in ipairs(reg.all) do
-                    if role[d] then
-                        if inF[d.t.idx] or inR[d.t.idx] then lines[#lines + 1] = d else extra[#extra + 1] = d end
-                    elseif d.r.role ~= "bus" and plays(d) then rest[#rest + 1] = d end
-                end
-                table.sort(extra, function(a, b) return (a.share or 0) > (b.share or 0) end)
-                for _, d in ipairs(extra) do lines[#lines + 1] = d end
-                table.sort(rest, function(a, b) return a.share > b.share end)
-                for _, d in ipairs(lines) do if #d.reasons > 0 then apx[#apx + 1] = d end end
-                mreg = { mask = {} } -- the compete lines replace the mask line
-            end
-            if tp == "band" or tp == "master" then
-                -- task 4f.10: band topic = every playing track with >= TOPIC_PCT of the range here, highest rs first, and the masking rule
-                -- of collect_region_data over every playing track inside the range; master = the loudest tracks until they cover MASTER_PCT
-                -- (MASTER_MIN to MASTER_MAX lines, none under MIN_SHARE), no mask line
-                local c = {}
-                for _, d in ipairs(reg.all) do
-                    if d.r.role ~= "bus" and plays(d) then c[#c + 1] = d end
-                end
-                lines, apx, mreg = {}, {}, { mask = {} }
-                if tp == "band" then
-                    table.sort(c, function(a, b) return rs[a] > rs[b] end)
-                    for _, d in ipairs(c) do if rs[d] >= MA_A.TOPIC_PCT then lines[#lines + 1] = d end end
-                    for b = bl, bh do
-                        local list, cen = MA_A.mask_band(D, reg, b, lines) -- task 5e: only the listed tracks; a brief track off the list can top a quiet band in its few seconds
-                        if list then mreg.mask[#mreg.mask + 1] = { band = b, list = list, cen = cen } end
-                    end
-                else
-                    table.sort(c, function(a, b) return a.share > b.share end)
-                    local sum = 0
-                    for _, d in ipairs(c) do
-                        if #lines >= MA_A.MASTER_MAX or d.share < MA_A.MIN_SHARE or (sum >= MA_A.MASTER_PCT and #lines >= MA_A.MASTER_MIN) then break end
-                        lines[#lines + 1] = d
-                        sum = sum + d.share
-                    end
-                end
-                for _, d in ipairs(lines) do if #d.reasons > 0 then apx[#apx + 1] = d end end
-            elseif tp == "stereo" then
-                mreg = { mask = {} }
-            end
+            local lines, apx, mreg, role, tail = reg.sel, reg.approx, reg, nil, nil
+            if part.region then lines, apx, mreg, role, tail = part.region(B, i, reg) end
+            role = role or {}
+            local shown = {}
             for _, d in ipairs(lines) do
-                if fs or tp == "band" or d.share >= MA_A.MIN_SHARE then
+                if part.all_lines or d.share >= MA_A.MIN_SHARE then
                     shown[d] = true
                     named[d.t.guid] = true
                     local dn = devs_in(d.notable)
                     draft[#draft + 1] = string.format(" %s%s%s%s %s%s%s", nm(d.t.name), role[d] and (" (" .. table.concat(role[d], ", ") .. ")") or "",
                         d.share and (" s" .. i0(d.share)) or "", rs[d] and (" rs" .. i0(rs[d])) or "", tok(d),
-                        #dn > 0 and (" | " .. devs(dn, true)) or "", tp == "band" and rlev(d) or "")
+                        #dn > 0 and (" | " .. devs(dn, true)) or "", B.rlev and B.rlev(d) or "")
                 end
             end
-            if fs then
-                local o = {}
-                for _, d in ipairs(rest) do
-                    if d.share >= MA_A.MIN_SHARE then o[#o + 1] = nm(d.t.name) .. " s" .. i0(d.share) end
-                end
-                if #o > 0 then draft[#draft + 1] = string.format(" R%d others %s", i, table.concat(o, ", ")) end
-                for _, s in ipairs(comp_lines) do draft[#draft + 1] = s end
-            elseif tp ~= "band" and tp ~= "master" then -- task 4f.10: no also line for band topics and Master & Loudness
+            for _, s in ipairs(tail or {}) do draft[#draft + 1] = s end
+            if part.also then
                 -- Every other counted track that plays in the region (no folder buses), in track order, with its play time there
                 local also = {}
                 for _, d in ipairs(reg.all) do
-                    if not shown[d] and d.r.role ~= "bus" and d.act and d.act >= MA_A.ACTIVE_MIN_PCT then also[#also + 1] = nm(d.t.name) .. " a" .. i0(d.act) end
+                    if not shown[d] and d.r.role ~= "bus" and plays(d) then also[#also + 1] = nm(d.t.name) .. " a" .. i0(d.act) end
                 end
                 if #also > 0 then draft[#draft + 1] = string.format(" R%d also %s", i, table.concat(also, ", ")) end
             end
@@ -3029,27 +3123,17 @@ local function build_data_block(D, focus, fs)
             end
         end
     end
-    if fs then -- task 4f.7b: focus tracks and returns keep full plugin settings even where they do not play
-        for _, t in ipairs(D.tracks) do
-            if inF[t.idx] or inR[t.idx] then named[t.guid] = true end
-        end
-        for g in pairs(named) do listed[g] = true end -- task 4f.8: a competitor never gets a bare YAML line
-    end
-    if tp == "band" then for g in pairs(named) do listed[g] = true end end -- task 4f.10: a named track never gets a bare YAML line
-    if tp == "master" then named = {} end -- task 4f.10: only the master keeps full plugin settings (an empty list, not nil = the old YAML)
-    return table.concat(draft, "\n"), named, omitted, listed
+    if part.finish then named = part.finish(B, named) or named end
+    return table.concat(draft, "\n"), named, omitted, B.listed
 end
 
 --- Stage 4 console output (append to the collection test): ROUTING, SONG, regions, OVERVIEW, DATA BLOCK, TOKENS, SELF-CHECK. Returns the data block, the GUIDs it names and (task 4f.6) the stored
 -- measurements D for build_data_block; nil when the region data failed.
 local function print_region_summary(out, tracks, max_sec, run_id, offsets)
-    local route = track_routing(tracks)
-    local D, err = collect_region_data(tracks, route, max_sec, run_id, offsets)
+    local D, err = collect_region_data(tracks, max_sec, run_id, offsets)
     if not D then out[#out + 1] = "\nREGION SUMMARY skipped: " .. tostring(err) return end
-    local song = D.song
+    local song, route, m_peak, m_clips = D.song, D.route, D.m_peak, D.m_clips
     local f1, n1, _, _, _, chain, pan_label, devs, mask_ranges = MA_A.fmt()
-    for _, t in ipairs(tracks) do t.guid = reaper.GetTrackGUID(t.track) end -- task 4f.6: tracks are found by GUID at send time
-    D.tracks, D.route = tracks, route -- task 4f.7a: the focus lists are built from the collected tracks
 
     -- ROUTING
     out[#out + 1] = "\nROUTING (fader, pan and automation are measured on the phantom tracks, not modelled; parent = folder parent idx)"
@@ -3064,10 +3148,6 @@ local function print_region_summary(out, tracks, max_sec, run_id, offsets)
     end
 
     -- SONG
-    local master_fader = level_db(reaper.GetMediaTrackInfo_Value(reaper.GetMasterTrack(0), "D_VOL"))
-    local stamped = reaper.gmem_read(MA_H_MSTAMP) == run_id
-    local m_peak = stamped and (level_db(reaper.gmem_read(MA_H_MPEAK)) + master_fader) or nil
-    local m_clips = stamped and math.floor(reaper.gmem_read(MA_H_MCLIPS) + 0.5) or nil
     out[#out + 1] = string.format("\nSONG (%.1f s) | integrated %s LUFS | max M %s | max S %s | LRA %s LU | peak %s dBFS post-fader | clips %s",
         D.proj_len, n1(song.integrated), n1(song.max_m), n1(song.max_s), n1(song.lra), f1(m_peak), m_clips and tostring(m_clips) or "n/a")
     local hdr, mline, sline = "      ", "  mid ", " side "
@@ -3121,7 +3201,6 @@ local function print_region_summary(out, tracks, max_sec, run_id, offsets)
     for _, d in ipairs(D.over) do out[#out + 1] = track_line(d, string.format("%3d ", d.t.idx), true) end
 
     -- DATA BLOCK (task 4f.6: from the stored measurements, the same builder the send uses)
-    D.m_peak, D.m_clips = m_peak, m_clips
     local text, named, omitted = build_data_block(D)
     out[#out + 1] = "\nDATA BLOCK (the measured part of the prompt):\n" .. text
 
@@ -3138,28 +3217,12 @@ end
 
 --- Task 4e: the whole prompt of the JSFX path. Fixed text first (role, legend, instructions: the same for every project, so a
 -- cached prompt start can be reused), then the data block and the compact project YAML.
-local function build_jsfx_prompt(block, yaml, focus, topic) -- focus (task 4f.7b): a group focus, adds the focus keys to the legend
+local function build_jsfx_prompt(block, yaml, focus) -- focus: an AI.FOCUS entry (nil = no focus, as in the report)
     local bands = {}
     for b = 1, 15 do bands[b] = string.format("%s %g-%g", MA_A.KEYS[b], B15_EDGES[b], B15_EDGES[b + 1]) end
-    -- task 4f.10: topic = the AI.FOCUS entry of a topic focus (tp "band", "stereo" or "master"): what its data leaves out
-    local tl, A = "", MA_A
-    if topic then
-        local t
-        if topic.tp == "band" then
-            local r = string.format("%g-%g Hz", B15_EDGES[topic.lo], B15_EDGES[topic.hi + 1])
-            t = { "- Only tracks with at least " .. A.TOPIC_PCT .. "% of the " .. r .. " energy in some region. Band data (SONG mid / side, bumps, region deviations) only inside " .. r .. ".",
-                "- rs = % of the " .. r .. " energy (all counted tracks add up to 100; s stays the share of the whole mix); levels = the track's band levels in that range (dB).",
-                "- REGIONS: every track with rs " .. A.TOPIC_PCT .. " or more there, highest rs first; no \"also\" line; mask = the same rule over these tracks, inside the range only.",
-                "- YAML: tracks left out of the data show only name, parent and flags." }
-        elseif topic.tp == "stereo" then
-            t = { "- Band data left out (bumps, region band deviations, mask lines); the SONG line keeps the master mid and side bands." }
-        else
-            t = { string.format("- REGIONS: the loudest tracks until they cover %d%% of the region (%d to %d lines, none under %d%%); no \"also\" and mask lines.",
-                A.MASTER_PCT, A.MASTER_MIN, A.MASTER_MAX, A.MIN_SHARE),
-                "- YAML: only the master lists full plugin settings; every track lists plugin names only." }
-        end
-        tl = "\nTOPIC DATA (see FOCUS at the end):\n" .. table.concat(t, "\n")
-    end
+    -- stage 6: what this focus's data adds or leaves out comes from its mode (MA_A.PARTS)
+    local A, part = MA_A, MA_A.PARTS[focus and focus.mode or "song"]
+    local legend = part.legend and table.concat(part.legend(focus), "\n") or ""
     return table.concat({
         "=== ROLE ===",
         "You are an experienced mixing and mastering engineer. Analyse this REAPER mix from the measured data and the project YAML below and give concrete advice.",
@@ -3177,13 +3240,7 @@ local function build_jsfx_prompt(block, yaml, focus, topic) -- focus (task 4f.7b
         "REGIONS: R n name start-end (seconds), the region's master numbers; after \"|\": master bands against the song average with the loudness difference removed (dB). Then the region's top tracks by share (same keys). \"R n also\" = every other track playing in region n, a = % of the region it plays; compare regions to see arrangement changes.",
         "On a region's master numbers, c, pL/pR, sub! and clip appear only when notable (c below 0, balance " .. MA_A.M_BAL_MIN .. " or more); none shown = normal.",
         "mask: Hz ranges where 2 or more of these tracks each hold at least " .. string.format("%g", A.MASK_SHARE * 100) .. "% of the energy, measured over the seconds they play together; number = each track's % of all energy in the whole range (a narrow overlap looks small in a wide range). approx: these tracks' shares are approximate (their folder also receives sends).",
-        "Differences under 1 dB are measurement noise. Width, correlation and balance are measured after pan. The LRA of a single region is naturally small (one section changes little in loudness); judge compression by crest, not by region LRA." .. (focus and table.concat({ "",
-            "FOCUS DATA (see FOCUS at the end):",
-            "- TRACKS: focus tracks and returns also show clip n, prepk = sample peak before their own fader (dB) and \"levels\" = all 15 band levels (dB). Tracks that never play while a focus track plays are left out.",
-            "- auto (under a TRACKS line): the track's envelopes over the whole song, ENVELOPE unit: value@seconds ...; the curve follows straight lines between the points within " .. string.format("%g", A.AUTO_TOL_DB) .. " dB (volume), " .. string.format("%g", A.AUTO_TOL_PCT) .. "% (pan, width) or " .. string.format("%g", A.AUTO_TOL_FX_PCT) .. "% of a plugin parameter's range; ~ = over " .. MA_A.AUTO_MAX .. " points, drawn coarser; envelopes that never move are left out; Mute lists the switching points. Send_Volume>NAME = the send to NAME, PLUGIN/PARAM = a plugin parameter. The measured numbers already include the automation.",
-            "- REGIONS: \"no focus track plays\" = master numbers only. Otherwise full lines with the track's role in brackets: focus; return = receives audio from a focus track (reverb, delay, parallel bus); backdrop = one of the " .. A.BACKDROP_N .. " loudest other tracks while focus tracks play; competitor = see compete. Focus tracks and returns first (track order), then the rest by share; line numbers cover the whole region. \"R n others\" = the remaining playing tracks with their share (under " .. string.format("%g", A.MIN_SHARE) .. "% left out); replaces \"R n also\".",
-            "- compete NAME range: TRACK +n oN: main bands of NAME = within " .. string.format("%g", A.COMP_MAIN_DB) .. " dB of its loudest band; a competitor is at most " .. string.format("%g", A.COMP_DB) .. " dB quieter than NAME in such a band and not panned to the opposite side. +n = competitor level against NAME in that range (dB, + = louder); o = % of NAME's playing seconds when the competitor plays too (no o = all of them). Over the seconds NAME plays in the region, not moment by moment; at most " .. A.COMP_N .. " ranges, strongest first. Replaces the mask lines.",
-            "- YAML: tracks left out of the data show only name, parent and flags." }, "\n") or "") .. tl,
+        "Differences under 1 dB are measurement noise. Width, correlation and balance are measured after pan. The LRA of a single region is naturally small (one section changes little in loudness); judge compression by crest, not by region LRA." .. legend,
         "",
         "=== PROJECT YAML ===",
         "Routing and settings: folders (parent, flags: folder), sends (connections; sidechain = feeds a side-chain input; send volume 0 dB when omitted), faders (vol_db), pan, envelopes (auto), plugins in chain order. The master and the tracks named under REGIONS, with their folders, list full plugin settings. All other tracks list plugin names only (fx: \"A > B\"); when you need their settings, ask for \"DETAIL <track name>\" and I will send that track's full plugin settings, sends, automation and measurements per region. Settings with a common name start are grouped: band_1: {freq: 181} means the setting band_1_freq. A renamed plugin shows its original in brackets, e.g. Ducking Comp (ReaComp). Muted tracks that make no sound are left out. \"Name: same as plugin 3 on Lead Vox\" = exactly the settings of the 3rd plugin in Lead Vox's chain. Plugin values are shown as each plugin reports them; some plugins label units or on/off states wrongly (e.g. a reverb time of 2.5 ms that means 2.5 s), so judge by plausibility.",
@@ -3478,10 +3535,10 @@ end
 
 --- Task 4f: the whole prompt from a collection (compact YAML read after the cleanup, so no analyzer or phantom is in it).
 -- Returns prompt, compact YAML; or nil, error text.
-local function build_collected_prompt(data_block, named, listed, topic, snap) -- listed (task 4f.7b): see build_data_block; topic (4f.10): a topic focus entry; snap (4g.3): the settings read at Collect
+local function build_collected_prompt(data_block, named, listed, focus, snap) -- listed (task 4f.7b): see build_data_block; focus: the AI.FOCUS entry; snap (4g.3): the settings read at Collect
     local cok, cyaml = pcall(extract_full_project_yaml, { full = named, listed = listed, snap = snap })
     if not (cok and type(cyaml) == "string") then return nil, tostring(cyaml) end
-    return build_jsfx_prompt(data_block, cyaml, listed ~= nil and not topic, topic), cyaml
+    return build_jsfx_prompt(data_block, cyaml, focus), cyaml
 end
 
 
@@ -3816,7 +3873,7 @@ function AI.collect()
             if not envelope then S.silent[tr] = true end
         end
     end
-    local prompt, cyaml = build_collected_prompt(block, named, nil, nil, S)
+    local prompt, cyaml = build_collected_prompt(block, named, nil, AI.FOCUS[1], S)
     if not prompt then
         out[#out + 1] = "ERROR: the prompt build failed: " .. tostring(cyaml)
         fail("Prompt build failed: ", tostring(cyaml))
@@ -3948,7 +4005,7 @@ end
 function AI.prompt(i)
     local c, f = AI.collected, AI.FOCUS[i] or AI.FOCUS[1]
     -- task 4f.7b: a group focus shapes the data block and the YAML; Selected Tracks is cached per selection
-    local lists = (f.g or f.inst or f.ret or f.sel) and AI.focus_lists() or nil
+    local lists = f.mode == "group" and AI.focus_lists() or nil
     local l = lists and lists[i]
     if l and #l == 0 then
         local _, msg = AI.focus_line(i)
@@ -3991,7 +4048,7 @@ function AI.prompt(i)
             end
         end
         local block, named, _, listed = build_data_block(c.D, f, fs)
-        local prompt, err = build_collected_prompt(block, named, listed, f.tp and f, c.snap)
+        local prompt, err = build_collected_prompt(block, named, listed, f, c.snap)
         if not prompt then return nil, "Prompt build failed: " .. tostring(err) end
         e = { prompt = prompt, tokens = MA_A.tokens(#prompt) }
         c.cache[key] = e
@@ -4002,15 +4059,15 @@ end
 -- Task 4f.5: "Focus on" choices (decision A: all data is always sent; the focus is one line at the END of the prompt, so the rest stays
 -- byte-identical and DeepSeek's cache still hits). Task 4f.7a: g = name groups (AI.track_group), inst = every non-return track outside
 -- Vocals and Drums & Bass, ret = returns (AI.is_return), sel = tracks selected in REAPER (a selected folder brings its children),
--- text = topic focus (no track list).
-AI.FOCUS = { { "Whole Song" }, { "Vocals", g = { vocals = true } }, { "Drums & Bass", g = { drums = true, bass = true } },
-    { "Guitars", g = { guitars = true } }, { "Keys & Synths", g = { keys = true } }, { "Strings & Brass", g = { sb = true } },
-    { "Instruments", inst = true }, { "Effects & Returns", ret = true }, { "Selected Tracks", sel = true },
-    { "Low End", tp = "band", lo = 1, hi = 6, text = "the low end (20-315 Hz: rumble, deepsub, sub, bass, body, mud): kick and bass balance, sub energy, mud, mono compatibility" },
-    { "Mids", tp = "band", lo = 7, hi = 12, text = "the mids (315 Hz-5 kHz: boxy, honk, nasal, bite, presence, harsh): boxiness, honk, clarity, presence, harshness" },
-    { "High End", tp = "band", lo = 13, hi = 15, text = "the high end (5-20 kHz: sibilance, sizzle, air): brightness, sibilance, air" },
-    { "Stereo Image", tp = "stereo", text = "the stereo image: width, panning, side energy, mono compatibility" },
-    { "Master & Loudness", tp = "master", text = "the master chain and the whole mix's loudness, dynamics and tonal balance (mastering)" } }
+-- text = topic focus (no track list). Stage 6: mode = the kind of focus, the one place for it: song, group, band, stereo, master (MA_A.PARTS).
+AI.FOCUS = { { "Whole Song", mode = "song" }, { "Vocals", mode = "group", g = { vocals = true } }, { "Drums & Bass", mode = "group", g = { drums = true, bass = true } },
+    { "Guitars", mode = "group", g = { guitars = true } }, { "Keys & Synths", mode = "group", g = { keys = true } }, { "Strings & Brass", mode = "group", g = { sb = true } },
+    { "Instruments", mode = "group", inst = true }, { "Effects & Returns", mode = "group", ret = true }, { "Selected Tracks", mode = "group", sel = true },
+    { "Low End", mode = "band", lo = 1, hi = 6, text = "the low end (20-315 Hz: rumble, deepsub, sub, bass, body, mud): kick and bass balance, sub energy, mud, mono compatibility" },
+    { "Mids", mode = "band", lo = 7, hi = 12, text = "the mids (315 Hz-5 kHz: boxy, honk, nasal, bite, presence, harsh): boxiness, honk, clarity, presence, harshness" },
+    { "High End", mode = "band", lo = 13, hi = 15, text = "the high end (5-20 kHz: sibilance, sizzle, air): brightness, sibilance, air" },
+    { "Stereo Image", mode = "stereo", text = "the stereo image: width, panning, side energy, mono compatibility" },
+    { "Master & Loudness", mode = "master", text = "the master chain and the whole mix's loudness, dynamics and tonal balance (mastering)" } }
 
 -- Task 4f.7a: focus name matching, a new classifier. A key matches the start of a
 -- word, a WHOLE key only a whole word. Groups are checked in this order; the first that matches wins.
@@ -4100,7 +4157,7 @@ function AI.focus_lists()
     end
     local lists = {}
     for i, f in ipairs(AI.FOCUS) do
-        if f.g or f.inst or f.ret or f.sel then
+        if f.mode == "group" then
             local l = {}
             for _, x in ipairs(info) do
                 local hit
@@ -4203,7 +4260,7 @@ end
 function AI.detail_text()
     local c = AI.collected
     local S, D, KEYS = c.snap, c.D, MA_A.KEYS
-    local f1, _, i0, c2, nm, _, pan_label, devs = MA_A.fmt()
+    local f1, _, i0, _, nm, _, _, devs, _, track_keys = MA_A.fmt()
     local only, skipped, names, any = {}, {}, {}, false
     -- matched by GUID (task 5b fix): REAPER can reuse a deleted track's pointer for a new track
     local by_guid = {}
@@ -4224,11 +4281,10 @@ function AI.detail_text()
     local function line(d)
         local l = {}
         for b = 1, 15 do l[b] = KEYS[b] .. i0(d.bands[b]) end
-        return string.format("%sL%s pk%s%s a%s W%s c%s %s%s clip%.0f prepk%s%s | levels %s", d.share and ("s" .. i0(d.share) .. " ") or "",
-            f1(d.L), f1(d.pk), d.crest and (" cr" .. i0(d.crest)) or "", i0(d.act), i0(d.width), c2(d.corr), pan_label(d.pan100),
-            d.sub_risk and " sub!" or "", d.s.clips, f1(d.pk - d.r.fader_db), #d.notable > 0 and (" | " .. devs(d.notable, true)) or "", table.concat(l, " "))
+        return string.format("%s%s clip%.0f prepk%s%s | levels %s", d.share and ("s" .. i0(d.share) .. " ") or "", track_keys(d, true),
+            d.s.clips, f1(d.pk - d.r.fader_db), #d.notable > 0 and (" | " .. devs(d.notable, true)) or "", table.concat(l, " "))
     end
-    local function plays(d) return d and d.act and d.act >= MA_A.ACTIVE_MIN_PCT end
+    local plays = MA_A.plays
     local p = { string.format("TRACK DETAIL (settings, sends and automation as they were when measured at %s; same keys as the data block). Per track: "
         .. "song = the whole-song line, then R n = one line per region where it plays; clip n = clipped samples, prepk = sample peak before its "
         .. "own fader (dB), levels = all 15 band levels (dB); auto = its envelopes over the whole song, ENVELOPE unit: value@seconds (straight "
