@@ -3281,6 +3281,8 @@ local function collect_jsfx_data()
     local path, write_err = write_analyzer_file()
     if not path then reaper.ShowMessageBox(write_err, "Analyzer file", 0) return nil end
 
+    local times = { close = 0, open = 0 } -- task 7b: seconds per part, printed in the report after the setup line
+
 	reaper.Undo_BeginBlock2(0)
     local render_opts = math.floor(reaper.GetSetProjectInfo(0, "RENDER_ADDTOPROJ", 0, false))
     -- Task 4f: tick "Automatically close when finished" in the render window for this run (bit 1 of renderclosewhendone; needs SWS), restored in the cleanup
@@ -3327,6 +3329,13 @@ local function collect_jsfx_data()
         -- task 5b: the layout follows the project: seconds = length + 2 s, then as many track slots as fit (header, tracks, master, master input)
         local nsec = math.ceil(reaper.GetProjectLength(0)) + 2
         local max_tr = math.min(4096, math.floor((MA_A.GMEM_SIZE - MA_HDR - nsec * 10 * (MA_MSTRIDE + MA_A.MISTRIDE)) / (nsec * MA_STRIDE)))
+        -- Task 7b: the audio device stays closed until the cleanup. With it open, routing changes can wait up to about 1 s each on the running
+        -- audio engine (setup 0.6-22 s, removing the phantoms 0-15 s; closed 0.2 s and 0.1 s, with the same numbers). A closed device stays closed.
+        if reaper.Audio_IsRunning() ~= 0 then
+            local c0 = reaper.time_precise()
+            reaper.Audio_Quit()
+            times.reopen, times.close = true, reaper.time_precise() - c0
+        end
         local tracks, skipped, inject_err = inject_analyzers(max_tr)
         if not tracks then error(inject_err, 0) end
         MA_MAXSEC, MA_MAXTR = nsec, math.max(#tracks, 1)
@@ -3339,6 +3348,7 @@ local function collect_jsfx_data()
         local tm = tracks.timing
         out[#out + 1] = string.format("Setup time %.1f s (inserting the phantom tracks %.1f s, copying the first phantom's chunk / naming + main send off %.1f s, hiding %.1f s, creating the sends %.1f s, analyzers %.1f s, master %.1f s, final check %.1f s; phantoms the check had to repair: %d of %d)",
             tm.total, tm.ins, tm.set, tm.hide, tm.send, tm.fx, tm.master, tm.check, tm.fixed, #tracks)
+        times.line = #out
         out[#out + 1] = "JSFX handshake after injection: " .. (reaper.gmem_read(0) == MA_MAGIC and "yes" or "no (advisory only)")
 
         -- The rendered file is not added to the project
@@ -3371,6 +3381,7 @@ local function collect_jsfx_data()
         reaper.Main_OnCommand(42230, 0)
         local render_s = reaper.time_precise() - render_t0
         reaper.gmem_write(6, 0)
+        times.render_end = reaper.time_precise()
 
         local proj_len = reaper.GetProjectLength(0)
         local max_sec = math.min(MA_MAXSEC, math.ceil(proj_len) + 2)
@@ -3508,10 +3519,12 @@ local function collect_jsfx_data()
                 end
             end
         end
+        times.read = reaper.time_precise() - times.render_end
 
     end)
 
     -- Cleanup ALWAYS runs (success, error or cancelled render)
+    local clean_t0 = reaper.time_precise()
     reaper.gmem_write(6, 0)
     remove_all_analyzers()
     remove_analyzer_file()
@@ -3527,9 +3540,21 @@ local function collect_jsfx_data()
 	local block_name = "Mix Assistant temp collection"
     reaper.Undo_EndBlock2(0, block_name, -1)
     if reaper.Undo_CanUndo2(0) == block_name then reaper.Undo_DoUndo2(0) end
+    local clean_s = reaper.time_precise() - clean_t0
+    -- Task 7b: the device goes back on last, also after an error or a cancelled render
+    local dev_warn
+    if times.reopen then
+        local c0 = reaper.time_precise()
+        reaper.Audio_Init()
+        times.open = reaper.time_precise() - c0
+        if reaper.Audio_IsRunning() == 0 then dev_warn = "Warning: REAPER's audio device did not reopen after Collect. If there is no sound, restart REAPER." end
+    end
+    -- Inserted after the setup line: the status line reads the report's last line after a failed run
+    table.insert(out, (times.line or 0) + 1, string.format("Times: closing the audio device %.2f s, reopening %.2f s | reading the data %s s | cleanup and undo %.1f s | whole run %.1f s%s",
+        times.close, times.open, times.read and string.format("%.1f", times.read) or "n/a", clean_s, reaper.time_precise() - run_t0, dev_warn and (" | " .. dev_warn) or ""))
 
-    if not ok then out[#out + 1] = "ERROR: " .. tostring(err) end
-    if coll then coll.warn = rate_warn end
+    if not ok then out[#out + 1] = "ERROR: " .. tostring(err) .. (dev_warn and (" " .. dev_warn) or "") end
+    if coll then coll.warn = dev_warn and ((rate_warn and (rate_warn .. " ") or "") .. dev_warn) or rate_warn end
     return ok, out, data_block, named, coll
 end
 

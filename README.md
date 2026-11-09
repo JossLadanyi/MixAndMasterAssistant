@@ -76,6 +76,8 @@ Create a text file `apikey.txt` next to the script with your DeepSeek key on the
 
 Nothing to set up. For its render, Collect sets Source to `Master mix`, Bounds to `Entire project`, the folder, the file name, "add to project" and "auto-close" itself, and restores your own render settings afterwards.
 
+Collect closes REAPER's audio and MIDI devices while it runs and reopens them at the end, even after an error or a cancelled render. In tests this made Collect about 15 to 30 s faster. Another program using the same audio interface may click at that moment.
+
 Tip: set the audio device to the project sample rate. The analyzers run at the device rate, and a different rate renders slower. Collect warns when the two rates differ.
 
 ## 📖 Usage
