@@ -25,13 +25,11 @@
 -- - SWS (recommended: lets the script close the render window by itself),
 -- - DeepSeek API key (only for Send): first line of "apikey.txt" next to this script.
 --   Copy Project Info works without it.
--- 2. Render Window Setup (One-Time Setup)
---   Open File > Render... and set:
---   Source: Master mix
---   Bounds: Entire project
---   Then click "Save settings". The script sets the folder, the file name, "add to project"
---   and auto-close itself for its render and restores your settings afterwards.
---   Tip: set the audio device to the project sample rate (the analyzers run at the device rate).
+-- 2. Render Settings (nothing to set up)
+--   Collect sets Source (Master mix), Bounds (Entire project), the folder, the file name,
+--   "add to project" and auto-close itself for its render and restores your settings afterwards.
+--   Tip: set the audio device to the project sample rate (the analyzers run at the device rate);
+--   Collect warns when the two differ.
 -- ==============================================================================
 
 local reaper = reaper

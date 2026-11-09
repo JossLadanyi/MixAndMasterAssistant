@@ -72,13 +72,11 @@ The analyzer plugin needs no installation: the script writes it to REAPER's `Eff
 
 Create a text file `apikey.txt` next to the script with your DeepSeek key on the first line. Keep it out of any public repository.
 
-## ⚙️ One-Time Render Setup
+## ⚙️ Render Settings
 
-1. Open **File > Render...** (`Ctrl+Alt+R` on Windows / `Cmd+Opt+R` on macOS).
-2. Set **Source:** `Master mix` and **Bounds:** `Entire project`.
-3. Click **Save settings** (do not click Render).
+Nothing to set up. For its render, Collect sets Source to `Master mix`, Bounds to `Entire project`, the folder, the file name, "add to project" and "auto-close" itself, and restores your own render settings afterwards.
 
-The script sets the folder, the file name, "add to project" and "auto-close" itself for its render and restores your settings afterwards. Tip: set the audio device to the project sample rate; the analyzers run at the device rate, and a different rate renders slower.
+Tip: set the audio device to the project sample rate. The analyzers run at the device rate, and a different rate renders slower. Collect warns when the two rates differ.
 
 ## 📖 Usage
 
@@ -106,6 +104,7 @@ The script sets the folder, the file name, "add to project" and "auto-close" its
 - **New measurement:** JSFX analyzers replace the Lua analysis of a rendered file. 15 bands instead of 9, per second per track and per 100 ms on the master, from one render that leaves no trace in the project.
 - **New prompt:** focus prompts, compact YAML, per-region lines with flagged values only, masking only between tracks that play together, cost shown before sending.
 - **New buttons:** Collect, Send, Copy, Send Track Detail; DeepSeek Flash is the default model.
+- **Render settings:** Collect sets Source / Bounds itself and restores yours; it warns when the audio device rate differs from the project rate.
 - **Removed:** the old "Run Fresh Scan" (solo / mute isolation, the 9-band Lua DSP, HTML tables). Earlier versions are in the git history.
 
 ## 📄 License
