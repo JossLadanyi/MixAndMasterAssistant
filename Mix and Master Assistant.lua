@@ -1,5 +1,5 @@
 -- ==============================================================================
--- REAPER AI MIX & MASTER ASSISTANT (v6.0)
+-- REAPER AI MIX & MASTER ASSISTANT (v6.1)
 -- ==============================================================================
 -- What it does:
 -- 1. Collect Project Info: ONE render of the project into a temporary folder. During it,
@@ -983,17 +983,29 @@ local function find_free_filename(dir, base_filename)
     return path
 end
 
+--- Task 9a: the folder for the files the user keeps (prompts, failed-Collect reports, Snapshots subfolder), with the separator at the end,
+-- created when missing: Options "folder" = a name next to the visible project (default "AI Mix and Master") or a full path. nil when a
+-- name is set and the project is not saved.
+local function files_dir()
+    local raw = reaper.GetExtState("MixAssistant", "folder")
+    local f = raw:match("^%s*(.-)[\\/%s]*$")
+    if f == "" then f = "AI Mix and Master" end
+    if not (raw:match("^%s*%a:[\\/]") or raw:match("^%s*[\\/]")) then
+        local _, fn = reaper.EnumProjects(-1, "")
+        local pd = (fn or ""):match("^(.*[\\/])")
+        if not pd then return nil end
+        f = pd .. f
+    end
+    reaper.RecursiveCreateDirectory(f, 0)
+    return f .. PATH_SEPARATOR
+end
+
 local function save_prompt_to_txt(full_prompt, target_str)
     local sanitized_target = target_str:gsub("[%s%p]+", "_")
     local base_filename = "AI_Mix_Prompt_" .. sanitized_target
 
-    local target_dir = nil
-    local _, project_filepath = reaper.EnumProjects(-1, "")
-
-    -- 1. Check if project is saved to disk (.rpp)
-    if project_filepath and project_filepath ~= "" then
-        target_dir = project_filepath:match("^(.*)[\\/]")
-    end
+    -- 1. The files folder (task 9a; needs a saved project unless Options names a full path)
+    local target_dir = files_dir()
 
     -- 2. Fallback to default project recording path if valid
     if not target_dir or target_dir == "" then
@@ -4299,6 +4311,7 @@ function AI.ask(model_choice, think, est)
     local reply, u = ask_deep_seek(chat_history, model, think)
     table.insert(chat_history, { role = u and "assistant" or "alert", content = reply })
     if u then table.insert(chat_history, { role = "info", content = AI.usage_line(u, model, est) }) end
+    AI.chat_save() -- task 9a.6
     fetch_deep_seek_balance()
     scroll_to_bottom = true
     return u ~= nil, u
@@ -4337,8 +4350,7 @@ function AI.collect(no_sc)
         if MA_A.DEV then
             dir = (debug.getinfo(1, "S").source or ""):match("^@(.*[\\/])")
         else
-            local _, pf = reaper.EnumProjects(-1, "")
-            dir = pf and pf:match("^(.*[\\/])")
+            dir = files_dir() -- task 9a
             if not dir then
                 local p = reaper.GetProjectPath("")
                 dir = p and p ~= "" and (p .. PATH_SEPARATOR) or nil
@@ -4388,9 +4400,31 @@ function AI.collect(no_sc)
     -- Whole Song is built now so a build error shows at once. The file is saved at send / copy time (AI.full_prompt), with MA_A.DEV also below.
     -- Task 4g.3: snap = the settings at the measurement; every prompt and the focus lists come from it until the next Collect.
     AI.collected = { D = D, snap = S, cache = { [AI.FOCUS[1][1]] = { prompt = prompt, tokens = MA_A.tokens(#prompt) } },
-        when = os.date("%H:%M"), changes = reaper.GetProjectStateChangeCount(0), soloed = reaper.AnyTrackSolo(0),
-        undo = reaper.Undo_CanUndo2(0) or "", sel = AI.sel_sig() } -- task 4f.7b: see AI.changed
+        when = os.date("%H:%M"), soloed = reaper.AnyTrackSolo(0), date = os.date("%Y-%m-%d %H:%M:%S") }
     AI.sent = false
+    -- task 9b.1: fingerprints of the project as measured (after the cleanup); 9a.2: the snapshot file, the Collect badge, old snapshots deleted
+    local c = AI.collected
+    local t0 = reaper.time_precise()
+    local fok, fp = pcall(AI.fp_fast)
+    local t1 = reaper.time_precise()
+    local gok, fpf = pcall(AI.fp_full)
+    local t2 = reaper.time_precise()
+    c.fp, c.fpf, AI.fpn, AI.diff = fok and fp or nil, gok and fpf or nil, nil, nil
+    if fok then AI.fp_tick(fp) end -- the badge from this fingerprint (no second run a second later)
+    AI.fp_log(string.format("fingerprint at Collect: fast %.2f s, full %.2f s%s%s", t1 - t0, t2 - t1, AI.fpf_stat or "",
+        (fok and gok) and "" or (" | FAILED: " .. tostring(not fok and fp or fpf))))
+    local sok, sline = pcall(AI.snap_save, c)
+    if not sok then
+        c.note = "Snapshot not saved: " .. tostring(sline) .. "."
+        sline = "SNAPSHOT: not saved: " .. tostring(sline)
+    end
+    out[#out + 1] = sline
+    out[#out + 1] = string.format("FINGERPRINT: fast %.2f s, full %.2f s%s%s", t1 - t0, t2 - t1, AI.fpf_stat or "", (fok and gok) and "" or (" | FAILED: " .. tostring(not fok and fp or fpf)))
+    AI.event("COLLECT", c)
+    if c.file then
+        local tok, terr = pcall(AI.snap_trim)
+        if not tok then out[#out + 1] = "SNAPSHOT: deleting old snapshots failed: " .. tostring(terr) end
+    end
     if MA_A.DEV then
         out[#out + 1] = string.format("PROMPT (task 4e, estimate): compact YAML %d chars = about %d tokens | whole prompt %d chars = about %d tokens",
             #cyaml, MA_A.tokens(#cyaml), #prompt, MA_A.tokens(#prompt))
@@ -4710,36 +4744,881 @@ function AI.full_prompt(i)
     return text, e
 end
 
---- Runs a collection run (fn: Collect) without marking the earlier collection as outdated: every run undoes its own
--- changes, so a project that was unchanged before the run is unchanged after it (REAPER's change counter still moves).
-function AI.keep(fn)
-    local c, before = AI.collected, reaper.GetProjectStateChangeCount(0)
-    fn()
-    if c and c == AI.collected and c.changes == before then c.changes, c.undo = reaper.GetProjectStateChangeCount(0), reaper.Undo_CanUndo2(0) or "" end
-end
+-- ------------------------------------------------------------------------------
+-- Stage 9: snapshots on disk (9a: options, save, load, chat file) and the "changed" check (9b: fingerprints, badge)
+-- ------------------------------------------------------------------------------
+AI.SNAP_VER = 1 -- task 9a.2: snapshot format version; a file of another version is refused (no converters)
+AI.SNAP_PAT, AI.CHAT_PAT = "^%d%d%d%d%d%d%d%d%-%d%d%d%d%d%d%.mas$", "^chat_%d+%-%d+.*%.json$" -- after "<project name>_"
+AI.EVENT_COL = { COLLECT = 0xFFB74DFF, ["PROJECT INFO SENT"] = 0xBA68C8FF, ["TRACK DETAIL SENT"] = 0x4DB6ACFF } -- task 9a.6: badge colours
+-- task 9b.1, fast part: track values per aspect (the aspect is the badge word), send values, item and take values, automation item values
+AI.FP_TRACK = { { "fader", "D_VOL" }, { "pan", "D_PAN D_WIDTH D_DUALPANL D_DUALPANR I_PANMODE D_PANLAW" }, { "mute", "B_MUTE" }, { "solo", "I_SOLO" },
+    { "phase", "B_PHASE" }, { "routing", "B_MAINSEND C_MAINSEND_OFFS C_MAINSEND_NCH I_NCHAN" }, { "FX bypass", "I_FXEN" }, { "automation mode", "I_AUTOMODE" } }
+AI.FP_SEND = "D_VOL D_PAN B_MUTE B_PHASE B_MONO I_SENDMODE I_SRCCHAN I_DSTCHAN I_AUTOMODE D_PANLAW I_MIDIFLAGS"
+AI.FP_ITEM = { { "position", "D_POSITION D_LENGTH" }, { "mute", "B_MUTE C_MUTE_SOLO" }, { "volume", "D_VOL" }, { "loop", "B_LOOPSRC" },
+    { "fades", "D_FADEINLEN D_FADEOUTLEN D_FADEINLEN_AUTO D_FADEOUTLEN_AUTO C_FADEINSHAPE C_FADEOUTSHAPE D_FADEINDIR D_FADEOUTDIR" },
+    { "active take", "I_CURTAKE" }, { "lane", "C_LANEPLAYS I_FIXEDLANE" } }
+AI.FP_TAKE = "D_STARTOFFS D_PLAYRATE D_PITCH B_PPITCH D_VOL D_PAN D_PANLAW I_CHANMODE I_PITCHMODE"
+AI.FP_AITEM = { "D_POOL_ID", "D_POSITION", "D_LENGTH", "D_STARTOFFS", "D_PLAYRATE", "D_BASELINE", "D_AMPLITUDE", "D_LOOPSRC" }
+-- full part: saved-state lines that cannot change the sound (selection, names, colours, sizes, window positions, MIDI editor view, record
+-- settings), and blocks left out (envelopes: the fast part has their points; item notes; extension data)
+AI.FP_DROP, AI.FP_SKIP = {}, { NOTES = true, EXT = true }
+for w in ("NAME PEAKCOL SEL TRACKHEIGHT SHOWINMIX WNDRECT FLOATPOS FLOAT SHOW LASTSEL DOCKED VIS LANEHEIGHT REC VU BUSCOMP LAYOUTS COLOR LOCK IID "
+    .. "CFGEDITVIEW CFGEDIT EVTFILTER INQ FREEMODE SPACER LANENAME LANEREC TAKECOLOR"):gmatch("%S+") do AI.FP_DROP[w] = true end
 
---- Task 4f.7b: the track selection as text (selected tracks + the number of selected items); task 4f.9: + the edit cursor and the
--- time selection (a ruler click moves REAPER's change counter too)
-function AI.sel_sig()
-    local t0, t1 = reaper.GetSet_LoopTimeRange(false, false, 0, 0, false)
-    local parts = { reaper.CountSelectedMediaItems(0), reaper.GetCursorPosition(), t0, t1 }
-    for k = 0, reaper.CountSelectedTracks(0) - 1 do parts[#parts + 1] = tostring(reaper.GetSelectedTrack(0, k)) end
-    return table.concat(parts, ",")
+--- Task 9a.1: options, saved per user (ExtState section MixAssistant, persistent); values are text
+function AI.opt_get(key, default)
+    local v = reaper.GetExtState("MixAssistant", key)
+    return v ~= "" and v or default
 end
+function AI.opt_set(key, v) reaper.SetExtState("MixAssistant", key, tostring(v), true) end
 
---- Task 4f.7b: has the project changed since the collection? Selecting tracks also moves REAPER's change counter, so a counter
--- change with a new selection and no new undo point (or a selection undo point) is taken as "unchanged". Once changed, it stays changed.
-function AI.changed()
-    local c = AI.collected
-    local n = reaper.GetProjectStateChangeCount(0)
-    if c.dirty or n == c.changes then return c.dirty end
-    local undo, sel = reaper.Undo_CanUndo2(0) or "", AI.sel_sig()
-    if sel ~= c.sel and (undo == c.undo or undo:lower():find("selection", 1, true)) then
-        c.changes, c.undo, c.sel = n, undo, sel
-        return false
+--- Task 9b.3: one line in MixAssistant_timing.txt next to the script (developer switch only)
+function AI.fp_log(text)
+    if not MA_A.DEV then return end
+    local dir = (debug.getinfo(1, "S").source or ""):match("^@(.*[\\/])")
+    local _, pf = reaper.EnumProjects(-1, "")
+    local f = dir and io.open(dir .. "MixAssistant_timing.txt", "a")
+    if f then
+        f:write(string.format("%s | %s | %s\n", os.date("%Y-%m-%d %H:%M:%S"), (pf or ""):match("([^\\/]+)$") or "?", text))
+        f:close()
     end
-    c.dirty = true
+end
+
+--- Task 9a.3: lossless binary packing of a data table. Type tags; tables (and deleted tracks) written once, then referenced by number
+-- (shared entries, cycles); strings written once, then by number; whole numbers as variable-length integers (1 byte for 0-63);
+-- number arrays (D.ps: 18 values per second) column by column: runs of zeros and of repeats as one count, other doubles XOR-ed with the
+-- column's previous double, zero bytes at both ends dropped (Gorilla). Integer and float stay apart (Lua prints 3 and 3.0 differently).
+-- A track is written as its GUID, the master as itself. Returns the bytes, the table ids (AI.pack_same) and the number of values.
+function AI.pack(root)
+    local P, char, mt = string.pack, string.char, math.type
+    local buf, ids, nid, strs, nstr, raw, guid, nb = {}, {}, 0, {}, 0, 0, {}, 0
+    local master, BIG = reaper.GetMasterTrack(0), 2 ^ 62
+    local IF = { "<I1", "<I2", "<I3", "<I4", "<I5", "<I6", "<I7" }
+    local function w(s) nb = nb + 1; buf[nb] = s end
+    local function uv(n)
+        while n >= 128 do w(char((n & 127) | 128)); n = n >> 7 end
+        w(char(n))
+    end
+    local function zz(n) return n >= 0 and n * 2 or -n * 2 - 1 end
+    local function int(x, tag, tag64) -- tag + zigzag varint, or tag64 + 8 bytes for huge integers
+        if x > -BIG and x < BIG then w(tag); uv(zz(x)) else w(tag64 .. P("<i8", x)) end
+    end
+    local function num(x)
+        raw = raw + 1
+        if mt(x) == "integer" then int(x, "\3", "\14")
+        elseif x == math.floor(x) and math.abs(x) < 2 ^ 53 and (x ~= 0 or 1 / x > 0) then w("\4"); uv(zz(math.tointeger(x)))
+        else w("\5" .. P("<d", x)) end
+    end
+    local function str(s)
+        local i = strs[s]
+        if i then w("\7"); uv(i) return end
+        nstr = nstr + 1
+        strs[s] = nstr
+        w("\6"); uv(#s); w(s)
+    end
+    -- column codes: 0 / 1 = run of float / integer zeros (count), 2 = run of the previous value (count), 3 = integer, 5 = huge integer,
+    -- 16 + 9 * L + T = double XOR-ed with the previous double, L leading and T trailing zero bytes dropped
+    local function col(t, n, sd)
+        for c = 1, sd do
+            local pv, pb, i = nil, 0, c
+            local function same(y) return y == pv and mt(y) == mt(pv) and (y ~= 0 or 1 / y == 1 / pv) end
+            while i <= n do
+                local x, j = t[i], i + sd
+                if x == 0 and (mt(x) == "integer" or 1 / x > 0) then
+                    local m = mt(x)
+                    while j <= n and t[j] == 0 and mt(t[j]) == m and (m == "integer" or 1 / t[j] > 0) do j = j + sd end
+                    w(m == "integer" and "\1" or "\0"); uv((j - i) // sd)
+                    pv = x
+                elseif same(x) then
+                    while j <= n and same(t[j]) do j = j + sd end
+                    w("\2"); uv((j - i) // sd)
+                elseif mt(x) == "integer" then
+                    int(x, "\3", "\5")
+                    pv = x
+                else
+                    local bits = string.unpack("<i8", P("<d", x))
+                    local xr = bits ~ pb
+                    pb, pv = bits, x
+                    local L, T = 0, 0
+                    while L < 8 and (xr >> (56 - 8 * L)) & 255 == 0 do L = L + 1 end
+                    if L < 8 then while (xr >> (8 * T)) & 255 == 0 do T = T + 1 end end
+                    local M = 8 - L - T
+                    w(char(16 + L * 9 + T))
+                    if M == 8 then w(P("<i8", xr)) elseif M > 0 then w(P(IF[M], xr >> (8 * T))) end
+                end
+                i = j
+            end
+        end
+    end
+    local value
+    function value(x)
+        local tx = type(x)
+        if tx == "number" then num(x)
+        elseif tx == "string" then str(x)
+        elseif tx == "boolean" then w(x and "\2" or "\1")
+        elseif tx == "table" or tx == "userdata" then
+            local id = ids[x]
+            if id then w("\9"); uv(id) return end
+            if tx == "userdata" then
+                if x == master then w("\12") return end
+                local g = guid[x]
+                if g == nil then
+                    g = reaper.ValidatePtr2(0, x, "MediaTrack*") and reaper.GetTrackGUID(x) or false
+                    guid[x] = g
+                end
+                if g then w("\10"); str(g) return end
+                nid = nid + 1 -- a deleted track (the phantom copies): a placeholder on load
+                ids[x] = nid
+                w("\11")
+                return
+            end
+            nid = nid + 1
+            ids[x] = nid
+            local n, cnt, nums = #x, 0, true
+            for k, v in pairs(x) do
+                cnt = cnt + 1
+                if type(v) ~= "number" or mt(k) ~= "integer" or k < 1 or k > n then nums = false break end
+            end
+            if nums and cnt == n and n >= 16 then
+                local sd = (n % 18 == 0 and n >= 36) and 18 or 1
+                w("\13"); uv(n); uv(sd)
+                raw = raw + n
+                col(x, n, sd)
+                return
+            end
+            local na, rest = 0, {}
+            while x[na + 1] ~= nil do na = na + 1 end
+            for k in pairs(x) do
+                if not (mt(k) == "integer" and k >= 1 and k <= na) then rest[#rest + 1] = k end
+            end
+            w("\8"); uv(na)
+            for i = 1, na do value(x[i]) end
+            uv(#rest)
+            for _, k in ipairs(rest) do value(k); value(x[k]) end
+        else
+            error("a " .. tx .. " value cannot be stored", 0)
+        end
+    end
+    value(root)
+    return table.concat(buf), ids, raw
+end
+
+--- Task 9a.3/9a.4: reads what AI.pack wrote, from s at pos. live[GUID] = the track with that GUID; a GUID not in the project becomes a
+-- placeholder table { gone = GUID } (one per GUID, so table keys stay distinct). Returns the value, the next position, the tables by id.
+function AI.unpack(s, pos, live)
+    local U, P, byte = string.unpack, string.pack, string.byte
+    local objs, strs, gone, master = {}, {}, {}, reaper.GetMasterTrack(0)
+    local IF = { "<I1", "<I2", "<I3", "<I4", "<I5", "<I6", "<I7" }
+    local function uv()
+        local n, sh = 0, 0
+        while true do
+            local b = byte(s, pos)
+            pos = pos + 1
+            n = n | ((b & 127) << sh)
+            if b < 128 then return n end
+            sh = sh + 7
+        end
+    end
+    local function zz(u) return (u & 1) == 0 and (u >> 1) or (-(u >> 1) - 1) end
+    local value
+    function value()
+        local tag = byte(s, pos)
+        pos = pos + 1
+        if tag == 1 then return false
+        elseif tag == 2 then return true
+        elseif tag == 3 then return zz(uv())
+        elseif tag == 4 then return zz(uv()) + 0.0
+        elseif tag == 5 or tag == 14 then
+            local x
+            x, pos = U(tag == 5 and "<d" or "<i8", s, pos)
+            return x
+        elseif tag == 6 then
+            local n = uv()
+            local x = s:sub(pos, pos + n - 1)
+            pos = pos + n
+            strs[#strs + 1] = x
+            return x
+        elseif tag == 7 then return strs[uv()]
+        elseif tag == 9 then return objs[uv()]
+        elseif tag == 10 then
+            local g = value()
+            if live[g] then return live[g] end
+            gone[g] = gone[g] or { gone = g }
+            return gone[g]
+        elseif tag == 11 then
+            local t = { gone = true }
+            objs[#objs + 1] = t
+            return t
+        elseif tag == 12 then return master
+        elseif tag == 8 then
+            local t = {}
+            objs[#objs + 1] = t
+            for i = 1, uv() do t[i] = value() end
+            for _ = 1, uv() do
+                local k = value()
+                t[k] = value()
+            end
+            return t
+        elseif tag == 13 then
+            local t = {}
+            objs[#objs + 1] = t
+            local n, sd = uv(), uv()
+            for i = 1, n do t[i] = 0 end
+            for c = 1, sd do
+                local pv, pb, i = nil, 0, c
+                while i <= n do
+                    local code = byte(s, pos)
+                    pos = pos + 1
+                    if code <= 2 then
+                        local v = code == 0 and 0.0 or code == 1 and 0 or pv
+                        for _ = 1, uv() do t[i] = v; i = i + sd end
+                        pv = v
+                    elseif code == 3 then
+                        pv = zz(uv()); t[i] = pv; i = i + sd
+                    elseif code == 5 then
+                        pv, pos = U("<i8", s, pos); t[i] = pv; i = i + sd
+                    else
+                        local L, T = (code - 16) // 9, (code - 16) % 9
+                        local M, xr = 8 - L - T, 0
+                        if M == 8 then xr, pos = U("<i8", s, pos)
+                        elseif M > 0 then xr, pos = U(IF[M], s, pos); xr = xr << (8 * T) end
+                        pb = pb ~ xr
+                        pv = U("<d", P("<i8", pb)); t[i] = pv; i = i + sd
+                    end
+                end
+            end
+            return t
+        end
+        error("unknown tag at byte " .. (pos - 1), 0)
+    end
+    local v = value()
+    return v, pos, objs
+end
+
+--- Task 9a.3: the save check: every table written (ids from AI.pack) against its decoded copy (objs from AI.unpack): same keys, every
+-- number bit for bit with the same integer / float kind, shared tables shared the same way; tracks decode to the same live track.
+function AI.pack_same(ids, objs)
+    local P, mt = string.pack, math.type
+    local function map(x)
+        local id = ids[x]
+        if id then return objs[id] end
+        return x -- strings, numbers, booleans and live tracks (found again by GUID)
+    end
+    local function same(a, b)
+        if type(a) == "number" then -- equal floats are the same bits except 0 / -0 (checked by 1 / x); NaN by its bytes
+            if type(b) ~= "number" or mt(a) ~= mt(b) then return false end
+            if a == b then return a ~= 0 or mt(a) == "integer" or 1 / a == 1 / b end
+            return a ~= a and P("<d", a) == P("<d", b)
+        end
+        return map(a) == b
+    end
+    for x, id in pairs(ids) do
+        local y = objs[id]
+        if type(y) ~= "table" then return false end
+        if type(x) == "userdata" then
+            if not y.gone then return false end
+        else
+            local n = 0
+            for k, v in pairs(x) do
+                n = n + 1
+                local yv = y[map(k)]
+                if yv == nil or not same(v, yv) then return false end
+            end
+            for _ in pairs(y) do n = n - 1 end
+            if n ~= 0 then return false end
+        end
+    end
     return true
+end
+
+--- Task 9a.2: the snapshot folder of the visible project (the Snapshots subfolder of files_dir, with the separator at the end) and the
+-- project name; nil when the project is not saved
+function AI.snap_dir()
+    local _, fn = reaper.EnumProjects(-1, "")
+    local name = (fn or ""):match("([^\\/]+)%.[^.\\/]*$")
+    local dir = name and files_dir()
+    if not dir then return nil end
+    return dir .. "Snapshots" .. PATH_SEPARATOR, name
+end
+
+--- The files "<name>_<rest>" in dir whose rest matches pat, oldest first (the names end in the time stamp)
+function AI.snap_files(dir, name, pat)
+    local d = dir:sub(1, -2)
+    pcall(reaper.EnumerateFiles, d, -1) -- REAPER caches folder listings; -1 rescans
+    local l, i, pre = {}, 0, name .. "_"
+    while true do
+        local f = reaper.EnumerateFiles(d, i)
+        if not f then break end
+        if f:sub(1, #pre) == pre and f:sub(#pre + 1):match(pat) then l[#l + 1] = f end
+        i = i + 1
+    end
+    table.sort(l)
+    return l
+end
+
+--- Task 9a.2: reads a snapshot file: header (format version, pinned flag at byte offset 6, header length) + header table + body table.
+-- Returns header, body, the body's tables by id, pinned; errors with a plain message.
+function AI.snap_read(path)
+    local f = io.open(path, "rb")
+    if not f then error("the file cannot be opened", 0) end
+    local s = f:read("a")
+    f:close()
+    if #s < 12 or s:sub(1, 4) ~= "MASN" then error("not a snapshot file", 0) end
+    local ver, pin, _, hl = string.unpack("<I2BBI4", s, 5)
+    if ver ~= AI.SNAP_VER then
+        error(string.format("it was written by another format version (%d; this script reads %d). Collect again", ver, AI.SNAP_VER), 0)
+    end
+    local live = {}
+    for i = 0, reaper.CountTracks(0) - 1 do
+        local tr = reaper.GetTrack(0, i)
+        live[reaper.GetTrackGUID(tr)] = tr
+    end
+    local ok, hdr, hend = pcall(AI.unpack, s, 13, live)
+    local body, bend, objs
+    if ok and hend == 13 + hl then ok, body, bend, objs = pcall(AI.unpack, s, hend, live) else ok = false end
+    if not (ok and bend == #s + 1 and type(hdr) == "table" and type(body) == "table") then error("the file is damaged", 0) end
+    return hdr, body, objs, pin == 1
+end
+
+--- Task 9a.2: writes AI.collected c as MixAssistant_snapshots/<project name>_<YYYYMMDD-HHMMSS>.mas, reads it back and compares it
+-- (AI.pack_same); only then c.file is set. Returns the report line; errors with a plain message.
+function AI.snap_save(c)
+    local t0 = reaper.time_precise()
+    local dir, name = AI.snap_dir()
+    if not dir then error("save the project to keep snapshots", 0) end
+    reaper.RecursiveCreateDirectory(dir, 0)
+    local file = name .. "_" .. os.date("%Y%m%d-%H%M%S") .. ".mas"
+    local hs = AI.pack({ date = c.date, label = "", len = reaper.GetProjectLength(0), srate = c.snap.meta and c.snap.meta.sample_rate, fp = c.fp, fpf = c.fpf })
+    local bs, ids, raw = AI.pack({ D = c.D, S = c.snap, when = c.when, soloed = c.soloed })
+    local data = "MASN" .. string.pack("<I2BBI4", AI.SNAP_VER, 0, 0, #hs) .. hs .. bs
+    local f = io.open(dir .. file, "wb")
+    if not f then error("the file cannot be written: " .. dir .. file, 0) end
+    f:write(data)
+    f:close()
+    local t1 = reaper.time_precise()
+    local ok, e, _, objs = pcall(AI.snap_read, dir .. file)
+    if not (ok and AI.pack_same(ids, objs)) then
+        os.remove(dir .. file)
+        error(ok and "the check after saving found a difference" or ("the check after saving could not read it: " .. tostring(e)), 0)
+    end
+    c.file = file
+    local t2 = reaper.time_precise()
+    return string.format("SNAPSHOT: %s %.0f KB, raw %d values, packed to %.0f%% of 8 bytes per value, save %.2f s (pack and write %.2f s, check %.2f s), check OK",
+        file, #data / 1024, raw, 100 * #data / math.max(1, 8 * raw), t2 - t0, t1 - t0, t2 - t1)
+end
+
+--- Task 9a.2: keeps the newest N unpinned snapshots of the project (Options) and every pinned one; deletes the chat files that no kept
+-- snapshot is named in (except the open chat)
+function AI.snap_trim()
+    local dir, name = AI.snap_dir()
+    if not dir then return end
+    local keep, kept, n = tonumber(AI.opt_get("keep", "3")) or 3, {}, 0
+    local l = AI.snap_files(dir, name, AI.SNAP_PAT)
+    for i = #l, 1, -1 do
+        local f = io.open(dir .. l[i], "rb")
+        local b = f and f:read(8)
+        if f then f:close() end
+        local pinned = b and #b == 8 and b:byte(7) == 1
+        if pinned or n < keep then
+            kept[l[i]] = true
+            if not pinned then n = n + 1 end
+        else
+            os.remove(dir .. l[i])
+        end
+    end
+    for _, f in ipairs(AI.snap_files(dir, name, AI.CHAT_PAT)) do
+        local any = f == AI.chat_file
+        for _, s in ipairs(AI.chat_refs(dir .. f)) do any = any or kept[s] end
+        if not any then os.remove(dir .. f) end
+    end
+end
+
+--- Task 9a.6: the snapshot files a chat file names (its first line: {"snaps":[...],)
+function AI.chat_refs(path)
+    local f = io.open(path, "r")
+    local line = f and f:read("l")
+    if f then f:close() end
+    local l = {}
+    for s in ((line or ""):match('^{"snaps":%[(.-)%]') or ""):gmatch('"([^"]+)"') do l[#l + 1] = s end
+    return l
+end
+
+--- Task 9a.6: the open chat as MixAssistant_snapshots/<project name>_chat_<YYYYMMDD-HHMMSS>.json (rewritten after every message and
+-- badge; a new chat gets a new file). First line: the snapshot files its badges name. Nothing for an unsaved project.
+function AI.chat_save()
+    local dir, name = AI.snap_dir()
+    if not dir or #chat_history == 0 then return end
+    reaper.RecursiveCreateDirectory(dir, 0)
+    if not AI.chat_file then
+        local base, k = name .. "_chat_" .. os.date("%Y%m%d-%H%M%S"), 1
+        AI.chat_file = base .. ".json"
+        while reaper.file_exists(dir .. AI.chat_file) do
+            k = k + 1
+            AI.chat_file = base .. "_" .. k .. ".json"
+        end
+    end
+    local ESC = { ["\n"] = "\\n", ["\r"] = "\\r", ["\t"] = "\\t", ['"'] = '\\"', ["\\"] = "\\\\" }
+    local function js(x) return '"' .. x:gsub('[%c"\\]', function(ch) return ESC[ch] or string.format("\\u%04x", ch:byte()) end) .. '"' end
+    local refs, seen, p = {}, {}, {}
+    for _, m in ipairs(chat_history) do
+        if m.snap and not seen[m.snap] then
+            seen[m.snap] = true
+            refs[#refs + 1] = js(m.snap)
+        end
+    end
+    p[1] = '{"snaps":[' .. table.concat(refs, ",") .. '],"messages":['
+    for i, m in ipairs(chat_history) do
+        local fl = {}
+        for _, k in ipairs({ "role", "content", "display_content", "event", "snap", "time" }) do
+            if type(m[k]) == "string" then fl[#fl + 1] = '"' .. k .. '":' .. js(m[k]) end
+        end
+        p[#p + 1] = "{" .. table.concat(fl, ",") .. "}" .. (i < #chat_history and "," or "")
+    end
+    p[#p + 1] = "]}"
+    write_lines(dir .. AI.chat_file, p)
+end
+
+--- Task 9a.6: a badge entry in the chat (COLLECT, PROJECT INFO SENT, TRACK DETAIL SENT) naming the snapshot; never sent to the API
+-- (build_json_messages sends only user and assistant messages; Copy Chat copies only those)
+function AI.event(what, c)
+    table.insert(chat_history, { role = "event", content = what, snap = c and c.file, time = os.date("%Y-%m-%d %H:%M") })
+    scroll_to_bottom = true
+    AI.chat_save()
+end
+
+--- Task 9a.5: the newest chat file that names snapshot file; true when loaded, false when damaged, nil when there is none
+function AI.chat_load(dir, name, file)
+    local l = AI.snap_files(dir, name, AI.CHAT_PAT)
+    for i = #l, 1, -1 do
+        for _, s in ipairs(AI.chat_refs(dir .. l[i])) do
+            if s == file then
+                local ok, j = parse_json(read_file(dir .. l[i]) or "")
+                if not (ok and type(j) == "table" and type(j.messages) == "table") then return false end
+                chat_history, AI.chat_file, scroll_to_bottom = j.messages, l[i], true
+                return true
+            end
+        end
+    end
+end
+
+--- Task 9a.5: the newest snapshot of the visible project: folder, project name, file, "YYYY-MM-DD hh:mm:ss"; nil when there is none
+function AI.snap_newest()
+    local dir, name = AI.snap_dir()
+    if not dir then return nil end
+    local l = AI.snap_files(dir, name, AI.SNAP_PAT)
+    local f = l[#l]
+    if not f then return nil end
+    local y, mo, d, h, mi, s = f:match("(%d%d%d%d)(%d%d)(%d%d)%-(%d%d)(%d%d)(%d%d)%.mas$")
+    return dir, name, f, string.format("%s-%s-%s %s:%s:%s", y, mo, d, h, mi, s)
+end
+
+--- Task 9a.5: loads a snapshot as AI.collected (prompts are rebuilt from it; nothing is sent) and its chat; 9b.3: both fingerprint
+-- parts now, so plugins whose private state differs while their settings match show as "(internal)". A load error leaves the state empty.
+function AI.load(dir, name, file)
+    local ok, hdr, body = pcall(AI.snap_read, dir .. file)
+    if not ok or type(body.D) ~= "table" or type(body.S) ~= "table" then
+        AI.status = "Snapshot " .. file .. " not loaded: " .. (ok and "the file is damaged" or tostring(hdr)) .. "."
+        return
+    end
+    local c = { D = body.D, snap = body.S, cache = {}, when = body.when, soloed = body.soloed, file = file, date = hdr.date, fp = hdr.fp, fpf = hdr.fpf }
+    AI.collected, AI.sent, chat_history, AI.chat_file = c, false, {}, nil
+    local chat = AI.chat_load(dir, name, file)
+    c.note = "Loaded snapshot " .. tostring(hdr.date) .. (chat == false and " (its chat file is damaged, not loaded)" or "") .. "."
+    if c.fp then
+        local t0 = reaper.time_precise()
+        local fok, fp = pcall(AI.fp_fast)
+        local t1 = reaper.time_precise()
+        local gok, fpf = pcall(AI.fp_full)
+        AI.fp_log(string.format("fingerprint after load: fast %.2f s, full %.2f s%s%s", t1 - t0, reaper.time_precise() - t1, AI.fpf_stat or "",
+            (fok and gok) and "" or (" | FAILED: " .. tostring(not fok and fp or fpf))))
+        if fok and gok and c.fpf then c.internal = AI.fp_internal(c.fp, fp, c.fpf, fpf, AI.fp_diff(c.fp, fp)) end
+        AI.fpn, AI.diff = nil, nil
+        if fok then AI.fp_tick(fp) end
+        return
+    end
+    AI.fpn, AI.diff = nil, nil
+end
+
+--- Task 9a.7: at script start and when the visible project changes (another tab, or another project opened in this tab), the state of
+-- that project per the startup option. Save As keeps the state (same project pointer, the collected tracks are still there).
+function AI.project_check()
+    local p, fn = reaper.EnumProjects(-1, "")
+    fn = fn or ""
+    if p == AI.proj and fn == AI.proj_fn then return end
+    local same = p == AI.proj and AI.proj_fn == "" -- first save of a new project
+    if p == AI.proj and not same and AI.collected then
+        local t = AI.collected.D.tracks[1]
+        for i = 0, reaper.CountTracks(0) - 1 do
+            if t and reaper.GetTrackGUID(reaper.GetTrack(0, i)) == t.guid then same = true break end
+        end
+    end
+    AI.proj, AI.proj_fn = p, fn
+    if same then return end
+    AI.collected, AI.sent, AI.chat_file, chat_history, AI.diff, AI.status = nil, false, nil, {}, nil, ""
+    local mode = AI.opt_get("startup", "ask")
+    if mode == "empty" then return end
+    local dir, name, file, date = AI.snap_newest()
+    if not file then return end
+    if mode == "ask" and reaper.ShowMessageBox("Reload the last state (" .. date .. ") and its chat?\n\nNothing is sent to the AI.",
+        "Mix and Master Assistant", 4) ~= 6 then return end
+    AI.load(dir, name, file)
+end
+
+--- Task 9b.1: 64-bit hash of a text, 8 bytes per step (string.unpack reads 64 words per call); every step is reversible, so any
+-- single changed word always changes the result
+function AI.fnv(s)
+    local U, n, h, pos = string.unpack, #s, 1469598103934665603, 1
+    local F = AI.FNV_F
+    if not F then F = "<" .. ("i8"):rep(64); AI.FNV_F = F end
+    while pos + 511 <= n do
+        local t = { U(F, s, pos) }
+        for j = 1, 64 do
+            h = (h ~ t[j]) * 1099511628211
+            h = h ~ (h >> 29)
+        end
+        pos = pos + 512
+    end
+    local r = s:sub(pos)
+    r = r .. ("\0"):rep(-#r % 8)
+    if #r > 0 then
+        local t = { U("<" .. ("i8"):rep(#r // 8), r) }
+        for j = 1, #r // 8 do
+            h = (h ~ t[j]) * 1099511628211
+            h = h ~ (h >> 29)
+        end
+    end
+    h = (h ~ n) * 1099511628211
+    return h ~ (h >> 29)
+end
+
+--- Task 9b.1, fast part: everything that can change the sound, read through the API, hashed per object and aspect.
+-- Returns { keys = object keys in project order, o = { [key] = { l = badge label, [aspect] = hash } } }; aspect "" = the label alone.
+-- Objects: "project" (tempo, sample rate), "master" and every track by GUID, plugins by their GUID, envelopes, items by GUID.
+function AI.fp_fast()
+    local R, P, fnv = reaper, string.pack, AI.fnv
+    local keys, o = {}, {}
+    local function obj(k, label)
+        local x = { l = label }
+        keys[#keys + 1] = k
+        o[k] = x
+        return x
+    end
+    local function pk(...) -- the values as exact bytes (numbers) or text
+        local t = table.pack(...)
+        for i = 1, t.n do
+            local v = t[i]
+            t[i] = type(v) == "number" and P("<n", v) or tostring(v)
+        end
+        return table.concat(t, "|", 1, t.n)
+    end
+    local function short(n) return (n:gsub("^%w+:%s*", ""):gsub("%s*%b()$", "")) end
+    local function env_h(env) -- active, every point (time, value, shape, tension; not the selection), automation items and their points
+        local ok, r, a = pcall(R.GetSetEnvelopeInfo_String, env, "ACTIVE", "", false)
+        if not (ok and r) then
+            local _, ch = R.GetEnvelopeStateChunk(env, "", false)
+            a = (ch or ""):match("\nACT (%d)") or "?"
+        end
+        local t = { tostring(a) }
+        for ai = -1, R.CountAutomationItems(env) - 1 do
+            if ai >= 0 then
+                for _, k in ipairs(AI.FP_AITEM) do t[#t + 1] = P("<n", R.GetSetAutomationItemInfo(env, ai, k, 0, false)) end
+            end
+            for i = 0, R.CountEnvelopePointsEx(env, ai) - 1 do
+                local _, tm, v, sh, ten = R.GetEnvelopePointEx(env, ai, i)
+                t[#t + 1] = P("<nnnn", tm, v, sh, ten)
+            end
+        end
+        return fnv(table.concat(t))
+    end
+    local FX = { R.TrackFX_GetCount, R.TrackFX_GetFXGUID, R.TrackFX_GetFXName, R.TrackFX_GetNamedConfigParm, R.TrackFX_GetEnabled,
+        R.TrackFX_GetOffline, R.TrackFX_GetNumParams, R.TrackFX_GetParamNormalized }
+    local TK = { R.TakeFX_GetCount, R.TakeFX_GetFXGUID, R.TakeFX_GetFXName, R.TakeFX_GetNamedConfigParm, R.TakeFX_GetEnabled,
+        R.TakeFX_GetOffline, R.TakeFX_GetNumParams, R.TakeFX_GetParamNormalized }
+    local function fx_text(F, x, fx) -- identity, position, enabled, offline, every parameter (wet included); and the plugin's name
+        local _, nm = F[3](x, fx, "")
+        local _, id = F[4](x, fx, "fx_ident")
+        local t = { nm, id or "", P("<nBB", fx, F[5](x, fx) and 1 or 0, F[6](x, fx) and 1 or 0) }
+        local np = F[7](x, fx)
+        for p0 = 0, np - 1, 4096 do -- the parameters packed 4096 at a time (one string.pack call each)
+            local k, v = math.min(4096, np - p0), {}
+            for j = 1, k do v[j] = F[8](x, fx, p0 + j - 1) end
+            t[#t + 1] = P("<" .. ("n"):rep(k), table.unpack(v, 1, k))
+        end
+        return table.concat(t, "|"), nm
+    end
+    local num, den = R.TimeMap_GetTimeSigAtTime(0, 0)
+    local pr = obj("project", "project")
+    local tm = { pk(R.Master_GetTempo(), num, den) }
+    for i = 0, R.CountTempoTimeSigMarkers(0) - 1 do tm[#tm + 1] = pk(R.GetTempoTimeSigMarker(0, i)) end
+    pr.tempo = fnv(table.concat(tm))
+    pr["sample rate"] = fnv(pk(R.GetSetProjectInfo(0, "PROJECT_SRATE", 0, false), R.GetSetProjectInfo(0, "PROJECT_SRATE_USE", 0, false)))
+    for i = -1, R.CountTracks(0) - 1 do
+        local tr = i < 0 and R.GetMasterTrack(0) or R.GetTrack(0, i)
+        local tg = i < 0 and "master" or R.GetTrackGUID(tr)
+        local _, name = R.GetTrackName(tr)
+        if i < 0 then name = "Master" end
+        local x = obj(tg, name)
+        local par = i >= 0 and R.GetParentTrack(tr)
+        x.moved = fnv(pk(i, par and R.GetTrackGUID(par) or ""))
+        for _, a in ipairs(AI.FP_TRACK) do
+            local t = {}
+            for k in a[2]:gmatch("%S+") do t[#t + 1] = P("<n", R.GetMediaTrackInfo_Value(tr, k)) end
+            x[a[1]] = fnv(table.concat(t))
+        end
+        if i < 0 then x.mute = fnv(pk(x.mute, R.GetMasterMuteSoloFlags())) end
+        local st = {}
+        for k = 0, R.GetTrackNumSends(tr, 0) - 1 do
+            local gok, dg = pcall(R.GetTrackGUID, R.GetTrackSendInfo_Value(tr, 0, k, "P_DESTTRACK"))
+            st[#st + 1] = gok and dg or "?"
+            for s in AI.FP_SEND:gmatch("%S+") do st[#st + 1] = P("<n", R.GetTrackSendInfo_Value(tr, 0, k, s)) end
+        end
+        x.sends = fnv(table.concat(st, "|"))
+        for fx = 0, FX[1](tr) - 1 do
+            local text, nm = fx_text(FX, tr, fx)
+            obj(FX[2](tr, fx) or (tg .. "|fx" .. fx), name .. " " .. short(nm))[""] = fnv(text)
+        end
+        local en = {}
+        for e = 0, R.CountTrackEnvelopes(tr) - 1 do
+            local env = R.GetTrackEnvelope(tr, e)
+            local _, ename = R.GetEnvelopeName(env)
+            en[ename] = (en[ename] or 0) + 1
+            obj(tg .. "|env|" .. ename .. (en[ename] > 1 and ("#" .. en[ename]) or ""), name .. " " .. ename .. " automation")[""] = env_h(env)
+        end
+        for it = 0, R.CountTrackMediaItems(tr) - 1 do
+            local item = R.GetTrackMediaItem(tr, it)
+            local _, ig = R.GetSetMediaItemInfo_String(item, "GUID", "", false)
+            local pos = R.GetMediaItemInfo_Value(item, "D_POSITION")
+            -- task 9b: one hash per aspect, so the badge names what changed (item settings in groups, then every take's parts)
+            local x = obj(ig ~= "" and ig or (tg .. "|item" .. it), string.format("%s item %d:%04.1f", name, pos // 60, pos % 60))
+            x.moved = fnv(tg)
+            for _, a in ipairs(AI.FP_ITEM) do
+                local t = {}
+                for k in a[2]:gmatch("%S+") do t[#t + 1] = P("<n", R.GetMediaItemInfo_Value(item, k)) end
+                x[a[1]] = fnv(table.concat(t))
+            end
+            local TA = { "take settings", "source file", "source section", "MIDI", "stretch markers", "take automation", "take FX" }
+            local ta = {}
+            for _, n in ipairs(TA) do ta[n] = {} end
+            for ti = 0, R.CountTakes(item) - 1 do
+                local take, p = R.GetTake(item, ti), {}
+                for _, n in ipairs(TA) do p[n] = {} end
+                if take then
+                    for k in AI.FP_TAKE:gmatch("%S+") do table.insert(p["take settings"], P("<n", R.GetMediaItemTakeInfo_Value(take, k))) end
+                    local src = R.GetMediaItemTake_Source(take)
+                    while src do
+                        table.insert(p["source file"], R.GetMediaSourceType(src, "") .. "|" .. R.GetMediaSourceFileName(src, ""))
+                        local sok, r, offs, len, rev = pcall(R.PCM_Source_GetSectionInfo, src)
+                        if sok then table.insert(p["source section"], pk(r, offs, len, rev)) end
+                        src = R.GetMediaSourceParent(src)
+                    end
+                    if R.TakeIsMIDI(take) then
+                        local _, mh = R.MIDI_GetHash(take, false, "")
+                        table.insert(p.MIDI, mh)
+                    end
+                    for s = 0, R.GetTakeNumStretchMarkers(take) - 1 do
+                        local _, sp, ss = R.GetTakeStretchMarker(take, s)
+                        table.insert(p["stretch markers"], P("<nnn", sp, ss, R.GetTakeStretchMarkerSlope(take, s)))
+                    end
+                    for e = 0, R.CountTakeEnvelopes(take) - 1 do table.insert(p["take automation"], P("<n", env_h(R.GetTakeEnvelope(take, e)))) end
+                    for fx = 0, TK[1](take) - 1 do table.insert(p["take FX"], (fx_text(TK, take, fx))) end
+                else
+                    table.insert(p["take settings"], "empty take")
+                end
+                for _, n in ipairs(TA) do table.insert(ta[n], table.concat(p[n], "|")) end
+            end
+            for _, n in ipairs(TA) do x[n] = fnv(table.concat(ta[n], "\n")) end
+        end
+    end
+    return { keys = keys, o = o }
+end
+
+--- Task 9b.1, full part: each track's saved state (master included) without the lines that cannot change the sound (AI.FP_DROP, AI.FP_SKIP),
+-- split into the track's own block (key = its fast key), one block per plugin (key = the plugin GUID) and per item (the item GUID), hashed.
+function AI.fp_full()
+    local R, fnv, DROP, SKIP = reaper, AI.fnv, AI.FP_DROP, AI.FP_SKIP
+    local out, rd, nb = {}, 0, 0
+    for i = -1, R.CountTracks(0) - 1 do
+        local tr = i < 0 and R.GetMasterTrack(0) or R.GetTrack(0, i)
+        local tg = i < 0 and "master" or R.GetTrackGUID(tr)
+        local t0 = R.time_precise()
+        local ok, chunk = R.GetTrackStateChunk(tr, "", false)
+        rd, nb = rd + R.time_precise() - t0, nb + #(chunk or "")
+        if ok then
+            local base = { k = tg }
+            local blocks, cur, depth, fxd, itd, skd, nfx, nit = { base }, base, 0, nil, nil, nil, 0, 0
+            local pos, L = 1, #chunk
+            while pos <= L do
+                local e = chunk:find("\n", pos, true) or (L + 1)
+                local line = chunk:sub(pos, e - 1)
+                pos = e + 1
+                local lt = line:match("^%s*(.-)%s*$")
+                local open = lt:sub(1, 1) == "<"
+                local tok = open and lt:match("^<([%w_]+)") or lt:match("^([%u%d_]+)$") or lt:match("^([%u%d_]+) ")
+                if open and depth == 1 and not itd then
+                    if tok == "ITEM" then
+                        nit = nit + 1
+                        cur = { k = tg .. "|item" .. nit }
+                        blocks[#blocks + 1], itd = cur, 1
+                    elseif tok == "FXCHAIN" then fxd = 2 end
+                end
+                if open and not skd and tok and (SKIP[tok] or tok:find("ENV", 1, true)) then skd = depth end
+                if not skd then
+                    if not itd and fxd and depth == fxd then
+                        if tok == "BYPASS" then
+                            nfx = nfx + 1
+                            cur = { k = tg .. "|fx" .. nfx }
+                            blocks[#blocks + 1] = cur
+                        elseif tok == "FXID" then cur.k = lt:match("({.-})") or cur.k end
+                    elseif itd and depth == 2 and tok == "IGUID" then cur.k = lt:match("({.-})") or cur.k end
+                    if not DROP[tok or ""] then cur[#cur + 1] = lt end
+                end
+                if open then
+                    depth = depth + 1
+                    -- a plugin's own state (base64 lines, no block inside): one piece up to its closing line, not line by line
+                    if fxd and depth == fxd + 1 and not itd and not skd then
+                        local cs = chunk:find("\n[ \t]*>[ \t\r]*\n", pos - 1)
+                        local inner = cs and chunk:sub(pos, cs - 1)
+                        if inner and not (inner:find("^[ \t]*<") or inner:find("\n[ \t]*<")) then
+                            cur[#cur + 1] = inner
+                            pos = cs + 1
+                        end
+                    end
+                elseif lt == ">" then
+                    depth = depth - 1
+                    if skd and depth == skd then skd = nil
+                    elseif itd and depth == itd then itd, cur = nil, base
+                    elseif fxd and depth == fxd - 1 then fxd, cur = nil, base end
+                end
+            end
+            for _, b in ipairs(blocks) do out[b.k] = fnv(table.concat(b, "\n")) end
+        end
+    end
+    AI.fpf_stat = string.format(" (reading the track states %.2f s, %.1f MB)", rd, nb / 1048576)
+    return out
+end
+
+--- Task 9b.4: what differs between fingerprint a (at the snapshot) and b (now), in project order: { { key, label }, ... }
+function AI.fp_diff(a, b)
+    local out, seen = {}, {}
+    local function cmp(k)
+        if seen[k] then return end
+        seen[k] = true
+        local x, y = a.o[k], b.o[k]
+        if not x then out[#out + 1] = { k, y.l .. " added", "added" } return end
+        if not y then out[#out + 1] = { k, x.l .. " removed", "removed" } return end
+        local asp = {}
+        for n in pairs(y) do if n ~= "l" then asp[#asp + 1] = n end end
+        for n in pairs(x) do if n ~= "l" and y[n] == nil then asp[#asp + 1] = n end end
+        table.sort(asp)
+        for _, n in ipairs(asp) do
+            if x[n] ~= y[n] then out[#out + 1] = { k, y.l .. (n ~= "" and (" " .. n) or ""), n ~= "" and n or "settings" } end
+        end
+    end
+    for _, k in ipairs(b.keys) do cmp(k) end
+    for _, k in ipairs(a.keys) do cmp(k) end
+    return out
+end
+
+--- Task 9b.4: full-part blocks that differ where the fast part matches (fast = AI.fp_diff of the same pair): "<label> (internal)"
+function AI.fp_internal(a, b, af, bf, fast)
+    local bad, out = {}, {}
+    for _, e in ipairs(fast) do bad[e[1]] = true end
+    for _, k in ipairs(b.keys) do
+        if a.o[k] and af[k] and bf[k] and af[k] ~= bf[k] and not bad[k] then out[#out + 1] = { k, b.o[k].l .. " (internal)", "internal" } end
+    end
+    return out
+end
+
+--- Task 9b.3/9b.5 (replaces the old change-counter check): the fast part again whenever REAPER's change counter moves, at most once per
+-- second; AI.diff = the badge labels (fast differences, then the "(internal)" ones found after a load); nil without fingerprints.
+function AI.fp_tick(given) -- given = a fast part just made (Collect, load): used as the current one
+    local c = AI.collected
+    if not (c and c.fp) then AI.diff = nil return end
+    local n, now = reaper.GetProjectStateChangeCount(0), reaper.time_precise()
+    if not given and (n == AI.fpn or now - (AI.fpt or 0) < 1) then return end
+    AI.fpn, AI.fpt = n, now
+    local ok, fp = true, given
+    if not given then ok, fp = pcall(AI.fp_fast) end
+    if not ok then AI.diff = { "the check failed: " .. tostring(fp) } return end
+    local d, bad, l = AI.fp_diff(c.fp, fp), {}, {}
+    for _, e in ipairs(d) do bad[e[1]] = true end
+    AI.diff_int = {} -- "(internal)" only: shown in the badge's tooltip, not as a change (some plugins rewrite private data on every reopen)
+    for _, e in ipairs(c.internal or {}) do if not bad[e[1]] then table.insert(AI.diff_int, e[2]) end end
+    local cnt, cl = {}, {}
+    for _, e in ipairs(d) do
+        l[#l + 1] = e[2]
+        if not cnt[e[3]] then cl[#cl + 1] = e[3] end
+        cnt[e[3]] = (cnt[e[3]] or 0) + 1
+    end
+    for i, n in ipairs(cl) do cl[i] = n .. " " .. cnt[n] end
+    AI.diff = l
+    AI.fp_log(string.format("fingerprint fast %s(%d changed%s; %d internal)", given and "(given) " or string.format("%.2f s ", reaper.time_precise() - now),
+        #l, #cl > 0 and (": " .. table.concat(cl, ", ")) or "", #AI.diff_int))
+end
+
+--- Task 9b.4: the snapshot line at the top of the window: its date and the badge (`unchanged` / `changed: ...`, hover = the full list)
+function AI.badge(ctx)
+    local c = AI.collected
+    if not c then return end
+    reaper.ImGui_Text(ctx, "Snapshot " .. tostring(c.date or c.when) .. (c.file and "" or " (not saved)") .. ":")
+    if not AI.diff then return end
+    reaper.ImGui_SameLine(ctx)
+    local n = #AI.diff
+    local txt = n == 0 and "unchanged" or ("changed: " .. table.concat(AI.diff, ", ", 1, math.min(3, n)) .. (n > 3 and string.format(", +%d more", n - 3) or ""))
+    local col = n == 0 and 0x81C784FF or 0xFFB74DFF
+    reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Button(), col)
+    reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_ButtonHovered(), col)
+    reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_ButtonActive(), col)
+    reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), 0x111111FF)
+    reaper.ImGui_SmallButton(ctx, txt .. "##fp_badge")
+    reaper.ImGui_PopStyleColor(ctx, 4)
+    if reaper.ImGui_IsItemHovered(ctx) then
+        local int = AI.diff_int or {}
+        reaper.ImGui_SetTooltip(ctx, (n == 0 and "Nothing that can change the sound differs from the snapshot." or table.concat(AI.diff, "\n"))
+            .. (#int > 0 and ("\n\nPrivate data differs (normal after reopening for some plugins):\n" .. table.concat(int, "\n")) or ""))
+    end
+end
+
+--- Task 9a.1: the Options tab
+function AI.options_ui(ctx)
+    reaper.ImGui_Dummy(ctx, 0, 4)
+    reaper.ImGui_Text(ctx, "At startup and when the visible project changes:")
+    local cur = AI.opt_get("startup", "ask")
+    for _, o in ipairs({ { "auto", "Reload the last state and its chat" }, { "ask", "Ask (default)" }, { "empty", "Start empty" } }) do
+        if reaper.ImGui_RadioButton(ctx, o[2], cur == o[1]) then AI.opt_set("startup", o[1]) end
+    end
+    reaper.ImGui_Dummy(ctx, 0, 8)
+    reaper.ImGui_SetNextItemWidth(ctx, 200)
+    local ch, v = reaper.ImGui_SliderInt(ctx, "Snapshots kept", tonumber(AI.opt_get("keep", "3")) or 3, 1, 10)
+    if ch then AI.opt_set("keep", v) end
+    if reaper.ImGui_IsItemHovered(ctx) then
+        reaper.ImGui_SetTooltip(ctx, "Every Collect saves a snapshot. The newest ones are kept, older ones are deleted at the next Collect (pinned ones never).")
+    end
+    reaper.ImGui_Dummy(ctx, 0, 8)
+    -- task 9a: the files folder (prompts, reports, Snapshots subfolder): a name next to each project, or a full path for all projects
+    AI.folder_buf = AI.folder_buf or AI.opt_get("folder", "AI Mix and Master")
+    reaper.ImGui_SetNextItemWidth(ctx, 300)
+    local _, fb = reaper.ImGui_InputText(ctx, "Files folder", AI.folder_buf)
+    AI.folder_buf = fb
+    if reaper.ImGui_IsItemDeactivatedAfterEdit(ctx) then AI.opt_set("folder", fb) end
+    if reaper.ImGui_IsItemHovered(ctx) then
+        reaper.ImGui_SetTooltip(ctx, "A name: a folder next to each project. A full path: one folder for all projects (file names start with the project name).\nEmpty = AI Mix and Master.")
+    end
+    if reaper.JS_Dialog_BrowseForFolder then
+        reaper.ImGui_SameLine(ctx)
+        if reaper.ImGui_Button(ctx, "Browse...") then
+            local r, d = reaper.JS_Dialog_BrowseForFolder("Folder for the Mix Assistant files", "")
+            if r == 1 and d and d ~= "" then AI.folder_buf = d; AI.opt_set("folder", d) end
+        end
+    end
+    reaper.ImGui_SameLine(ctx)
+    if reaper.ImGui_Button(ctx, "Default") then AI.folder_buf = "AI Mix and Master"; AI.opt_set("folder", "AI Mix and Master") end
+    local _, pfn = reaper.EnumProjects(-1, "")
+    local name, shown = fb:match("^%s*(.-)[\\/%s]*$"), nil
+    if name == "" then name = "AI Mix and Master" end
+    if fb:match("^%s*%a:[\\/]") or fb:match("^%s*[\\/]") then shown = name
+    elseif (pfn or "") ~= "" then shown = pfn:match("^(.*[\\/])") .. name end
+    reaper.ImGui_TextWrapped(ctx, "This project: " .. (shown and (shown .. PATH_SEPARATOR .. " (snapshots in its Snapshots subfolder)") or "none (save the project first)"))
 end
 
 --- "Send Project Info to Agent": a new chat that starts with the collected prompt (the chat shows only a short line for it).
@@ -4748,14 +5627,19 @@ function AI.send(model_choice, think, focus_idx)
     local c = AI.collected
     local text, e = AI.full_prompt(focus_idx)
     if not text then AI.status = e return end
-    chat_history = { { role = "user", content = text, display_content = string.format(
-        "Project info sent (collected %s, about %d tokens, focus: %s).\nPrompt file: %s",
-        c.when, MA_A.tokens(#text), (AI.FOCUS[focus_idx] or AI.FOCUS[1])[1], e.path or "not saved") } }
+    chat_history, AI.chat_file = {}, nil -- task 9a.6: a new chat, a new chat file, starting with its badge
+    -- task 9a.6: the message itself carries the badge (event) and its snapshot, shown as one entry
+    table.insert(chat_history, { role = "user", content = text, event = "PROJECT INFO SENT", snap = c.file, time = os.date("%Y-%m-%d %H:%M"),
+        display_content = string.format("Project info sent (collected %s, about %d tokens, focus: %s).\nPrompt file: %s",
+        c.when, MA_A.tokens(#text), (AI.FOCUS[focus_idx] or AI.FOCUS[1])[1], e.path or "not saved") })
+    AI.chat_save()
     scroll_to_bottom = true
-    local u
-    AI.sent, u = AI.ask(model_choice, think, MA_A.tokens(#text))
-    if u and (u.prompt_tokens or 0) > 1000 then
-        reaper.SetExtState("MixAssistant", "chars_per_token", string.format("%.3f", #text / u.prompt_tokens), true)
+    return function() -- task 9a: the API call runs a frame later, so the badge and the message show while waiting
+        local u
+        AI.sent, u = AI.ask(model_choice, think, MA_A.tokens(#text))
+        if u and (u.prompt_tokens or 0) > 1000 then
+            reaper.SetExtState("MixAssistant", "chars_per_token", string.format("%.3f", #text / u.prompt_tokens), true)
+        end
     end
 end
 
@@ -4863,10 +5747,12 @@ end
 --- Task 4g.3: adds the detail to the chat (the chat shows a short line; the text is saved next to the project) and asks the AI.
 function AI.detail_send(model_choice, think, text, info)
     local path = save_prompt_to_txt(text, "JSFX Detail")
-    table.insert(chat_history, { role = "user", content = text, display_content = string.format(
+    table.insert(chat_history, { role = "user", content = text, event = "TRACK DETAIL SENT", snap = AI.collected.file, -- task 9a.6 (see AI.send)
+        time = os.date("%Y-%m-%d %H:%M"), display_content = string.format(
         "Track detail sent: %s (about %d tokens).\nFile: %s", info.names, info.tokens, path or "not saved") })
+    AI.chat_save()
     scroll_to_bottom = true
-    AI.ask(model_choice, think)
+    return function() AI.ask(model_choice, think) end -- task 9a: a frame later (see AI.send)
 end
 
 local MODEL_ITEMS = "DeepSeek V4 Pro (Flagship Reasoning)\0DeepSeek Flash (Fast / Low-Cost)\0\0"
@@ -4913,6 +5799,8 @@ local function main()
 
     local function loop()
         poll_deep_seek_balance()
+        if scan_state == 0 then AI.project_check() end -- task 9a.7: startup and project tab switches
+        AI.fp_tick() -- task 9b.3
 
         reaper.ImGui_SetNextWindowSize(ctx, 720, 680, reaper.ImGui_Cond_FirstUseEver())
         local window_flags = reaper.ImGui_WindowFlags_NoCollapse() | reaper.ImGui_WindowFlags_TopMost()
@@ -4927,10 +5815,18 @@ local function main()
             if reaper.ImGui_SmallButton(ctx, "↻ Refresh") then
                 fetch_deep_seek_balance()
             end
+            AI.badge(ctx) -- task 9b.4
             reaper.ImGui_Separator(ctx)
             reaper.ImGui_Dummy(ctx, 0, 2)
 
             local _ -- throw-away for ImGui's 'changed' return values (keeps them out of the global scope)
+            -- task 9a.1: tabs (the Chat tab is everything below; while an action runs it stays shown)
+            if reaper.ImGui_BeginTabBar(ctx, "##tabs") then
+                if reaper.ImGui_BeginTabItem(ctx, "Chat") then AI.tab = 1 reaper.ImGui_EndTabItem(ctx) end
+                if reaper.ImGui_BeginTabItem(ctx, "Options") then AI.tab = 2 reaper.ImGui_EndTabItem(ctx) end
+                reaper.ImGui_EndTabBar(ctx)
+            end
+            if AI.tab == 2 and scan_state == 0 then AI.options_ui(ctx) else
 
             -- COLLECT (task 4f)
             render_section_header(ctx, "  COLLECT AND MANAGE PROJECT INFORMATION")
@@ -4943,7 +5839,7 @@ local function main()
             if reaper.ImGui_Button(ctx, is_busy and "Working..." or "Collect Project Info", -1, bh) and (not reaper.AnyTrackSolo(0) or
                 reaper.ShowMessageBox("Some tracks are soloed. Collect Project Info will measure only the soloed tracks, and the master numbers will describe only them.\n\nContinue?",
                     "Soloed tracks", 1) == 1) then
-                pending, AI.status = function() AI.keep(function() AI.collect(no_sc) end) end,
+                pending, AI.status = function() AI.collect(no_sc) end,
                     no_sc and "⏳ Rendering without the sidechain measurement (Shift)... please wait." or "⏳ Rendering the project and reading the analyzers... please wait."
             end
             local c = AI.collected
@@ -4984,7 +5880,8 @@ local function main()
             reaper.ImGui_PopStyleVar(ctx, 1)
             reaper.ImGui_SameLine(ctx)
             if reaper.ImGui_Button(ctx, "Send Project Info to Agent", 0, bh) then
-                pending, AI.status = function() AI.send(model_idx + 1, think, focus_idx) end, "⏳ Waiting for DeepSeek (with Think on this can take a few minutes)..."
+                local run = AI.send(model_idx + 1, think, focus_idx)
+                if run then pending, AI.status = run, "⏳ Waiting for DeepSeek (with Think on this can take a few minutes)..." end
             end
             reaper.ImGui_SameLine(ctx)
             if reaper.ImGui_Button(ctx, "Copy Project Info", 0, bh) then -- the whole prompt with the focus line, for the web chat
@@ -4993,27 +5890,32 @@ local function main()
             end
             reaper.ImGui_SameLine(ctx)
             -- task 4g.3: only after Send Project Info in this chat (Clear Chat locks it again); asks before sending
-            if not AI.sent then reaper.ImGui_BeginDisabled(ctx, true) end
+            -- task 9a: Shift+click copies the detail instead (saved next to the project too), also before Send Project Info
+            local copy_detail = no_sc
+            if not (AI.sent or copy_detail) then reaper.ImGui_BeginDisabled(ctx, true) end
             if reaper.ImGui_Button(ctx, "Send Track Detail...", 0, bh) then
                 local text, info = AI.detail_text()
                 if not text then
                     reaper.ShowMessageBox(info, "Send Track Detail", 0)
+                elseif copy_detail then
+                    reaper.ImGui_SetClipboardText(ctx, text)
+                    AI.status = "Track detail copied: " .. info.names .. " (file: " .. (save_prompt_to_txt(text, "JSFX Detail") or "not saved") .. ")."
                 elseif reaper.ShowMessageBox(string.format("Send the detail of: %s?\n\nAbout %d tokens (sending this part costs about $%.3f now; the earlier chat is mostly cached).%s",
                     info.names, info.tokens, AI.cost(get_model_name(model_idx + 1), 0, info.tokens, 0),
                     #info.skipped > 0 and ("\n\nLeft out (not in the last Collect): " .. table.concat(info.skipped, ", ")) or ""), "Send Track Detail", 1) == 1 then
-                    pending, AI.status = function() AI.detail_send(model_idx + 1, think, text, info) end, "⏳ Waiting for DeepSeek (with Think on this can take a few minutes)..."
+                    pending, AI.status = AI.detail_send(model_idx + 1, think, text, info), "⏳ Waiting for DeepSeek (with Think on this can take a few minutes)..."
                 end
             end
             if reaper.ImGui_IsItemHovered(ctx, reaper.ImGui_HoveredFlags_AllowWhenDisabled()) then
-                reaper.ImGui_SetTooltip(ctx, (AI.sent and "" or "Send Project Info first. ") .. "Sends the selected tracks' full data to this chat.")
+                reaper.ImGui_SetTooltip(ctx, (AI.sent and "" or "Send Project Info first. ") .. "Sends the selected tracks' full data to this chat. Shift+click: copy it instead.")
             end
-            if not AI.sent then reaper.ImGui_EndDisabled(ctx) end
+            if not (AI.sent or copy_detail) then reaper.ImGui_EndDisabled(ctx) end
             -- Clear Chat right-aligned on the same row
             reaper.ImGui_SameLine(ctx)
             local w2 = reaper.ImGui_CalcTextSize(ctx, "Clear Chat") + 2 * bpad
             local gap = reaper.ImGui_GetContentRegionAvail(ctx) - w2
             if gap > 0 then reaper.ImGui_SetCursorPosX(ctx, reaper.ImGui_GetCursorPosX(ctx) + gap) end
-            if reaper.ImGui_Button(ctx, "Clear Chat", w2, bh) then chat_history, AI.sent = {}, false end
+            if reaper.ImGui_Button(ctx, "Clear Chat", w2, bh) then chat_history, AI.sent, AI.chat_file = {}, false, nil end -- 9a.6: the next chat gets its own file
             if not c then reaper.ImGui_EndDisabled(ctx) end
             if is_busy then reaper.ImGui_EndDisabled(ctx) end
             reaper.ImGui_PopStyleVar(ctx, 1)
@@ -5027,8 +5929,9 @@ local function main()
                 local e, perr = AI.prompt(focus_idx) -- task 4f.6: the chosen focus's prompt (built once, then cached)
                 st = e and string.format("Collected %s%s, about %d tokens; sending costs about $%.3f now (%s)", c.when, c.soloed and " (soloed tracks only)" or "", e.tokens,
                     AI.cost(get_model_name(model_idx + 1), 0, e.tokens, 0), pk and ("peak until " .. till) or "off-peak") or perr
-                -- task 4g.3: the prompts keep describing the project as it was collected
-                if AI.changed() then
+                if c.note then st = c.note .. " " .. st end -- task 9a: loaded snapshot / snapshot not saved
+                -- task 4g.3: the prompts keep describing the project as it was collected; 9b.5: changed = the fingerprints differ
+                if AI.diff and #AI.diff > 0 then
                     st, col = string.format("Project changed since Collect at %s. Prompts describe the project as it was then; Collect again to include your changes (free). %s",
                         c.when, st), 0xFFB74DFF
                 end
@@ -5069,7 +5972,14 @@ local function main()
                 push_chat_font(15)
 
                 for idx, msg in ipairs(chat_history) do
-                    if msg.role == "user" then
+                    if msg.role == "user" and msg.event then
+                        -- task 9a.6: project info / Track Detail sent: its badge, the short line, then time and snapshot in grey
+                        render_role_badge(ctx, " " .. msg.event .. " ", AI.EVENT_COL[msg.event] or 0x9E9E9EFF, 0x111111FF, idx)
+                        render_markdown_text(ctx, msg, msg.display_content or msg.content, idx)
+                        reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), 0x9E9E9EFF)
+                        reaper.ImGui_TextWrapped(ctx, (msg.time or "") .. " | snapshot " .. (msg.snap or "not saved"))
+                        reaper.ImGui_PopStyleColor(ctx, 1)
+                    elseif msg.role == "user" then
                         -- Light Blue background with dark text
                         render_role_badge(ctx, " YOU ", 0x4FC3F7FF, 0x111111FF, idx)
                         render_markdown_text(ctx, msg, msg.display_content or msg.content, idx)
@@ -5088,6 +5998,12 @@ local function main()
                         -- Grey token/cost line (task 4f; never sent to the AI), wrapped so a narrow window does not cut it off
                         reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), 0x9E9E9EFF)
                         reaper.ImGui_TextWrapped(ctx, msg.content)
+                        reaper.ImGui_PopStyleColor(ctx, 1)
+                    elseif msg.role == "event" then
+                        -- task 9a.6: Collect / project info sent / Track Detail sent, with the snapshot it belongs to (never sent to the AI)
+                        render_role_badge(ctx, " " .. msg.content .. " ", AI.EVENT_COL[msg.content] or 0x9E9E9EFF, 0x111111FF, idx)
+                        reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), 0x9E9E9EFF)
+                        reaper.ImGui_TextWrapped(ctx, (msg.time or "") .. " | snapshot " .. (msg.snap or "not saved"))
                         reaper.ImGui_PopStyleColor(ctx, 1)
                     end
 
@@ -5154,6 +6070,7 @@ local function main()
                 end
             end
             reaper.ImGui_EndGroup(ctx)
+            end -- task 9a.1: end of the Chat tab
         end
 
         reaper.ImGui_End(ctx)
